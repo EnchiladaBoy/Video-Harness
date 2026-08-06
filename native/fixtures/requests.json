@@ -1,0 +1,33 @@
+{
+  "minimal": {
+    "model": "black-forest-labs/flux-3-video",
+    "prompt": "A tiny cinema drifting through serene sunset clouds"
+  },
+  "configured": {
+    "model": "black-forest-labs/flux-3-video",
+    "prompt": "A tiny cinema drifting through serene sunset clouds",
+    "duration": 5,
+    "resolution": "720p",
+    "aspect_ratio": "16:9",
+    "generate_audio": false,
+    "seed": 42,
+    "frame_images": [
+      {
+        "type": "image_url",
+        "image_url": {"url": "https://images.example/first.png"},
+        "frame_type": "first_frame"
+      }
+    ],
+    "input_references": [
+      {
+        "type": "image_url",
+        "image_url": {"url": "https://images.example/style.png"}
+      }
+    ],
+    "provider": {
+      "order": ["fixture-provider"],
+      "parameters": {"guidance": 3}
+    }
+  }
+}
+

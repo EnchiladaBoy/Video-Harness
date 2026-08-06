@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+native/target/
+*.part
+
+# Local editor, OS, and secret material.
+.idea/
+.vscode/
+.DS_Store
+*.pem
+*.key
+id_ed25519*
+video_harness_cli*
+
+# Local credentials and runtime state never belong in the repository.
+.env
+.env.*
+*.sqlite3
+*.db

@@ -1,0 +1,23 @@
+{
+  "submitted": {
+    "id": "job-fixture-1",
+    "status": "pending",
+    "polling_url": "/api/v1/videos/job-fixture-1",
+    "generation_id": "generation-fixture-1"
+  },
+  "completed": {
+    "id": "job-fixture-1",
+    "status": "completed",
+    "polling_url": "/api/v1/videos/job-fixture-1",
+    "generation_id": "generation-fixture-1",
+    "unsigned_urls": ["https://cdn.example/video.mp4?signature=fixture"],
+    "usage": {"cost": "0.85"}
+  },
+  "failed": {
+    "id": "job-fixture-2",
+    "status": "failed",
+    "polling_url": "/api/v1/videos/job-fixture-2",
+    "error": {"code": "provider_error", "message": "Fixture provider failed"}
+  }
+}
+

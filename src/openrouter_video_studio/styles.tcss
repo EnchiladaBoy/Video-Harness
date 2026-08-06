@@ -1,0 +1,289 @@
+$studio-bg: #0d1020;
+$studio-panel: #171b31;
+$studio-panel-alt: #202640;
+$studio-ink: #f5f3ff;
+$studio-muted: #aaa8c0;
+$studio-cyan: #66e4ff;
+$studio-pink: #ff79c6;
+$studio-violet: #a88bff;
+$studio-success: #65f5a5;
+$studio-warning: #ffd166;
+$studio-error: #ff6b81;
+
+Screen {
+    background: $studio-bg;
+    color: $studio-ink;
+}
+
+Header {
+    background: $studio-panel;
+    color: $studio-cyan;
+}
+
+Footer {
+    background: $studio-panel;
+    color: $studio-muted;
+}
+
+.page {
+    width: 100%;
+    height: 1fr;
+    padding: 1 2;
+}
+
+.narrow {
+    width: 76;
+    max-width: 94%;
+    height: auto;
+    max-height: 96%;
+    padding: 2 3;
+    background: $studio-panel;
+    border: round $studio-violet;
+}
+
+.hero {
+    height: auto;
+    margin-bottom: 1;
+    color: $studio-cyan;
+    text-align: center;
+}
+
+.subtitle {
+    height: auto;
+    color: $studio-muted;
+    text-align: center;
+    margin-bottom: 1;
+}
+
+.section-title {
+    color: $studio-pink;
+    text-style: bold;
+    margin: 1 0 0 0;
+    height: auto;
+}
+
+.hint, .muted {
+    color: $studio-muted;
+    height: auto;
+}
+
+.error {
+    color: $studio-error;
+}
+
+.success {
+    color: $studio-success;
+}
+
+.warning {
+    color: $studio-warning;
+}
+
+StatusPill {
+    height: auto;
+    min-height: 1;
+    margin: 1 0;
+}
+
+Input, TextArea, Select {
+    background: $studio-panel-alt;
+    color: $studio-ink;
+    border: tall #454d78;
+}
+
+Input:focus, TextArea:focus, Select:focus {
+    border: tall $studio-cyan;
+}
+
+Button {
+    min-width: 16;
+    margin-right: 1;
+}
+
+Button.primary {
+    background: $studio-violet;
+    color: #0d1020;
+    text-style: bold;
+}
+
+Button.success {
+    background: $studio-success;
+    color: #0d1020;
+}
+
+.button-row {
+    height: auto;
+    align-horizontal: right;
+    margin-top: 1;
+}
+
+#onboarding-key {
+    margin-top: 1;
+}
+
+#compose-grid {
+    height: 1fr;
+}
+
+#prompt-panel {
+    width: 2fr;
+    min-width: 38;
+    height: 1fr;
+    padding-right: 2;
+}
+
+#settings-panel {
+    width: 1fr;
+    min-width: 30;
+    height: 1fr;
+    padding: 0 1;
+    background: $studio-panel;
+    border: round #343b60;
+    overflow-y: auto;
+}
+
+#prompt {
+    height: 1fr;
+    min-height: 10;
+}
+
+.setting-row {
+    width: 100%;
+    height: auto;
+    margin-bottom: 1;
+}
+
+.setting-row Label {
+    width: 13;
+    padding-top: 1;
+    color: $studio-muted;
+}
+
+.setting-row Select, .setting-row Input {
+    width: 1fr;
+}
+
+.switch-row {
+    height: 3;
+    align-vertical: middle;
+}
+
+.switch-row Label {
+    width: 1fr;
+    padding-top: 0;
+}
+
+#advanced {
+    height: auto;
+    margin-top: 1;
+}
+
+#references, #provider-json {
+    height: 5;
+}
+
+CostSummary {
+    height: auto;
+    padding: 1;
+    margin-top: 1;
+    background: #142d3b;
+    border-left: thick $studio-cyan;
+}
+
+CostSummary.unknown {
+    background: #342d1e;
+    border-left: thick $studio-warning;
+}
+
+.modal-backdrop {
+    align: center middle;
+    background: rgba(4, 5, 15, 0.78);
+}
+
+.modal-card {
+    width: 72;
+    max-width: 92%;
+    height: auto;
+    max-height: 90%;
+    padding: 2 3;
+    background: $studio-panel;
+    border: round $studio-pink;
+}
+
+#confirmation-details {
+    height: auto;
+    max-height: 16;
+    overflow-y: auto;
+    margin: 1 0;
+    padding: 1;
+    background: $studio-panel-alt;
+}
+
+#progress-card {
+    width: 86;
+    max-width: 96%;
+}
+
+#job-meta {
+    text-align: center;
+    color: $studio-muted;
+    height: auto;
+}
+
+#progress-error {
+    height: auto;
+    margin: 1 0;
+    padding: 1;
+    color: $studio-error;
+    background: #371a2a;
+    display: none;
+}
+
+.complete-path {
+    height: auto;
+    padding: 1;
+    margin: 1 0;
+    background: $studio-panel-alt;
+    color: $studio-success;
+    border-left: thick $studio-success;
+}
+
+#history-table {
+    height: 1fr;
+    min-height: 12;
+    margin: 1 0;
+    background: $studio-panel;
+}
+
+#history-detail {
+    height: 6;
+    padding: 1;
+    background: $studio-panel;
+    color: $studio-muted;
+}
+
+#compose-grid.compact {
+    layout: vertical;
+    overflow-y: auto;
+}
+
+#compose-grid.compact #prompt-panel,
+#compose-grid.compact #settings-panel {
+    width: 100%;
+    min-width: 0;
+    height: auto;
+    padding: 0;
+}
+
+#compose-grid.compact #prompt {
+    height: 12;
+}
+
+#compose-grid.compact #settings-panel {
+    margin-top: 1;
+}
+
+ComposeScreen.short .subtitle,
+ComposeScreen.short .hint {
+    display: none;
+}

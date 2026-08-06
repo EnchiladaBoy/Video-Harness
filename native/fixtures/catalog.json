@@ -1,0 +1,35 @@
+{
+  "fetched_at": "2026-08-06T04:30:15+00:00",
+  "data": [
+    {
+      "id": "black-forest-labs/flux-3-video",
+      "name": "FLUX.3 Video",
+      "description": "Fixture model with cents-per-output-second pricing",
+      "supported_resolutions": ["720p", "1080p"],
+      "supported_aspect_ratios": ["16:9", "9:16"],
+      "supported_sizes": ["1280x720"],
+      "supported_durations": [4, 8],
+      "supported_frame_images": ["first_frame", "last_frame"],
+      "generate_audio": false,
+      "seed": true,
+      "allowed_passthrough_parameters": ["guidance"],
+      "pricing_skus": {
+        "cents_per_second_output_720p": "17",
+        "video_tokens": "0.0001"
+      }
+    },
+    {
+      "id": "example/audio-video",
+      "name": "Audio Video Fixture",
+      "supported_resolutions": ["720p"],
+      "supported_aspect_ratios": ["16:9"],
+      "supported_durations": [5],
+      "generate_audio": true,
+      "pricing_skus": {
+        "duration_seconds_with_audio": "0.25",
+        "duration_seconds_without_audio": "0.10"
+      }
+    }
+  ]
+}
+
