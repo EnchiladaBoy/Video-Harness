@@ -25,6 +25,7 @@ fn run_installer(root: &Path, arguments: &[&str]) -> std::process::Output {
         .args(arguments)
         .env("OPENROUTER_VIDEO_LIB_DIR", root.join("lib"))
         .env("OPENROUTER_VIDEO_BIN_DIR", root.join("bin"))
+        .env("VIDEO_HARNESS_DATA_DIR", root.join("share"))
         .output()
         .expect("run installer")
 }
@@ -59,6 +60,30 @@ fn cleanup(root: &Path) {
         }
     }
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn fresh_install_does_not_require_or_create_the_legacy_python_command() {
+    if std::env::consts::ARCH != "aarch64" {
+        return;
+    }
+
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture = manifest.join("fixtures/fake-openrouter-video.sh");
+    let root = unique_temp_dir();
+    fs::create_dir_all(root.join("bin")).expect("create test bin directory");
+
+    assert_success(run_installer(
+        &root,
+        &["install", fixture.to_str().expect("UTF-8 fixture path")],
+    ));
+    assert!(root.join("bin/video-harness").is_symlink());
+    assert!(root.join("bin/video-harness-tui").is_symlink());
+    assert!(root.join("bin/openrouter-video-rs").is_symlink());
+    assert!(!root.join("bin/openrouter-video").exists());
+    assert!(!root.join("bin/openrouter-video-python").exists());
+
+    cleanup(&root);
 }
 
 #[test]
@@ -115,15 +140,34 @@ fn beta_install_promotion_and_rollback_preserve_python_target() {
     );
 
     let beta = root.join("bin/openrouter-video-rs");
+    let gui = root.join("bin/video-harness");
+    let tui = root.join("bin/video-harness-tui");
     let python_alias = root.join("bin/openrouter-video-python");
     assert_eq!(resolved(&stable), python_target);
     assert_eq!(resolved(&python_alias), python_target);
     assert_eq!(
         resolved(&beta),
-        root.join("lib/releases/0.2.0-test/openrouter-video")
+        root.join("lib/releases/0.3.0-test/video-harness-tui")
     );
     assert_eq!(
-        fs::metadata(root.join("lib/releases/0.2.0-test"))
+        resolved(&gui),
+        root.join("lib/releases/0.3.0-test/video-harness")
+    );
+    assert_eq!(resolved(&tui), resolved(&beta));
+    assert!(
+        root.join("share/applications/io.github.EnchiladaBoy.VideoHarness.desktop")
+            .is_file()
+    );
+    assert!(
+        root.join("share/metainfo/io.github.EnchiladaBoy.VideoHarness.metainfo.xml")
+            .is_file()
+    );
+    assert!(
+        root.join("share/icons/hicolor/scalable/apps/io.github.EnchiladaBoy.VideoHarness.svg")
+            .is_file()
+    );
+    assert_eq!(
+        fs::metadata(root.join("lib/releases/0.3.0-test"))
             .expect("release metadata")
             .permissions()
             .mode()

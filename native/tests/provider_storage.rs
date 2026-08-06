@@ -1,15 +1,17 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
-use openrouter_video_studio::config::{
+use secrecy::ExposeSecret;
+use tempfile::tempdir;
+use video_harness::config::{
     APP_NAME, APP_SETTINGS_SCHEMA_VERSION, AppPaths, AppSettings, ConfigError, load_app_settings,
     save_app_settings, validated_provider_slug,
 };
-use openrouter_video_studio::credentials::{
+use video_harness::credentials::{
     CredentialStore, DEFAULT_USERNAME, FAL_USERNAME, username_for_provider,
 };
-use openrouter_video_studio::domain::ProviderId;
-use secrecy::ExposeSecret;
-use tempfile::tempdir;
+use video_harness::domain::ProviderId;
 
 #[test]
 fn provider_paths_retain_openrouter_compatibility_and_namespace_fal() {
@@ -48,10 +50,45 @@ fn provider_paths_retain_openrouter_compatibility_and_namespace_fal() {
         paths.app_settings(),
         paths.config_dir.join("app-settings.json")
     );
+    assert_eq!(
+        paths.gui_state_db(),
+        paths.data_dir.join("gui-state.sqlite3")
+    );
     assert!(validated_provider_slug("fal-2").is_ok());
     for unsafe_value in ["../fal", "Fal", "fal/provider", "", "."] {
         assert!(validated_provider_slug(unsafe_value).is_err());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn application_state_directories_are_private_without_repermissioning_videos() {
+    let directory = tempdir().expect("temporary directory");
+    let videos = directory.path().join("Videos");
+    fs::create_dir(&videos).expect("create videos");
+    fs::set_permissions(&videos, fs::Permissions::from_mode(0o755)).expect("set videos mode");
+    let paths = AppPaths {
+        data_dir: directory.path().join("data"),
+        cache_dir: directory.path().join("cache"),
+        config_dir: directory.path().join("config"),
+        videos_dir: videos.clone(),
+    };
+
+    paths.ensure_dirs().expect("secure application directories");
+    for path in [&paths.data_dir, &paths.cache_dir, &paths.config_dir] {
+        assert_eq!(
+            fs::metadata(path).expect("metadata").permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    assert_eq!(
+        fs::metadata(videos)
+            .expect("videos metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
 }
 
 #[test]

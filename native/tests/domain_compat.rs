@@ -1,14 +1,15 @@
 use std::fs;
 
 use chrono::{Local, TimeZone, Utc};
-use openrouter_video_studio::config::{make_output_path_at, partial_path, slugify_prompt};
-use openrouter_video_studio::domain::{
-    FrameImage, FrameType, InputReference, JobLocator, JobStatus, ModelRef, ProviderId,
-    ProviderJobKey, VideoCatalog, VideoModel, VideoRequest, estimate_cost,
-};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tempfile::tempdir;
+use video_harness::config::{make_output_path_at, partial_path, slugify_prompt};
+use video_harness::domain::{
+    DraftMedia, FrameImage, FrameType, GenerationDraft, InputReference, JobLocator, JobStatus,
+    MediaRole, ModelRef, ProviderId, ProviderJobKey, StagedMedia, UploadReceipt, VideoCatalog,
+    VideoModel, VideoRequest, estimate_cost,
+};
 
 fn fixture(name: &str) -> Value {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -175,18 +176,17 @@ fn cost_estimates_only_known_units_and_never_guess_token_pricing() {
 #[test]
 fn job_fixtures_preserve_unknown_status_cost_and_provider_error() {
     let jobs = fixture("jobs.json");
-    let completed = openrouter_video_studio::domain::VideoJob::from_api(&jobs["completed"])
-        .expect("completed job");
+    let completed =
+        video_harness::domain::VideoJob::from_api(&jobs["completed"]).expect("completed job");
     assert_eq!(completed.status, JobStatus::Completed);
     assert!(completed.terminal());
     assert!(completed.successful());
     assert_eq!(completed.cost(), Some(Decimal::new(85, 2)));
 
-    let failed =
-        openrouter_video_studio::domain::VideoJob::from_api(&jobs["failed"]).expect("failed job");
+    let failed = video_harness::domain::VideoJob::from_api(&jobs["failed"]).expect("failed job");
     assert_eq!(failed.error.as_deref(), Some("Fixture provider failed"));
 
-    let unknown = openrouter_video_studio::domain::VideoJob::from_api(&json!({
+    let unknown = video_harness::domain::VideoJob::from_api(&json!({
         "id": "job-provider",
         "status": "provider-specific",
         "polling_url": "/api/v1/videos/job-provider"
@@ -271,6 +271,85 @@ fn provider_identifiers_and_locators_validate_on_deserialization() {
         }))
         .is_err()
     );
+}
+
+#[test]
+fn gui_drafts_persist_paths_not_contents_and_stage_in_storyboard_order() {
+    let directory = tempdir().expect("temporary media directory");
+    let local = directory.path().join("first.png");
+    fs::write(&local, b"\x89PNG\r\n\x1a\nnot copied into the draft").expect("fixture media");
+
+    let mut draft = GenerationDraft::new(
+        ProviderId::fal(),
+        "fal-ai/fixture/image-to-video",
+        "Clouds drift over a quiet ridge",
+    )
+    .expect("draft");
+    draft
+        .media
+        .push(DraftMedia::local(local.clone(), MediaRole::StartFrame));
+    draft.media.push(
+        DraftMedia::remote("https://images.example/style.png", MediaRole::Reference)
+            .expect("remote reference"),
+    );
+    draft.validate().expect("valid draft");
+
+    let serialized = serde_json::to_string(&draft).expect("serialize draft");
+    assert!(serialized.contains(local.to_string_lossy().as_ref()));
+    assert!(!serialized.contains("not copied into the draft"));
+
+    let request = draft
+        .to_video_request(&[
+            StagedMedia::remote(
+                MediaRole::StartFrame,
+                "https://v3.fal.media/files/fixture/start.png",
+            )
+            .expect("staged frame"),
+            StagedMedia::remote(MediaRole::Reference, "https://images.example/style.png")
+                .expect("staged reference"),
+        ])
+        .expect("URL-only provider request");
+    assert_eq!(request.frame_images[0].frame_type, FrameType::FirstFrame);
+    assert_eq!(
+        request.input_references[0].url,
+        "https://images.example/style.png"
+    );
+
+    draft
+        .media
+        .push(DraftMedia::local(local, MediaRole::StartFrame));
+    assert!(
+        draft.validate().is_err(),
+        "duplicate start frames must block Review"
+    );
+
+    let video = directory.path().join("wrong-kind.mp4");
+    fs::write(&video, b"\0\0\0\x18ftypmp42").expect("fixture video");
+    assert!(
+        DraftMedia::local(video, MediaRole::Reference)
+            .validate()
+            .is_err(),
+        "video files must not be mislabeled as image_url references"
+    );
+}
+
+#[test]
+fn upload_receipts_are_bound_to_provider_digest_and_expiration() {
+    let uploaded_at = Utc::now();
+    let receipt = UploadReceipt::new(
+        ProviderId::fal(),
+        "a".repeat(64),
+        "https://v3.fal.media/files/fixture/reference.png",
+        uploaded_at,
+        uploaded_at + chrono::Duration::hours(24),
+        Some("image/png".into()),
+        42,
+    )
+    .expect("receipt");
+    assert!(receipt.reusable_for(&ProviderId::fal(), &"a".repeat(64), uploaded_at));
+    assert!(!receipt.reusable_for(&ProviderId::openrouter(), &"a".repeat(64), uploaded_at));
+    assert!(!receipt.reusable_for(&ProviderId::fal(), &"b".repeat(64), uploaded_at));
+    assert!(!receipt.reusable_for(&ProviderId::fal(), &"a".repeat(64), receipt.expires_at));
 }
 
 #[test]

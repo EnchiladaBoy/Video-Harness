@@ -3,13 +3,13 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use openrouter_video_studio::app::{
+use ratatui::{Terminal, backend::TestBackend};
+use video_harness::app::{
     Action, App, Completion, ComposeFocus, CostView, Effect, HistoryItem, LayoutMode, Modal,
     ProviderConnectionKind, Route, TaskEvent, TaskScope, TerminalCapabilities, UiModel, UiProvider,
 };
-use openrouter_video_studio::domain::{JobLocator, ProviderId};
-use openrouter_video_studio::ui;
-use ratatui::{Terminal, backend::TestBackend};
+use video_harness::domain::{JobLocator, ProviderId};
+use video_harness::ui;
 
 fn capabilities() -> TerminalCapabilities {
     TerminalCapabilities {
@@ -308,7 +308,7 @@ fn ratatui_test_backend_renders_wide_stacked_compact_and_too_small_interfaces() 
     ] {
         let content = render_at(&mut app, width, height);
         assert_eq!(app.layout_mode(), mode);
-        assert!(content.contains("Video Studio Beta"));
+        assert!(content.contains("Video Harness TUI"));
         assert!(content.contains("[OR]"));
         assert!(content.contains("Review & Generate"));
         assert!(

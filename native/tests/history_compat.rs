@@ -1,12 +1,12 @@
 use std::fs;
 use std::path::Path;
 
-use openrouter_video_studio::domain::{JobLocator, JobStatus, ProviderId, VideoJob, VideoRequest};
-use openrouter_video_studio::history::{HistoryError, HistoryStore};
 use rusqlite::Connection;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tempfile::tempdir;
+use video_harness::domain::{JobLocator, JobStatus, ProviderId, VideoJob, VideoRequest};
+use video_harness::history::{HistoryError, HistoryStore};
 
 fn fixture(name: &str) -> Value {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -133,7 +133,7 @@ fn first_native_open_creates_a_no_clobber_sqlite_backup_with_wal_content() {
     assert_eq!(backed_up_rows, 3);
     let native_tables: i64 = backup_connection
         .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'openrouter_video_studio_native_meta'",
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'video_harness_native_meta'",
             [],
             |row| row.get(0),
         )

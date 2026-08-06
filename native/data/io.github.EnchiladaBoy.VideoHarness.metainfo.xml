@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.EnchiladaBoy.VideoHarness</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Video Harness</name>
+  <summary>Create AI videos across providers</summary>
+  <description>
+    <p>
+      Video Harness is a native workspace for prompting, reviewing, monitoring,
+      downloading, and playing AI video generations from multiple providers.
+    </p>
+    <p>
+      It keeps provider credentials separate, confirms the latest price before
+      every paid request, and makes reference media compatibility explicit.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.EnchiladaBoy.VideoHarness.desktop</launchable>
+  <developer id="io.github.enchiladaboy">
+    <name>EnchiladaBoy</name>
+  </developer>
+  <url type="homepage">https://github.com/EnchiladaBoy/video-harness-cli</url>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.3.0" date="2026-08-06">
+      <description>
+        <p>Introduces the native GTK interface, local reference staging, and concurrent job monitoring.</p>
+      </description>
+    </release>
+  </releases>
+</component>

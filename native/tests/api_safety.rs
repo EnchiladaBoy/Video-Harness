@@ -5,17 +5,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use openrouter_video_studio::api::{
-    ApiErrorKind, ClientOptions, HttpExecutor, HttpRequest, HttpResponse, OpenRouterClient,
-    TransportError,
-};
-use openrouter_video_studio::domain::VideoRequest;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION};
 use reqwest::{Method, StatusCode};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use url::Url;
+use video_harness::api::{
+    ApiErrorKind, ClientOptions, HttpExecutor, HttpRequest, HttpResponse, OpenRouterClient,
+    TransportError,
+};
+use video_harness::domain::VideoRequest;
 
 const BASE_URL: &str = "https://api.fixture.invalid/api/v1";
 const FIXTURE_KEY: &str = "sk-test-placeholder";
@@ -207,6 +207,79 @@ async fn ambiguous_submission_transport_failure_performs_exactly_one_post() {
     let requests = executor.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].method, Method::POST);
+}
+
+#[tokio::test]
+async fn ambiguous_submission_5xx_performs_exactly_one_post_and_is_never_retryable() {
+    let executor = ScriptedExecutor::with_replies([
+        Reply::Json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": {"message": "upstream failed after accepting the request"}}),
+        ),
+        Reply::Json(
+            StatusCode::OK,
+            json!({
+                "id": "must-not-be-read",
+                "status": "pending",
+                "polling_url": "/api/v1/videos/must-not-be-read"
+            }),
+        ),
+    ]);
+    let client = client(executor.clone(), 5);
+    let request = VideoRequest::new("black-forest-labs/flux-3-video", "A harmless local fixture")
+        .expect("fixture request");
+    let error = client
+        .submit(&request)
+        .await
+        .expect_err("a paid 5xx response cannot prove rejection");
+    assert_eq!(error.kind, ApiErrorKind::SubmissionUncertain);
+    assert_eq!(error.status_code, Some(503));
+    assert!(!error.is_retryable());
+    assert!(error.message.contains("may exist"));
+    let requests = executor.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, Method::POST);
+}
+
+#[tokio::test]
+async fn nonstandard_4xx_cannot_prove_rejection_and_is_not_retried() {
+    let status = StatusCode::from_u16(499).expect("fixture status");
+    let executor = ScriptedExecutor::with_replies([
+        Reply::Json(
+            status,
+            json!({"error": {"message": "proxy closed after forwarding the request"}}),
+        ),
+        Reply::Json(StatusCode::OK, json!({"id": "must-not-be-read"})),
+    ]);
+    let client = client(executor.clone(), 5);
+    let request = VideoRequest::new("black-forest-labs/flux-3-video", "A harmless local fixture")
+        .expect("fixture request");
+    let error = client
+        .submit(&request)
+        .await
+        .expect_err("an unknown proxy status cannot prove paid-request rejection");
+    assert_eq!(error.kind, ApiErrorKind::SubmissionUncertain);
+    assert_eq!(error.status_code, Some(499));
+    assert!(!error.is_retryable());
+    assert_eq!(executor.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn paid_submission_preserves_deterministic_4xx_rejection() {
+    let executor = ScriptedExecutor::with_replies([Reply::Json(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        json!({"error": {"message": "fixture validation rejection"}}),
+    )]);
+    let client = client(executor.clone(), 5);
+    let request = VideoRequest::new("black-forest-labs/flux-3-video", "A harmless local fixture")
+        .expect("fixture request");
+    let error = client
+        .submit(&request)
+        .await
+        .expect_err("422 proves the paid request was rejected");
+    assert_eq!(error.kind, ApiErrorKind::RequestValidation);
+    assert_eq!(error.status_code, Some(422));
+    assert_eq!(executor.requests().len(), 1);
 }
 
 #[tokio::test]

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Video Harness
+Comment=Create AI videos across providers
+Exec=video-harness
+Icon=io.github.EnchiladaBoy.VideoHarness
+Terminal=false
+Type=Application
+Categories=AudioVideo;Video;
+Keywords=video;generation;AI;OpenRouter;fal;
+StartupNotify=true
+StartupWMClass=io.github.EnchiladaBoy.VideoHarness

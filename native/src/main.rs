@@ -1,8 +1,8 @@
 use std::process::ExitCode;
 
-const HELP: &str = "Video Studio Beta
+const HELP: &str = "Video Harness TUI
 
-Usage: openrouter-video [OPTIONS]
+Usage: video-harness-tui [OPTIONS]
 
 Options:
   -h, --help       Print help
@@ -19,7 +19,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         [argument] if argument == "-V" || argument == "--version" => {
-            println!("openrouter-video {}", env!("CARGO_PKG_VERSION"));
+            println!("video-harness-tui {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         [argument, ..] => {
@@ -43,10 +43,10 @@ fn run_tui() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(openrouter_video_studio::app::run()) {
+    match runtime.block_on(video_harness::app::run()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("Video Studio Beta exited with an error: {error}");
+            eprintln!("Video Harness TUI exited with an error: {error}");
             ExitCode::FAILURE
         }
     }

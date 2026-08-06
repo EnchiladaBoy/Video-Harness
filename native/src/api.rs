@@ -29,7 +29,7 @@ use crate::config::partial_path;
 use crate::domain::{DomainError, VideoCatalog, VideoJob, VideoRequest};
 
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
-pub const DEFAULT_APP_TITLE: &str = "Video Studio Beta";
+pub const DEFAULT_APP_TITLE: &str = "Video Harness";
 pub const MAX_REDIRECTS: usize = 5;
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 1024 * 1024;
@@ -79,10 +79,11 @@ impl ApiError {
     }
 
     pub fn is_retryable(&self) -> bool {
-        self.kind == ApiErrorKind::Network
-            || self
-                .status_code
-                .is_some_and(|status| retryable_statuses().contains(&status))
+        self.kind != ApiErrorKind::SubmissionUncertain
+            && (self.kind == ApiErrorKind::Network
+                || self
+                    .status_code
+                    .is_some_and(|status| retryable_statuses().contains(&status)))
     }
 }
 
@@ -752,8 +753,12 @@ impl OpenRouterClient {
                 }
             };
 
-            if response.status.is_client_error() || response.status.is_server_error() {
+            if !response.status.is_success() {
+                let status = response.status;
                 let error = self.error_from_http(response).await;
+                if !retry_safe && submission_status_is_ambiguous(status) {
+                    return Err(submission_uncertain_from_http(error));
+                }
                 if retry_safe
                     && error
                         .status_code
@@ -941,7 +946,7 @@ impl OpenRouterClient {
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_static("openrouter-video-studio/0.2 Video Studio Beta"),
+            HeaderValue::from_static("video-harness/0.3 Video Harness"),
         );
         if let Some(referer) = &self.options.http_referer {
             headers.insert(
@@ -1042,6 +1047,22 @@ impl OpenRouterClient {
             .saturating_mul(multiplier)
             .min(Duration::from_secs(30))
     }
+}
+
+fn submission_status_is_ambiguous(status: StatusCode) -> bool {
+    !status.is_client_error()
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status.canonical_reason().is_none()
+}
+
+fn submission_uncertain_from_http(mut error: ApiError) -> ApiError {
+    let status = error.status_code.unwrap_or_default();
+    let provider_message = error.message.trim();
+    error.kind = ApiErrorKind::SubmissionUncertain;
+    error.message = format!(
+        "OpenRouter returned HTTP {status} after receiving the submission: {provider_message}. The job may exist; do not submit again until history is checked."
+    );
+    error
 }
 
 async fn collect_body(mut body: HttpBody, limit: usize) -> Result<Vec<u8>, TransportError> {

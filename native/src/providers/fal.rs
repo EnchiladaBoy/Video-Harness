@@ -8,16 +8,18 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use reqwest::header::{
-    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION,
-    RETRY_AFTER, USER_AGENT,
+    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue,
+    LOCATION, RETRY_AFTER, USER_AGENT,
 };
 use reqwest::{Method, StatusCode};
 use rust_decimal::Decimal;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Map, Value, json};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use url::Url;
 
@@ -26,21 +28,30 @@ use crate::api::{
 };
 use crate::config::partial_path;
 use crate::domain::{
-    CostQuote, JobLocator, JobStatus, ProviderDescriptor, ProviderId, QuoteConfidence,
-    VideoArtifact, VideoCatalog, VideoJob, VideoModel, VideoRequest,
+    CostQuote, DraftMedia, JobLocator, JobStatus, MediaSource, ProviderDescriptor, ProviderId,
+    QuoteConfidence, StagedMedia, UploadReceipt, VideoArtifact, VideoCatalog, VideoJob, VideoModel,
+    VideoRequest,
 };
 
-use super::{ProviderAccount, ProviderError, ProviderErrorKind, VideoProvider};
+use super::{
+    MediaCapabilities, ProviderAccount, ProviderError, ProviderErrorKind, UploadProgress,
+    VideoProvider, media_sha256,
+};
 
 pub const DEFAULT_PLATFORM_URL: &str = "https://api.fal.ai/v1";
 pub const DEFAULT_QUEUE_URL: &str = "https://queue.fal.run";
+pub const DEFAULT_STORAGE_URL: &str = "https://rest.fal.ai";
+pub const INPUT_UPLOAD_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
+const MULTIPART_THRESHOLD: u64 = 90 * 1024 * 1024;
+const MULTIPART_CHUNK_SIZE: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct FalOptions {
     pub platform_base_url: Url,
     pub queue_base_url: Url,
+    pub storage_base_url: Url,
     pub timeout: Duration,
     pub max_retries: usize,
     pub backoff_base: Duration,
@@ -51,9 +62,291 @@ impl Default for FalOptions {
         Self {
             platform_base_url: Url::parse(DEFAULT_PLATFORM_URL).expect("built-in fal URL is valid"),
             queue_base_url: Url::parse(DEFAULT_QUEUE_URL).expect("built-in fal URL is valid"),
+            storage_base_url: Url::parse(DEFAULT_STORAGE_URL)
+                .expect("built-in fal storage URL is valid"),
             timeout: Duration::from_secs(60),
             max_retries: 3,
             backoff_base: Duration::from_secs(1),
+        }
+    }
+}
+
+/// Binary side of fal's documented two-step CDN upload. Keeping it separate
+/// from the JSON executor makes uploads testable without sending file bytes.
+#[async_trait]
+pub trait FalUploadExecutor: Send + Sync {
+    async fn upload(
+        &self,
+        upload_url: &Url,
+        path: &Path,
+        content_type: &str,
+        size_bytes: u64,
+        multipart: bool,
+        progress: Option<mpsc::UnboundedSender<UploadProgress>>,
+    ) -> Result<(), ProviderError>;
+}
+
+struct ReqwestFalUploadExecutor {
+    client: reqwest::Client,
+}
+
+impl ReqwestFalUploadExecutor {
+    fn new(timeout: Duration) -> Result<Self, ProviderError> {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| configuration("Could not configure fal CDN uploads"))?;
+        Ok(Self { client })
+    }
+
+    async fn put_bytes(&self, url: &Url, bytes: Bytes) -> Result<Value, ProviderError> {
+        let mut last_error = None;
+        for attempt in 0..3 {
+            let response = self
+                .client
+                .put(url.clone())
+                .body(bytes.clone())
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    let mut stream = response.bytes_stream();
+                    let mut body = Vec::new();
+                    while let Some(chunk) = stream.next().await {
+                        let chunk = chunk.map_err(|_| {
+                            ProviderError::new(
+                                ProviderId::fal(),
+                                ProviderErrorKind::Network,
+                                "fal CDN interrupted an upload response",
+                            )
+                        })?;
+                        if body.len().saturating_add(chunk.len()) > 1024 * 1024 {
+                            return Err(response_error(
+                                "fal CDN upload response exceeded the safe size limit",
+                            ));
+                        }
+                        body.extend_from_slice(&chunk);
+                    }
+                    return if body.is_empty() {
+                        Ok(Value::Null)
+                    } else {
+                        serde_json::from_slice(&body)
+                            .map_err(|_| response_error("fal CDN returned invalid upload JSON"))
+                    };
+                }
+                Ok(response) => {
+                    last_error = Some(format!("HTTP {}", response.status().as_u16()));
+                    if !response.status().is_server_error()
+                        && response.status() != StatusCode::TOO_MANY_REQUESTS
+                    {
+                        break;
+                    }
+                }
+                Err(_) => last_error = Some("network error".into()),
+            }
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
+            }
+        }
+        Err(ProviderError::new(
+            ProviderId::fal(),
+            ProviderErrorKind::Network,
+            format!(
+                "fal CDN upload failed{}",
+                last_error
+                    .as_deref()
+                    .map(|error| format!(" ({error})"))
+                    .unwrap_or_default()
+            ),
+        ))
+    }
+
+    async fn upload_single(
+        &self,
+        upload_url: &Url,
+        path: &Path,
+        content_type: &str,
+        size_bytes: u64,
+        progress: Option<mpsc::UnboundedSender<UploadProgress>>,
+    ) -> Result<(), ProviderError> {
+        for attempt in 0..3 {
+            if let Some(progress) = &progress {
+                let _ = progress.send(UploadProgress {
+                    sent: 0,
+                    total: size_bytes,
+                });
+            }
+            let file = tokio::fs::File::open(path)
+                .await
+                .map_err(|error| validation(format!("Could not open local media: {error}")))?;
+            let progress_for_stream = progress.clone();
+            let stream = futures_util::stream::try_unfold(
+                (file, 0u64, progress_for_stream),
+                move |(mut file, mut sent, progress)| async move {
+                    let mut buffer = vec![0u8; 1024 * 1024];
+                    let read = file.read(&mut buffer).await?;
+                    if read == 0 {
+                        return Ok::<_, std::io::Error>(None);
+                    }
+                    buffer.truncate(read);
+                    sent = sent.saturating_add(read as u64);
+                    if let Some(progress) = &progress {
+                        let _ = progress.send(UploadProgress {
+                            sent,
+                            total: size_bytes,
+                        });
+                    }
+                    Ok(Some((Bytes::from(buffer), (file, sent, progress))))
+                },
+            );
+            let response = self
+                .client
+                .put(upload_url.clone())
+                .header(CONTENT_TYPE, content_type)
+                .header(CONTENT_LENGTH, size_bytes)
+                .body(reqwest::Body::wrap_stream(stream))
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response)
+                    if !response.status().is_server_error()
+                        && response.status() != StatusCode::TOO_MANY_REQUESTS =>
+                {
+                    return Err(response_error(format!(
+                        "fal CDN rejected the upload with HTTP {}",
+                        response.status().as_u16()
+                    )));
+                }
+                _ if attempt < 2 => {
+                    tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
+                }
+                _ => {
+                    return Err(ProviderError::new(
+                        ProviderId::fal(),
+                        ProviderErrorKind::Network,
+                        "fal CDN upload failed after safe retries",
+                    ));
+                }
+            }
+        }
+        unreachable!("upload retry loop always returns")
+    }
+
+    async fn upload_multipart(
+        &self,
+        upload_url: &Url,
+        path: &Path,
+        size_bytes: u64,
+        progress: Option<mpsc::UnboundedSender<UploadProgress>>,
+    ) -> Result<(), ProviderError> {
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .map_err(|error| validation(format!("Could not open local media: {error}")))?;
+        let mut sent = 0u64;
+        let mut part_number = 1u64;
+        let mut parts = Vec::new();
+        if let Some(progress) = &progress {
+            let _ = progress.send(UploadProgress {
+                sent,
+                total: size_bytes,
+            });
+        }
+        loop {
+            let mut chunk = vec![0u8; MULTIPART_CHUNK_SIZE];
+            let mut read_total = 0usize;
+            while read_total < chunk.len() {
+                let read = file
+                    .read(&mut chunk[read_total..])
+                    .await
+                    .map_err(|error| validation(format!("Could not read local media: {error}")))?;
+                if read == 0 {
+                    break;
+                }
+                read_total += read;
+            }
+            if read_total == 0 {
+                break;
+            }
+            chunk.truncate(read_total);
+            let part_url = upload_child_url(upload_url, &part_number.to_string())?;
+            let response = self.put_bytes(&part_url, Bytes::from(chunk)).await?;
+            let response_part = response
+                .get("partNumber")
+                .or_else(|| response.get("part_number"))
+                .and_then(Value::as_u64)
+                .unwrap_or(part_number);
+            let etag = response
+                .get("etag")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| response_error("fal CDN upload part is missing its ETag"))?;
+            parts.push(json!({"partNumber": response_part, "etag": etag}));
+            sent = sent.saturating_add(read_total as u64);
+            if let Some(progress) = &progress {
+                let _ = progress.send(UploadProgress {
+                    sent,
+                    total: size_bytes,
+                });
+            }
+            part_number += 1;
+        }
+        let complete_url = upload_child_url(upload_url, "complete")?;
+        let completion = json!({"parts": parts});
+        for attempt in 0..3 {
+            let response = self
+                .client
+                .post(complete_url.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .json(&completion)
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response)
+                    if !response.status().is_server_error()
+                        && response.status() != StatusCode::TOO_MANY_REQUESTS =>
+                {
+                    return Err(response_error(format!(
+                        "fal CDN could not complete the upload (HTTP {})",
+                        response.status().as_u16()
+                    )));
+                }
+                _ if attempt < 2 => {
+                    tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
+                }
+                _ => {
+                    return Err(ProviderError::new(
+                        ProviderId::fal(),
+                        ProviderErrorKind::Network,
+                        "Could not complete fal CDN multipart upload after safe retries",
+                    ));
+                }
+            }
+        }
+        unreachable!("multipart completion retry loop always returns")
+    }
+}
+
+#[async_trait]
+impl FalUploadExecutor for ReqwestFalUploadExecutor {
+    async fn upload(
+        &self,
+        upload_url: &Url,
+        path: &Path,
+        content_type: &str,
+        size_bytes: u64,
+        multipart: bool,
+        progress: Option<mpsc::UnboundedSender<UploadProgress>>,
+    ) -> Result<(), ProviderError> {
+        validate_upload_url(upload_url)?;
+        if multipart {
+            self.upload_multipart(upload_url, path, size_bytes, progress)
+                .await
+        } else {
+            self.upload_single(upload_url, path, content_type, size_bytes, progress)
+                .await
         }
     }
 }
@@ -62,6 +355,7 @@ pub struct FalProvider {
     api_key: SecretString,
     options: FalOptions,
     executor: Arc<dyn HttpExecutor>,
+    upload_executor: Arc<dyn FalUploadExecutor>,
     models: RwLock<BTreeMap<String, VideoModel>>,
 }
 
@@ -94,8 +388,18 @@ impl FalProvider {
 
     pub fn with_executor(
         api_key: SecretString,
+        options: FalOptions,
+        executor: Arc<dyn HttpExecutor>,
+    ) -> Result<Self, ProviderError> {
+        let upload_executor = Arc::new(ReqwestFalUploadExecutor::new(options.timeout)?);
+        Self::with_executors(api_key, options, executor, upload_executor)
+    }
+
+    pub fn with_executors(
+        api_key: SecretString,
         mut options: FalOptions,
         executor: Arc<dyn HttpExecutor>,
+        upload_executor: Arc<dyn FalUploadExecutor>,
     ) -> Result<Self, ProviderError> {
         let key = api_key.expose_secret().trim().to_owned();
         if key.is_empty() || key.chars().any(char::is_whitespace) {
@@ -107,19 +411,23 @@ impl FalProvider {
         }
         validate_base(&options.platform_base_url, "fal platform URL")?;
         validate_base(&options.queue_base_url, "fal queue URL")?;
+        validate_base(&options.storage_base_url, "fal storage URL")?;
         if options.platform_base_url.host_str() != Some("api.fal.ai")
             || options.queue_base_url.host_str() != Some("queue.fal.run")
+            || options.storage_base_url.host_str() != Some("rest.fal.ai")
         {
             return Err(configuration(
-                "fal credentials may only be sent to api.fal.ai and queue.fal.run",
+                "fal credentials may only be sent to api.fal.ai, queue.fal.run, and rest.fal.ai",
             ));
         }
         normalize_base(&mut options.platform_base_url);
         normalize_base(&mut options.queue_base_url);
+        normalize_base(&mut options.storage_base_url);
         Ok(Self {
             api_key: SecretString::from(key),
             options,
             executor,
+            upload_executor,
             models: RwLock::new(BTreeMap::new()),
         })
     }
@@ -310,6 +618,10 @@ impl FalProvider {
         append_segments(self.options.queue_base_url.clone(), &segments)
     }
 
+    fn storage_url(&self, segments: &[&str]) -> Result<Url, ProviderError> {
+        append_segments(self.options.storage_base_url.clone(), segments)
+    }
+
     async fn request_json(
         &self,
         method: Method,
@@ -318,14 +630,39 @@ impl FalProvider {
         retry_safe: bool,
         body: Option<Value>,
     ) -> Result<Value, ProviderError> {
+        self.request_json_with_headers(
+            method,
+            url,
+            authenticated,
+            retry_safe,
+            body,
+            HeaderMap::new(),
+        )
+        .await
+    }
+
+    async fn request_json_with_headers(
+        &self,
+        method: Method,
+        url: Url,
+        authenticated: bool,
+        retry_safe: bool,
+        body: Option<Value>,
+        extra_headers: HeaderMap,
+    ) -> Result<Value, ProviderError> {
         let max_attempts = if retry_safe {
             self.options.max_retries + 1
         } else {
             1
         };
         for attempt in 0..max_attempts {
-            let request =
-                self.http_request(method.clone(), url.clone(), authenticated, body.clone())?;
+            let request = self.http_request(
+                method.clone(),
+                url.clone(),
+                authenticated,
+                body.clone(),
+                &extra_headers,
+            )?;
             let response = match self.executor.execute(request).await {
                 Ok(response) => response,
                 Err(_) if !retry_safe => {
@@ -348,8 +685,12 @@ impl FalProvider {
                 }
             };
             if !response.status.is_success() {
+                let status = response.status;
                 let retry = retry_safe && retryable(response.status) && attempt + 1 < max_attempts;
                 let error = self.error_from_http(response).await;
+                if !retry_safe && submission_status_is_ambiguous(status) {
+                    return Err(submission_uncertain_from_http(error));
+                }
                 if retry {
                     if let Some(delay) = error.retry_after {
                         tokio::time::sleep(delay).await;
@@ -402,12 +743,13 @@ impl FalProvider {
         url: Url,
         authenticated: bool,
         body: Option<Value>,
+        extra_headers: &HeaderMap,
     ) -> Result<HttpRequest, ProviderError> {
-        let mut headers = HeaderMap::new();
+        let mut headers = extra_headers.clone();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_str(&format!("openrouter-video-studio/0.2 {DEFAULT_APP_TITLE}"))
+            HeaderValue::from_str(&format!("video-harness/0.3 {DEFAULT_APP_TITLE}"))
                 .map_err(|_| configuration("Invalid application title"))?,
         );
         if authenticated {
@@ -606,7 +948,7 @@ impl FalProvider {
             );
             headers.insert(
                 USER_AGENT,
-                HeaderValue::from_static("openrouter-video-studio/0.2 Video Studio Beta"),
+                HeaderValue::from_static("video-harness/0.3 Video Harness"),
             );
             let current = self
                 .executor
@@ -712,6 +1054,33 @@ impl FalProvider {
             }
         }
     }
+
+    async fn submit_request(
+        &self,
+        request: &VideoRequest,
+        submit_before: Option<DateTime<Utc>>,
+    ) -> Result<VideoJob, ProviderError> {
+        let model = self.ensure_model(&request.model).await?;
+        let input = self.fal_input(request, &model)?;
+        let url = self.queue_url(&request.model, &[])?;
+        // Schema resolution above can involve retryable public GETs. Check
+        // staged-input freshness only after that work and immediately before
+        // the one potentially billable POST.
+        if submit_before.is_some_and(|deadline| Utc::now() >= deadline) {
+            return Err(validation(
+                "Staged input media is too close to expiring; Review again before generating",
+            ));
+        }
+        let payload = self
+            .request_json(Method::POST, url, true, false, Some(input))
+            .await?;
+        fal_submitted_job(&request.model, &payload).map_err(|error| {
+            submission_uncertain(format!(
+                "fal returned an invalid accepted-job response: {}. The request may exist.",
+                error.message
+            ))
+        })
+    }
 }
 
 #[async_trait]
@@ -722,6 +1091,145 @@ impl VideoProvider for FalProvider {
             display_name: "fal.ai".into(),
             website: "https://fal.ai".into(),
         }
+    }
+
+    fn media_capabilities(&self) -> MediaCapabilities {
+        MediaCapabilities {
+            remote_urls: true,
+            local_files: true,
+            uploaded_files_public: true,
+            upload_retention: Some(Duration::from_secs(INPUT_UPLOAD_RETENTION_SECONDS)),
+        }
+    }
+
+    async fn validate_request(&self, request: &VideoRequest) -> Result<(), ProviderError> {
+        if request.provider_id != ProviderId::fal() {
+            return Err(validation("The request belongs to a different provider"));
+        }
+        request
+            .validate()
+            .map_err(|error| validation(error.to_string()))?;
+        let model = self.ensure_model(&request.model).await?;
+        self.fal_input(request, &model)?;
+        Ok(())
+    }
+
+    async fn stage_media(
+        &self,
+        media: &DraftMedia,
+        cached_receipt: Option<&UploadReceipt>,
+        progress: Option<mpsc::UnboundedSender<UploadProgress>>,
+    ) -> Result<StagedMedia, ProviderError> {
+        media
+            .validate()
+            .map_err(|error| validation(error.to_string()))?;
+        let MediaSource::LocalFile { path } = &media.source else {
+            let MediaSource::RemoteUrl { url } = &media.source else {
+                unreachable!()
+            };
+            return StagedMedia::remote(media.role, url.clone())
+                .map_err(|error| validation(error.to_string()));
+        };
+
+        let (sha256, size_bytes) = media_sha256(path)
+            .await
+            .map_err(|error| validation(format!("Could not read local media: {error}")))?;
+        if size_bytes == 0 {
+            return Err(validation("Local media file is empty"));
+        }
+        let now = Utc::now();
+        if let Some(receipt) = cached_receipt.filter(|receipt| {
+            receipt.reusable_for(&ProviderId::fal(), &sha256, now)
+                && receipt.size_bytes == size_bytes
+        }) {
+            return StagedMedia::uploaded(media.role, receipt.clone())
+                .map_err(|error| validation(error.to_string()));
+        }
+
+        let content_type = media_content_type(path);
+        let mut file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "reference.bin".into());
+        file_name.retain(|character| !character.is_control());
+        if file_name.is_empty() {
+            file_name = "reference.bin".into();
+        }
+        let multipart = size_bytes > MULTIPART_THRESHOLD;
+        let endpoint = if multipart {
+            "initiate-multipart"
+        } else {
+            "initiate"
+        };
+        let mut url = self.storage_url(&["storage", "upload", endpoint])?;
+        url.query_pairs_mut()
+            .append_pair("storage_type", "fal-cdn-v3");
+        let lifecycle = json!({
+            "expiration_duration_seconds": INPUT_UPLOAD_RETENTION_SECONDS
+        })
+        .to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-fal-object-lifecycle"),
+            HeaderValue::from_str(&lifecycle)
+                .map_err(|_| configuration("Invalid fal upload lifecycle"))?,
+        );
+        let upload_started_at = Utc::now();
+        let initiated = self
+            .request_json_with_headers(
+                Method::POST,
+                url,
+                true,
+                true,
+                Some(json!({
+                    "file_name": file_name,
+                    "content_type": content_type.clone(),
+                })),
+                headers,
+            )
+            .await?;
+        let public_url = initiated
+            .get("file_url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| response_error("fal upload initiation is missing file_url"))?;
+        StagedMedia::remote(media.role, public_url.to_owned())
+            .map_err(|error| unsafe_endpoint(error.to_string()))?;
+        let upload_url = initiated
+            .get("upload_url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| response_error("fal upload initiation is missing upload_url"))?;
+        let upload_url = Url::parse(upload_url)
+            .map_err(|_| unsafe_endpoint("fal returned an invalid CDN upload URL"))?;
+        validate_upload_url(&upload_url)?;
+        // No fal API credential is attached to this provider-signed URL.
+        self.upload_executor
+            .upload(
+                &upload_url,
+                path,
+                &content_type,
+                size_bytes,
+                multipart,
+                progress,
+            )
+            .await?;
+
+        // The provider may start the retention clock when the upload is
+        // initiated, so never overstate the cache lifetime by upload time.
+        let uploaded_at = upload_started_at;
+        let expires_at =
+            uploaded_at + chrono::Duration::seconds(INPUT_UPLOAD_RETENTION_SECONDS as i64);
+        let receipt = UploadReceipt::new(
+            ProviderId::fal(),
+            sha256,
+            public_url,
+            uploaded_at,
+            expires_at,
+            Some(content_type),
+            size_bytes,
+        )
+        .map_err(|error| response_error(error.to_string()))?;
+        StagedMedia::uploaded(media.role, receipt)
+            .map_err(|error| response_error(error.to_string()))
     }
 
     async fn validate_credentials(&self) -> Result<ProviderAccount, ProviderError> {
@@ -758,9 +1266,7 @@ impl VideoProvider for FalProvider {
     }
 
     async fn quote(&self, request: &VideoRequest) -> Result<CostQuote, ProviderError> {
-        if request.provider_id != ProviderId::fal() {
-            return Err(validation("The request belongs to a different provider"));
-        }
+        self.validate_request(request).await?;
         let mut url = self.platform_url(&["models", "pricing"])?;
         url.query_pairs_mut()
             .append_pair("endpoint_id", &request.model);
@@ -839,19 +1345,15 @@ impl VideoProvider for FalProvider {
     }
 
     async fn submit(&self, request: &VideoRequest) -> Result<VideoJob, ProviderError> {
-        let model = self.ensure_model(&request.model).await?;
-        let input = self.fal_input(request, &model)?;
-        let url = self.queue_url(&request.model, &[])?;
-        // This is the only paid POST and `request_json` receives retry_safe=false.
-        let payload = self
-            .request_json(Method::POST, url, true, false, Some(input))
-            .await?;
-        fal_submitted_job(&request.model, &payload).map_err(|error| {
-            submission_uncertain(format!(
-                "fal returned an invalid accepted-job response: {}. The request may exist.",
-                error.message
-            ))
-        })
+        self.submit_request(request, None).await
+    }
+
+    async fn submit_prepared(
+        &self,
+        request: &VideoRequest,
+        submit_before: Option<DateTime<Utc>>,
+    ) -> Result<VideoJob, ProviderError> {
+        self.submit_request(request, submit_before).await
     }
 
     async fn poll(&self, locator: &JobLocator) -> Result<VideoJob, ProviderError> {
@@ -1164,20 +1666,25 @@ fn validate_schema(schema: &Value, value: &Value, path: &str) -> Result<(), Prov
             validate_schema(branch, value, path)?;
         }
     }
-    if let Some(options) = schema
-        .get("anyOf")
-        .or_else(|| schema.get("oneOf"))
-        .and_then(Value::as_array)
-    {
-        if options
+    if let Some(options) = schema.get("anyOf").and_then(Value::as_array)
+        && !options
             .iter()
             .any(|schema| validate_schema(schema, value, path).is_ok())
-        {
-            return Ok(());
-        }
+    {
         return Err(validation(format!(
             "{path} does not match any allowed schema"
         )));
+    }
+    if let Some(options) = schema.get("oneOf").and_then(Value::as_array) {
+        let matching = options
+            .iter()
+            .filter(|schema| validate_schema(schema, value, path).is_ok())
+            .count();
+        if matching != 1 {
+            return Err(validation(format!(
+                "{path} must match exactly one allowed schema"
+            )));
+        }
     }
     if let Some(values) = schema.get("enum").and_then(Value::as_array)
         && !values.contains(value)
@@ -1263,15 +1770,21 @@ fn validate_schema(schema: &Value, value: &Value, path: &str) -> Result<(), Prov
                 return Err(validation(format!("{path}.{required} is required")));
             }
         }
-        if let Some(properties) = properties {
-            for (key, value) in object {
-                if let Some(child_schema) = properties.get(key) {
-                    validate_schema(child_schema, value, &format!("{path}.{key}"))?;
-                } else if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+        for (key, value) in object {
+            if let Some(child_schema) = properties.and_then(|properties| properties.get(key)) {
+                validate_schema(child_schema, value, &format!("{path}.{key}"))?;
+                continue;
+            }
+            match schema.get("additionalProperties") {
+                Some(Value::Bool(false)) => {
                     return Err(validation(format!(
                         "{path}.{key} is not accepted by this model"
                     )));
                 }
+                Some(child_schema @ Value::Object(_)) => {
+                    validate_schema(child_schema, value, &format!("{path}.{key}"))?;
+                }
+                _ => {}
             }
         }
     }
@@ -1603,6 +2116,79 @@ fn validate_download_url(url: &Url) -> Result<(), ProviderError> {
     Ok(())
 }
 
+fn validate_upload_url(url: &Url) -> Result<(), ProviderError> {
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(unsafe_endpoint(
+            "fal CDN upload URL must be public HTTPS without credentials",
+        ));
+    }
+    let host = url.host_str().unwrap_or_default();
+    if host.eq_ignore_ascii_case("localhost")
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+    {
+        return Err(unsafe_endpoint("fal CDN returned a local upload host"));
+    }
+    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        let unsafe_address = match address {
+            std::net::IpAddr::V4(address) => {
+                address.is_private()
+                    || address.is_loopback()
+                    || address.is_link_local()
+                    || address.is_unspecified()
+                    || address.is_broadcast()
+                    || address.is_documentation()
+            }
+            std::net::IpAddr::V6(address) => {
+                address.is_loopback()
+                    || address.is_unspecified()
+                    || address.is_unique_local()
+                    || address.is_unicast_link_local()
+            }
+        };
+        if unsafe_address {
+            return Err(unsafe_endpoint("fal CDN returned a non-public upload host"));
+        }
+    }
+    Ok(())
+}
+
+fn upload_child_url(base: &Url, suffix: &str) -> Result<Url, ProviderError> {
+    validate_upload_url(base)?;
+    let mut url = base.clone();
+    let path = format!("{}/{}", base.path().trim_end_matches('/'), suffix);
+    url.set_path(&path);
+    Ok(url)
+}
+
+fn media_content_type(path: &Path) -> String {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("avif") => "image/avif",
+        Some("bmp") => "image/bmp",
+        Some("tif" | "tiff") => "image/tiff",
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mov") => "video/quicktime",
+        Some("mkv") => "video/x-matroska",
+        _ => "application/octet-stream",
+    }
+    .into()
+}
+
 async fn collect_body(response: HttpResponse, limit: usize) -> Result<Vec<u8>, ProviderError> {
     let mut body = response.body;
     let mut bytes = Vec::new();
@@ -1747,4 +2333,53 @@ fn submission_uncertain(message: impl Into<String>) -> ProviderError {
         ProviderErrorKind::SubmissionUncertain,
         message,
     )
+}
+
+fn submission_status_is_ambiguous(status: StatusCode) -> bool {
+    !status.is_client_error()
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status.canonical_reason().is_none()
+}
+
+fn submission_uncertain_from_http(mut error: ProviderError) -> ProviderError {
+    let status = error.status_code.unwrap_or_default();
+    let provider_message = error.message.trim();
+    error.kind = ProviderErrorKind::SubmissionUncertain;
+    error.message = format!(
+        "fal.ai returned HTTP {status} after receiving the submission: {provider_message}. The request may exist; do not submit again until history is checked."
+    );
+    error
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_combinators_do_not_skip_sibling_constraints() {
+        let any_of_with_minimum = json!({
+            "type": "number",
+            "minimum": 1,
+            "anyOf": [{"type": "number"}, {"type": "string"}]
+        });
+        assert!(validate_schema(&any_of_with_minimum, &json!(0.5), "$input").is_err());
+
+        let overlapping_one_of = json!({
+            "oneOf": [{"type": "number"}, {"minimum": 0}]
+        });
+        assert!(validate_schema(&overlapping_one_of, &json!(1), "$input").is_err());
+    }
+
+    #[test]
+    fn schema_additional_properties_is_enforced_without_declared_properties() {
+        let closed = json!({"type": "object", "additionalProperties": false});
+        assert!(validate_schema(&closed, &json!({"unexpected": true}), "$input").is_err());
+
+        let typed = json!({
+            "type": "object",
+            "additionalProperties": {"type": "string"}
+        });
+        assert!(validate_schema(&typed, &json!({"valid": "yes"}), "$input").is_ok());
+        assert!(validate_schema(&typed, &json!({"invalid": 1}), "$input").is_err());
+    }
 }

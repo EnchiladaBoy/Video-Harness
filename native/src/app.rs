@@ -2856,7 +2856,61 @@ fn service_event_to_task(event: crate::workflow::ServiceEvent) -> Option<TaskEve
         }),
         ServiceEvent::SettingsSaved { .. }
         | ServiceEvent::DefaultProviderSaved { .. }
+        | ServiceEvent::PreparationStarted { .. }
+        | ServiceEvent::MediaUploadStarted { .. }
+        | ServiceEvent::MediaUploadProgress { .. }
+        | ServiceEvent::MediaUploadCompleted { .. }
+        | ServiceEvent::ReviewReady { .. }
+        | ServiceEvent::PreparedInvalidated { .. }
+        | ServiceEvent::DraftSaved { .. }
+        | ServiceEvent::DraftLoaded { .. }
+        | ServiceEvent::UncertainSubmissionSaved { .. }
+        | ServiceEvent::UncertainSubmissionCleared { .. }
+        | ServiceEvent::UncertainSubmissionsLoaded { .. }
+        | ServiceEvent::MonitorPaused { .. }
+        | ServiceEvent::MonitorsPaused { .. }
+        | ServiceEvent::ResumeAllStarted { .. }
+        | ServiceEvent::ResumableJobsLoaded { .. }
+        | ServiceEvent::JobRecoverySaved { .. }
+        | ServiceEvent::ShutdownBlocked { .. }
         | ServiceEvent::VideoOpened { .. } => None,
+        ServiceEvent::JobRecoveryWarning {
+            provider_id,
+            message,
+            ..
+        } => Some(TaskEvent::Error {
+            provider_id: Some(provider_id),
+            scope: TaskScope::General,
+            message,
+            recoverable: true,
+        }),
+        ServiceEvent::JobRecoveryFailed {
+            provider_id,
+            key,
+            message,
+            ..
+        } => Some(TaskEvent::Error {
+            provider_id: Some(provider_id),
+            scope: TaskScope::Generation,
+            message: format!("{message} Remote job id: {}", key.remote_job_id),
+            recoverable: false,
+        }),
+        ServiceEvent::SubmissionUncertain {
+            provider_id,
+            message,
+            ..
+        } => Some(TaskEvent::Error {
+            provider_id: Some(provider_id),
+            scope: TaskScope::Generation,
+            message,
+            recoverable: false,
+        }),
+        ServiceEvent::UncertainSubmissionBlocked { record, .. } => Some(TaskEvent::Error {
+            provider_id: Some(record.provider_id),
+            scope: TaskScope::Generation,
+            message: record.message,
+            recoverable: false,
+        }),
         ServiceEvent::SubmissionStarted { provider_id, .. } => {
             Some(TaskEvent::SubmissionStarted { provider_id })
         }
@@ -2952,7 +3006,10 @@ fn service_event_to_task(event: crate::workflow::ServiceEvent) -> Option<TaskEve
                 ServiceScope::Import => TaskScope::Import,
                 ServiceScope::History => TaskScope::History,
                 ServiceScope::OpenVideo => TaskScope::OpenVideo,
-                ServiceScope::Startup | ServiceScope::Settings => TaskScope::General,
+                ServiceScope::Preparation => TaskScope::Generation,
+                ServiceScope::Startup | ServiceScope::Settings | ServiceScope::Draft => {
+                    TaskScope::General
+                }
             },
             message,
             recoverable,

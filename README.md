@@ -1,76 +1,85 @@
-# OpenRouter Video Studio
+# Video Harness
 
-OpenRouter Video Studio is a Linux-first terminal interface for generating videos without composing API requests by hand. Paste an OpenRouter API key, choose a current video model, write a prompt, confirm the estimated cost, and follow the real job status while a small terminal animation plays. Completed videos are downloaded to your normal **Videos** folder and can be opened with a single key.
+Video Harness is a native Linux workspace for generating AI video across providers. It gives prompts, reference frames, model controls, price review, job monitoring, downloads, and playback a proper graphical home instead of making you assemble API requests by hand.
 
-> Video generation is a paid OpenRouter operation. The app always asks for confirmation before submitting a job. A displayed estimate is informational; OpenRouter's final usage cost is authoritative.
+The v0.3 release supports OpenRouter and fal.ai. It saves finished videos to your XDG Videos directory (normally `~/Videos`) and keeps the transition-release terminal interface available as `video-harness-tui`.
 
-## Requirements
+## What it does
 
-- Linux and Python 3.11 or newer
-- A terminal with color support (the interface also remains usable without color)
-- An [OpenRouter API key](https://openrouter.ai/settings/keys) with sufficient credit
-- `xdg-open` to use the open-video hotkey
-- A desktop Secret Service provider, such as GNOME Keyring, for persistent credential storage
+- Builds a generation visually with a prompt, model options, and ordered reference media.
+- Accepts local image files through a picker or drag and drop, as well as public HTTPS URLs.
+- Checks each model/provider combination before Review instead of silently dropping unsupported inputs.
+- Shows a fresh quote and a complete request summary before enabling the single paid **Generate** action.
+- Monitors multiple accepted remote jobs independently, with honest provider states and a small waiting animation.
+- Downloads atomically to `~/Videos`, plays completed work in the app, and can open it in the system player.
+- Autosaves draft text, options, and source paths locally. It never copies draft media or writes API keys into settings/history.
 
-The API key is masked while typing. When a supported keyring is available it is stored there; otherwise it stays only in memory for the current run. It is never written to project configuration, application history, or logs.
+Local reference files are uploaded only when you choose **Review**. fal.ai inputs are staged on fal's public CDN with a 24-hour expiry preference and reusable receipts are cached until expiry. OpenRouter currently documents video references as stable public HTTPS URLs, so Video Harness clearly blocks local files for OpenRouter rather than uploading them somewhere you did not choose.
 
-## Install
+## Install on Fedora
 
-From this directory, run:
+Install the native build prerequisites once:
+
+```bash
+sudo dnf install gcc gtk4-devel libadwaita-devel
+```
+
+Then build and install both native interfaces plus the desktop entry:
 
 ```bash
 chmod +x install.sh
 ./install.sh
 ```
 
-The installer creates an isolated `.venv`, installs the project in editable mode, and links `openrouter-video` into `~/.local/bin`. It does not use `sudo` or install global Python packages.
-
-Launch it with:
+Launch **Video Harness** from GNOME's app grid or run:
 
 ```bash
-openrouter-video
+video-harness
 ```
 
-If `~/.local/bin` is not on `PATH`, run `~/.local/bin/openrouter-video` or add that directory to your shell's `PATH`.
+The immutable release lives under `~/.local/lib/openrouter-video-studio/releases/0.3.0/`. The legacy internal directory is intentional: it preserves existing credentials, catalog caches, settings, and `history.sqlite3`. New GUI-only state is isolated in `gui-state.sqlite3`.
 
-## Use
+## First generation
 
-1. On first launch, paste an API key and validate it.
-2. Enter a prompt and select a model. Settings shown by the app adapt to that model's advertised capabilities.
-3. Start generation and review the final settings and cost estimate before confirming.
-4. Keep the app open to watch the remote state and elapsed time. Leaving the progress view does not cancel a paid remote job.
-5. When complete, press `O` or `Enter` to open the saved video, or `N` to start another.
+1. Open **Providers & Settings**, paste a provider key, and connect it. Keys are masked and stored in Secret Service when available; otherwise they remain in memory for that session.
+2. In **New Generation**, choose a provider/model, write the prompt, and add any reference media.
+3. Choose **Review**. Video Harness validates the draft, stages supported local files, refreshes the quote, and shows exactly what will be submitted.
+4. Choose **Generate — one paid request** once. Video Harness never automatically retries an ambiguous paid submission.
+5. Follow the job in **Jobs**. Closing the app pauses local monitoring only; the remote provider continues. Use **Resume all** after relaunch.
 
-Videos are saved directly in the XDG Videos directory. On a typical Linux install—and on the intended system here—that is `/home/alex/Videos`. Partial downloads use a `.part` suffix and are only renamed to `.mp4` after a successful non-empty download.
+If a paid request is accepted, the remote job ID is surfaced before local persistence work so it remains recoverable even if a later disk write fails.
+If the connection disappears before an ID comes back, a durable safety hold blocks that exact draft across restarts. Video Harness asks you to check the provider dashboard before explicitly allowing another paid attempt; editing creates a distinct draft, and undoing the edit restores the hold.
 
-Common keys are displayed in the footer. `Ctrl+Enter` begins the confirmation flow, `H` opens local history, `Esc` returns or closes a dialog, and `Q` quits where shown.
+## Terminal and Python transition
 
-## Reliability and privacy
-
-- The live model catalog comes from OpenRouter and the last successful catalog is cached for temporary offline use.
-- Safe reads and downloads use bounded retries. Submission is never automatically retried after an ambiguous network failure, preventing accidental duplicate paid jobs.
-- Authorization is attached only to validated OpenRouter API URLs. It is not sent to provider-hosted unsigned download URLs.
-- Pending job metadata and prompts are retained only in the local history database so monitoring can resume after a restart. To clear all history, close the app and remove the database shown by your XDG data path (normally `~/.local/share/openrouter-video-studio/history.sqlite3`).
-- A local timeout pauses monitoring—it does not claim the remote generation failed. Resume it from history later.
-
-## Development and tests
-
-Install the test extras into the private environment and run the offline suite:
+The Rust terminal UI remains available for one transition release:
 
 ```bash
-.venv/bin/python -m pip install --editable '.[test]'
-.venv/bin/python -m pytest
+video-harness-tui
+# compatibility alias
+openrouter-video-rs
 ```
 
-Tests mock the HTTP transport and never create paid video jobs. Do not use a real API key in tests.
+`openrouter-video` and its Python environment are not replaced by a normal Video Harness install. Existing installations are captured as `openrouter-video-python`; the native installer's explicit `promote` and `rollback` commands retain the previous safety behavior. To install the old Python interface directly, use `./install-python-legacy.sh`.
 
-## Multi-provider native Rust beta
+## Development
 
-A one-executable Fedora ARM64 edition is developed alongside this Python implementation. Native v0.2 presents the temporary title **Video Studio Beta** and supports provider adapters for OpenRouter and fal.ai while preserving the existing Python command as the stable rollback target. It uses compatibility-safe application paths, isolated provider credentials, and additive provider-qualified history. Native build, test, beta alias, atomic promotion, and rollback instructions are in [native/README.md](native/README.md).
+```bash
+cd native
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+```
 
-## Troubleshooting
+The Rust integration suite uses in-memory credentials, temporary databases, and deterministic mock transports. It does not contact inference providers or spend credits. The preserved Python compatibility suite can be run with `pytest` from its existing virtual environment.
 
-- **Key is not remembered:** unlock or install a Secret Service provider, then restart. The memory-only fallback is intentional when secure persistence is unavailable.
-- **Video does not open:** the file is still saved; install `xdg-utils` or open the reported path in your preferred player.
-- **Model list is marked stale:** check connectivity to OpenRouter. You can browse cached details, but submission still needs network access.
-- **Job appears stuck:** use history to resume polling. Do not submit the same prompt again unless you intend to pay for another generation.
+## Data and privacy
+
+- API keys use the existing `openrouter-video-studio` Secret Service identity for compatibility and are never shown again by the app.
+- Prompts, remote job IDs, and request metadata are stored locally to support history and resuming.
+- Draft persistence stores source paths/URLs, never source file contents.
+- Half-written seed, Advanced JSON, and schema-control text is restored exactly; credential-like fields and active provider keys fail closed instead of being written.
+- Downloads use `.part` files and become `.mp4` only after a successful, non-empty transfer.
+- Authorization is restricted to validated provider API endpoints and is never attached to unsigned output URLs.
+
+Video generation is a paid provider operation. Quotes are informational; the provider's final usage charge is authoritative.

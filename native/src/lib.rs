@@ -1,10 +1,12 @@
-//! Native backend and terminal UI for OpenRouter Video Studio.
+//! Native backend and frontends for Video Harness.
 
 pub mod api;
 pub mod app;
 pub mod config;
 pub mod credentials;
 pub mod domain;
+pub mod gui;
+pub mod gui_state;
 pub mod history;
 pub mod providers;
 pub mod ui;

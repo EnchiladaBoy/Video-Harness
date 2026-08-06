@@ -2,7 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
@@ -414,6 +415,413 @@ impl InputReference {
 
     pub fn to_payload(&self) -> Value {
         json!({"type": "image_url", "image_url": {"url": self.url}})
+    }
+}
+
+/// A reference asset as selected in the GUI before any provider-specific
+/// upload has taken place. Local file contents are deliberately never
+/// serialized; only their path is persisted with a draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MediaSource {
+    LocalFile { path: PathBuf },
+    RemoteUrl { url: String },
+}
+
+impl MediaSource {
+    pub fn local(path: impl Into<PathBuf>) -> Self {
+        Self::LocalFile { path: path.into() }
+    }
+
+    pub fn remote(url: impl Into<String>) -> Result<Self, DomainError> {
+        let source = Self::RemoteUrl { url: url.into() };
+        source.validate()?;
+        Ok(source)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        match self {
+            Self::LocalFile { path } => {
+                if path.as_os_str().is_empty() {
+                    return Err(DomainError::Validation(
+                        "Local media path is required".into(),
+                    ));
+                }
+                if !path.is_absolute() {
+                    return Err(DomainError::Validation(
+                        "Local media path must be absolute".into(),
+                    ));
+                }
+                let metadata = fs::metadata(path).map_err(|error| {
+                    DomainError::Validation(format!(
+                        "Local media file {} is unavailable: {error}",
+                        path.display()
+                    ))
+                })?;
+                if !metadata.is_file() {
+                    return Err(DomainError::Validation(format!(
+                        "Local media path {} is not a regular file",
+                        path.display()
+                    )));
+                }
+                if metadata.len() == 0 {
+                    return Err(DomainError::Validation(format!(
+                        "Local media file {} is empty",
+                        path.display()
+                    )));
+                }
+                validate_local_reference_image(path)?;
+            }
+            Self::RemoteUrl { url } => validate_public_https_url(url, "Reference media")?,
+        }
+        Ok(())
+    }
+
+    pub fn local_path(&self) -> Option<&Path> {
+        match self {
+            Self::LocalFile { path } => Some(path),
+            Self::RemoteUrl { .. } => None,
+        }
+    }
+
+    pub fn remote_url(&self) -> Option<&str> {
+        match self {
+            Self::LocalFile { .. } => None,
+            Self::RemoteUrl { url } => Some(url),
+        }
+    }
+}
+
+fn validate_local_reference_image(path: &Path) -> Result<(), DomainError> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| {
+            DomainError::Validation("Local references must use a supported image extension".into())
+        })?;
+    if !matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "avif" | "bmp" | "tif" | "tiff"
+    ) {
+        return Err(DomainError::Validation(format!(
+            "Local reference {} is not a supported image; video and audio files cannot be sent as image_url inputs",
+            path.display()
+        )));
+    }
+    let mut file = fs::File::open(path).map_err(|error| {
+        DomainError::Validation(format!(
+            "Local media file {} is unavailable: {error}",
+            path.display()
+        ))
+    })?;
+    let mut header = [0u8; 16];
+    let read = file.read(&mut header).map_err(|error| {
+        DomainError::Validation(format!(
+            "Could not inspect local media file {}: {error}",
+            path.display()
+        ))
+    })?;
+    let bytes = &header[..read];
+    let signature_matches = match extension.as_str() {
+        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "jpg" | "jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
+        "bmp" => bytes.starts_with(b"BM"),
+        "tif" | "tiff" => bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*"),
+        "avif" => {
+            bytes.len() >= 12
+                && &bytes[4..8] == b"ftyp"
+                && matches!(&bytes[8..12], b"avif" | b"avis" | b"mif1" | b"miaf")
+        }
+        _ => false,
+    };
+    if !signature_matches {
+        return Err(DomainError::Validation(format!(
+            "Local reference {} does not match its image format",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaRole {
+    StartFrame,
+    EndFrame,
+    Reference,
+}
+
+impl MediaRole {
+    pub const fn frame_type(self) -> Option<FrameType> {
+        match self {
+            Self::StartFrame => Some(FrameType::FirstFrame),
+            Self::EndFrame => Some(FrameType::LastFrame),
+            Self::Reference => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftMedia {
+    pub source: MediaSource,
+    pub role: MediaRole,
+}
+
+impl DraftMedia {
+    pub fn local(path: impl Into<PathBuf>, role: MediaRole) -> Self {
+        Self {
+            source: MediaSource::local(path),
+            role,
+        }
+    }
+
+    pub fn remote(url: impl Into<String>, role: MediaRole) -> Result<Self, DomainError> {
+        Ok(Self {
+            source: MediaSource::remote(url)?,
+            role,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        self.source.validate()
+    }
+}
+
+/// A provider upload that can be reused while both its content digest and
+/// expiration remain valid. The source path is intentionally absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadReceipt {
+    pub provider_id: ProviderId,
+    pub sha256: String,
+    pub public_url: String,
+    pub uploaded_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    pub size_bytes: u64,
+}
+
+impl UploadReceipt {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        provider_id: ProviderId,
+        sha256: impl Into<String>,
+        public_url: impl Into<String>,
+        uploaded_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        content_type: Option<String>,
+        size_bytes: u64,
+    ) -> Result<Self, DomainError> {
+        let receipt = Self {
+            provider_id,
+            sha256: sha256.into(),
+            public_url: public_url.into(),
+            uploaded_at,
+            expires_at,
+            content_type,
+            size_bytes,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(DomainError::Validation(
+                "Upload receipt SHA-256 digest is invalid".into(),
+            ));
+        }
+        validate_public_https_url(&self.public_url, "Uploaded media")?;
+        if self.expires_at <= self.uploaded_at {
+            return Err(DomainError::Validation(
+                "Upload receipt expiration must follow upload time".into(),
+            ));
+        }
+        if self.size_bytes == 0 {
+            return Err(DomainError::Validation(
+                "Upload receipt cannot describe an empty file".into(),
+            ));
+        }
+        if self
+            .content_type
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty() || value.chars().any(char::is_control))
+        {
+            return Err(DomainError::Validation(
+                "Upload receipt content type is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn reusable_for(&self, provider_id: &ProviderId, sha256: &str, now: DateTime<Utc>) -> bool {
+        self.validate().is_ok()
+            && &self.provider_id == provider_id
+            && self.sha256 == sha256
+            && self.expires_at > now
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedMedia {
+    pub role: MediaRole,
+    pub public_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<UploadReceipt>,
+}
+
+impl StagedMedia {
+    pub fn remote(role: MediaRole, url: impl Into<String>) -> Result<Self, DomainError> {
+        let media = Self {
+            role,
+            public_url: url.into(),
+            receipt: None,
+        };
+        media.validate()?;
+        Ok(media)
+    }
+
+    pub fn uploaded(role: MediaRole, receipt: UploadReceipt) -> Result<Self, DomainError> {
+        receipt.validate()?;
+        let media = Self {
+            role,
+            public_url: receipt.public_url.clone(),
+            receipt: Some(receipt),
+        };
+        media.validate()?;
+        Ok(media)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        validate_public_https_url(&self.public_url, "Staged media")?;
+        if let Some(receipt) = &self.receipt {
+            receipt.validate()?;
+            if receipt.public_url != self.public_url {
+                return Err(DomainError::Validation(
+                    "Staged media URL does not match its upload receipt".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Editable, autosave-friendly generation input. It deliberately separates
+/// local reference paths from the URL-only `VideoRequest` sent to providers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GenerationDraft {
+    pub provider_id: ProviderId,
+    pub model: String,
+    pub prompt: String,
+    pub duration: Option<u32>,
+    pub resolution: Option<String>,
+    pub aspect_ratio: Option<String>,
+    pub size: Option<String>,
+    pub generate_audio: Option<bool>,
+    pub seed: Option<i64>,
+    #[serde(default)]
+    pub media: Vec<DraftMedia>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_options: Option<Value>,
+}
+
+impl GenerationDraft {
+    pub fn new(
+        provider_id: ProviderId,
+        model: impl Into<String>,
+        prompt: impl Into<String>,
+    ) -> Result<Self, DomainError> {
+        let draft = Self {
+            provider_id,
+            model: model.into(),
+            prompt: prompt.into(),
+            duration: None,
+            resolution: None,
+            aspect_ratio: None,
+            size: None,
+            generate_audio: None,
+            seed: None,
+            media: Vec::new(),
+            adapter_options: None,
+        };
+        // A newly opened composer may have an empty prompt/model. Full
+        // validation happens at Review, matching the GUI workflow.
+        Ok(draft)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        let request = self.request_without_media()?;
+        request.validate()?;
+        let mut start_frames = 0usize;
+        let mut end_frames = 0usize;
+        for media in &self.media {
+            media.validate()?;
+            match media.role {
+                MediaRole::StartFrame => start_frames += 1,
+                MediaRole::EndFrame => end_frames += 1,
+                MediaRole::Reference => {}
+            }
+        }
+        if start_frames > 1 || end_frames > 1 {
+            return Err(DomainError::Validation(
+                "A draft can contain at most one start frame and one end frame".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn to_video_request(&self, staged: &[StagedMedia]) -> Result<VideoRequest, DomainError> {
+        self.validate()?;
+        if staged.len() != self.media.len() {
+            return Err(DomainError::Validation(
+                "Every draft media item must be staged before Review".into(),
+            ));
+        }
+        let mut request = self.request_without_media()?;
+        for (draft_media, staged_media) in self.media.iter().zip(staged) {
+            staged_media.validate()?;
+            if draft_media.role != staged_media.role {
+                return Err(DomainError::Validation(
+                    "Staged media order or role does not match the draft".into(),
+                ));
+            }
+            if let Some(frame_type) = staged_media.role.frame_type() {
+                request.frame_images.push(FrameImage::new(
+                    staged_media.public_url.clone(),
+                    frame_type,
+                )?);
+            } else {
+                request
+                    .input_references
+                    .push(InputReference::new(staged_media.public_url.clone())?);
+            }
+        }
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn request_without_media(&self) -> Result<VideoRequest, DomainError> {
+        let mut request = VideoRequest::for_provider(
+            self.provider_id.clone(),
+            self.model.clone(),
+            self.prompt.clone(),
+        )?;
+        request.duration = self.duration;
+        request.resolution = self.resolution.clone();
+        request.aspect_ratio = self.aspect_ratio.clone();
+        request.size = self.size.clone();
+        request.generate_audio = self.generate_audio;
+        request.seed = self.seed;
+        request.adapter_options = self.adapter_options.clone();
+        Ok(request)
     }
 }
 

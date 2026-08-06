@@ -1,26 +1,36 @@
 [package]
-name = "openrouter-video-studio-native"
-version = "0.2.0"
+name = "video-harness"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.88"
-description = "A safe multi-provider terminal client for AI video generation"
+rust-version = "1.92"
+description = "A native multi-provider workspace for AI video generation"
 license = "MIT"
+repository = "https://github.com/EnchiladaBoy/video-harness-cli"
+keywords = ["video", "ai", "gtk", "openrouter", "fal"]
+categories = ["multimedia::video"]
+default-run = "video-harness"
 publish = false
 
 [lib]
-name = "openrouter_video_studio"
+name = "video_harness"
 path = "src/lib.rs"
 
 [[bin]]
-name = "openrouter-video"
+name = "video-harness"
+path = "src/bin/video-harness.rs"
+
+[[bin]]
+name = "video-harness-tui"
 path = "src/main.rs"
 
 [dependencies]
 async-trait = "0.1.89"
+adw = { package = "libadwaita", version = "0.9.2", features = ["v1_6"] }
 bytes = "1.10"
 chrono = { version = "0.4.45", features = ["clock", "serde"] }
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 futures-util = "0.3.31"
+gtk = { package = "gtk4", version = "0.11.4", features = ["v4_10"] }
 httpdate = "1.0.3"
 keyring = "4.1"
 ratatui = "0.30.0"
@@ -30,6 +40,7 @@ rust_decimal = { version = "1.40", features = ["serde-with-str"] }
 secrecy = "0.10.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+sha2 = "0.10"
 thiserror = "2.0.18"
 tokio = { version = "1.49", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 unicode-normalization = "0.1.25"

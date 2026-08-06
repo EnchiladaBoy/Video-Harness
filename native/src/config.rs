@@ -5,6 +5,8 @@ use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local};
@@ -182,6 +184,12 @@ impl AppPaths {
         self.data_dir.join("history.sqlite3")
     }
 
+    /// GUI editing and upload state lives beside, but never inside, the
+    /// compatibility-sensitive generation history database.
+    pub fn gui_state_db(&self) -> PathBuf {
+        self.data_dir.join("gui-state.sqlite3")
+    }
+
     pub fn catalog_cache(&self) -> PathBuf {
         self.cache_dir.join("video-models.json")
     }
@@ -233,17 +241,25 @@ impl AppPaths {
     }
 
     pub fn ensure_dirs(&self) -> Result<(), ConfigError> {
-        for path in [
-            &self.data_dir,
-            &self.cache_dir,
-            &self.config_dir,
-            &self.videos_dir,
-        ] {
+        for path in [&self.data_dir, &self.cache_dir, &self.config_dir] {
             fs::create_dir_all(path).map_err(|source| ConfigError::CreateDirectory {
                 path: path.clone(),
                 source,
             })?;
+            #[cfg(unix)]
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
+                ConfigError::CreateDirectory {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
         }
+        // The user's normal Videos folder is intentionally not made private or
+        // otherwise re-permissioned by this application.
+        fs::create_dir_all(&self.videos_dir).map_err(|source| ConfigError::CreateDirectory {
+            path: self.videos_dir.clone(),
+            source,
+        })?;
         Ok(())
     }
 }

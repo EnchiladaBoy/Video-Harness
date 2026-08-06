@@ -1,4 +1,4 @@
-//! Pure Ratatui rendering for the native OpenRouter Video Studio.
+//! Pure Ratatui rendering for the transitional Video Harness TUI.
 
 use std::time::Instant;
 
@@ -113,7 +113,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Palette) {
-    let title = " Video Studio Beta ";
+    let title = " Video Harness TUI ";
     let clock_width = app.clock.chars().count() as u16;
     let gap = area.width.saturating_sub(title.len() as u16 + clock_width);
     let line = Line::from(vec![
@@ -209,7 +209,7 @@ fn render_too_small(frame: &mut Frame<'_>, app: &App, palette: Palette) {
         Paragraph::new(lines)
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true })
-            .block(panel_block(" Video Studio Beta ", false, palette)),
+            .block(panel_block(" Video Harness TUI ", false, palette)),
         area,
     );
 }
@@ -222,9 +222,9 @@ fn render_onboarding(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Pale
     frame.render_widget(
         panel_block(
             if app.capabilities.unicode {
-                " ✦ Video Studio Beta ✦ "
+                " ✦ Video Harness TUI ✦ "
             } else {
-                " Video Studio Beta "
+                " Video Harness TUI "
             },
             false,
             palette,
@@ -292,7 +292,7 @@ fn render_compose(frame: &mut Frame<'_>, area: Rect, app: &App, palette: Palette
     let page = area.inner(Margin::new(if area.width > 90 { 2 } else { 1 }, 0));
     let body = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(page);
     frame.render_widget(
-        Paragraph::new("Video Studio Beta")
+        Paragraph::new("Video Harness TUI")
             .alignment(Alignment::Center)
             .style(
                 Style::default()

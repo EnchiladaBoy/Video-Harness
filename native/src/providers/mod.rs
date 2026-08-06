@@ -10,15 +10,18 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 use crate::api::DownloadProgress;
 use crate::domain::{
-    CostQuote, JobLocator, ProviderDescriptor, ProviderId, VideoArtifact, VideoCatalog, VideoJob,
-    VideoRequest,
+    CostQuote, DraftMedia, GenerationDraft, JobLocator, MediaSource, ProviderDescriptor,
+    ProviderId, StagedMedia, UploadReceipt, VideoArtifact, VideoCatalog, VideoJob, VideoRequest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,9 +87,197 @@ pub struct ProviderAccount {
     pub raw: Value,
 }
 
+/// Provider-level media behavior used to update the GUI before Review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaCapabilities {
+    pub remote_urls: bool,
+    pub local_files: bool,
+    /// fal CDN input uploads are accessible to anyone who has their URL.
+    pub uploaded_files_public: bool,
+    /// The lifetime requested for provider-managed input uploads.
+    pub upload_retention: Option<Duration>,
+}
+
+impl MediaCapabilities {
+    pub const fn urls_only() -> Self {
+        Self {
+            remote_urls: true,
+            local_files: false,
+            uploaded_files_public: false,
+            upload_retention: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadProgress {
+    pub sent: u64,
+    pub total: u64,
+}
+
+/// Hash a local media file without retaining its contents in memory. The
+/// digest is used as the provider-upload cache key.
+pub async fn media_sha256(path: &Path) -> Result<(String, u64), std::io::Error> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size = size.saturating_add(read as u64);
+    }
+    Ok((format!("{:x}", hasher.finalize()), size))
+}
+
 #[async_trait]
 pub trait VideoProvider: Send + Sync {
     fn descriptor(&self) -> ProviderDescriptor;
+
+    fn media_capabilities(&self) -> MediaCapabilities {
+        MediaCapabilities::urls_only()
+    }
+
+    /// Validate an editable draft without uploading media or performing a
+    /// potentially billable submission. Local files are represented by inert
+    /// public-HTTPS placeholders only after their paths and provider media
+    /// capabilities have been checked.
+    async fn validate_draft(&self, draft: &GenerationDraft) -> Result<(), ProviderError> {
+        let descriptor = self.descriptor();
+        if draft.provider_id != descriptor.id {
+            return Err(ProviderError::new(
+                descriptor.id,
+                ProviderErrorKind::Validation,
+                "The draft belongs to a different provider",
+            ));
+        }
+        draft.validate().map_err(|error| {
+            ProviderError::new(
+                descriptor.id.clone(),
+                ProviderErrorKind::Validation,
+                error.to_string(),
+            )
+        })?;
+
+        let capabilities = self.media_capabilities();
+        let mut validation_media = Vec::with_capacity(draft.media.len());
+        for (index, media) in draft.media.iter().enumerate() {
+            let public_url = match &media.source {
+                MediaSource::RemoteUrl { url } if capabilities.remote_urls => url.clone(),
+                MediaSource::RemoteUrl { .. } => {
+                    return Err(ProviderError::new(
+                        descriptor.id,
+                        ProviderErrorKind::Validation,
+                        format!(
+                            "{} does not support remote reference URLs",
+                            descriptor.display_name
+                        ),
+                    ));
+                }
+                MediaSource::LocalFile { path } if capabilities.local_files => {
+                    let extension = path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .unwrap_or("png");
+                    format!(
+                        "https://validation.invalid/reference-{}.{extension}",
+                        index + 1
+                    )
+                }
+                MediaSource::LocalFile { .. } => {
+                    return Err(ProviderError::new(
+                        descriptor.id,
+                        ProviderErrorKind::Validation,
+                        format!(
+                            "{} does not support local reference files; use a public HTTPS URL",
+                            descriptor.display_name
+                        ),
+                    ));
+                }
+            };
+            validation_media.push(StagedMedia::remote(media.role, public_url).map_err(
+                |error| {
+                    ProviderError::new(
+                        descriptor.id.clone(),
+                        ProviderErrorKind::Validation,
+                        error.to_string(),
+                    )
+                },
+            )?);
+        }
+        let request = draft.to_video_request(&validation_media).map_err(|error| {
+            ProviderError::new(
+                descriptor.id,
+                ProviderErrorKind::Validation,
+                error.to_string(),
+            )
+        })?;
+        self.validate_request(&request).await
+    }
+
+    /// Validate a fully resolved provider request without a paid POST. The
+    /// default enforces domain and provider ownership; adapters should extend
+    /// this with current catalog/schema checks.
+    async fn validate_request(&self, request: &VideoRequest) -> Result<(), ProviderError> {
+        let descriptor = self.descriptor();
+        if request.provider_id != descriptor.id {
+            return Err(ProviderError::new(
+                descriptor.id,
+                ProviderErrorKind::Validation,
+                "The request belongs to a different provider",
+            ));
+        }
+        request.validate().map_err(|error| {
+            ProviderError::new(
+                descriptor.id,
+                ProviderErrorKind::Validation,
+                error.to_string(),
+            )
+        })
+    }
+
+    /// Resolve a draft media source into the public HTTPS URL accepted by
+    /// provider request schemas. Implementations may reuse a supplied receipt
+    /// only after verifying its provider, digest, and expiration.
+    async fn stage_media(
+        &self,
+        media: &DraftMedia,
+        _cached_receipt: Option<&UploadReceipt>,
+        _progress: Option<mpsc::UnboundedSender<UploadProgress>>,
+    ) -> Result<StagedMedia, ProviderError> {
+        media.source.validate().map_err(|error| {
+            ProviderError::new(
+                self.descriptor().id,
+                ProviderErrorKind::Validation,
+                error.to_string(),
+            )
+        })?;
+        match &media.source {
+            MediaSource::RemoteUrl { url } => {
+                StagedMedia::remote(media.role, url.clone()).map_err(|error| {
+                    ProviderError::new(
+                        self.descriptor().id,
+                        ProviderErrorKind::Validation,
+                        error.to_string(),
+                    )
+                })
+            }
+            MediaSource::LocalFile { .. } => {
+                let descriptor = self.descriptor();
+                Err(ProviderError::new(
+                    descriptor.id,
+                    ProviderErrorKind::Validation,
+                    format!(
+                        "{} does not support local reference files; use a public HTTPS URL",
+                        descriptor.display_name
+                    ),
+                ))
+            }
+        }
+    }
 
     async fn validate_credentials(&self) -> Result<ProviderAccount, ProviderError>;
 
@@ -98,6 +289,28 @@ pub trait VideoProvider: Send + Sync {
     /// must turn ambiguous transport failures into `SubmissionUncertain` and
     /// must never retry this method internally.
     async fn submit(&self, request: &VideoRequest) -> Result<VideoJob, ProviderError>;
+
+    /// Submit a reviewed request whose quote and provider-staged inputs are
+    /// usable only until `submit_before`. Adapters with async preflight work
+    /// must recheck this deadline immediately before their paid request.
+    async fn submit_prepared(
+        &self,
+        request: &VideoRequest,
+        submit_before: Option<DateTime<Utc>>,
+    ) -> Result<VideoJob, ProviderError> {
+        if submit_before.is_some() {
+            let descriptor = self.descriptor();
+            return Err(ProviderError::new(
+                descriptor.id,
+                ProviderErrorKind::Configuration,
+                format!(
+                    "{} cannot safely submit a deadline-bound Review; its adapter must implement a post-preflight deadline check",
+                    descriptor.display_name
+                ),
+            ));
+        }
+        self.submit(request).await
+    }
 
     async fn poll(&self, locator: &JobLocator) -> Result<VideoJob, ProviderError>;
 

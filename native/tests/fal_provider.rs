@@ -2,35 +2,40 @@ use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use openrouter_video_studio::api::{HttpExecutor, HttpRequest, HttpResponse, TransportError};
-use openrouter_video_studio::domain::{
-    JobLocator, JobStatus, ProviderId, QuoteConfidence, VideoRequest,
-};
-use openrouter_video_studio::providers::fal::{FalOptions, FalProvider};
-use openrouter_video_studio::providers::{ProviderErrorKind, VideoProvider};
+use chrono::{TimeDelta, Utc};
 use reqwest::header::{AUTHORIZATION, HeaderMap};
 use reqwest::{Method, StatusCode};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use url::Url;
+use video_harness::api::{HttpExecutor, HttpRequest, HttpResponse, TransportError};
+use video_harness::domain::{
+    DraftMedia, GenerationDraft, JobLocator, JobStatus, MediaRole, ProviderId, QuoteConfidence,
+    VideoRequest,
+};
+use video_harness::providers::fal::{FalOptions, FalProvider, FalUploadExecutor};
+use video_harness::providers::{ProviderError, ProviderErrorKind, UploadProgress, VideoProvider};
 
 const KEY: &str = "fal-test-placeholder";
+const PNG_FIXTURE: &[u8] = b"\x89PNG\r\n\x1a\nfixture image bytes";
 
 #[derive(Clone)]
 struct CapturedRequest {
     method: Method,
     url: Url,
     authorized: bool,
+    object_lifecycle: Option<String>,
     body: Option<Value>,
 }
 
 enum Reply {
     Json(StatusCode, Value),
+    DelayedJson(Duration, StatusCode, Value),
     Bytes(Vec<u8>),
     InterruptedBody,
 }
@@ -70,10 +75,20 @@ impl HttpExecutor for ScriptedExecutor {
                 method: request.method.clone(),
                 url: request.url.clone(),
                 authorized: request.headers.contains_key(AUTHORIZATION),
+                object_lifecycle: request
+                    .headers
+                    .get("x-fal-object-lifecycle")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned),
                 body: request.json_body.clone(),
             });
-        match self.replies.lock().expect("reply lock").pop_front() {
+        let reply = { self.replies.lock().expect("reply lock").pop_front() };
+        match reply {
             Some(Reply::Json(status, value)) => {
+                HttpResponse::from_json(status, request.url, &value).map_err(|_| TransportError)
+            }
+            Some(Reply::DelayedJson(delay, status, value)) => {
+                tokio::time::sleep(delay).await;
                 HttpResponse::from_json(status, request.url, &value).map_err(|_| TransportError)
             }
             Some(Reply::Bytes(body)) => {
@@ -103,6 +118,57 @@ impl HttpExecutor for ScriptedExecutor {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CapturedUpload {
+    url: Url,
+    path: PathBuf,
+    content_type: String,
+    size_bytes: u64,
+    multipart: bool,
+}
+
+#[derive(Default)]
+struct ScriptedUploadExecutor {
+    uploads: Mutex<Vec<CapturedUpload>>,
+}
+
+impl ScriptedUploadExecutor {
+    fn uploads(&self) -> Vec<CapturedUpload> {
+        self.uploads.lock().expect("upload lock").clone()
+    }
+}
+
+#[async_trait]
+impl FalUploadExecutor for ScriptedUploadExecutor {
+    async fn upload(
+        &self,
+        upload_url: &Url,
+        path: &std::path::Path,
+        content_type: &str,
+        size_bytes: u64,
+        multipart: bool,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<UploadProgress>>,
+    ) -> Result<(), ProviderError> {
+        self.uploads
+            .lock()
+            .expect("upload lock")
+            .push(CapturedUpload {
+                url: upload_url.clone(),
+                path: path.to_owned(),
+                content_type: content_type.to_owned(),
+                size_bytes,
+                multipart,
+            });
+        if let Some(progress) = progress {
+            let _ = progress.send(UploadProgress {
+                sent: size_bytes,
+                total: size_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
 fn provider(executor: Arc<ScriptedExecutor>) -> FalProvider {
     FalProvider::with_executor(
         SecretString::from(KEY.to_owned()),
@@ -112,6 +178,23 @@ fn provider(executor: Arc<ScriptedExecutor>) -> FalProvider {
             ..FalOptions::default()
         },
         executor,
+    )
+    .expect("fixture fal provider")
+}
+
+fn provider_with_upload(
+    executor: Arc<ScriptedExecutor>,
+    upload_executor: Arc<ScriptedUploadExecutor>,
+) -> FalProvider {
+    FalProvider::with_executors(
+        SecretString::from(KEY.to_owned()),
+        FalOptions {
+            max_retries: 0,
+            backoff_base: Duration::ZERO,
+            ..FalOptions::default()
+        },
+        executor,
+        upload_executor,
     )
     .expect("fixture fal provider")
 }
@@ -378,6 +461,154 @@ async fn interrupted_paid_response_is_uncertain_and_never_retried() {
 }
 
 #[tokio::test]
+async fn delayed_schema_resolution_consuming_media_margin_never_reaches_paid_post() {
+    let schema_delay = Duration::from_millis(250);
+    let executor = ScriptedExecutor::with_replies([
+        Reply::DelayedJson(
+            schema_delay,
+            StatusCode::OK,
+            json!({
+                "models": [expanded_model()],
+                "next_cursor": null,
+                "has_more": false
+            }),
+        ),
+        Reply::Json(StatusCode::OK, json!({"request_id": "must-not-be-read"})),
+    ]);
+    let provider = provider(executor.clone());
+    let submit_before = Utc::now() + TimeDelta::milliseconds(100);
+    let started = Instant::now();
+
+    let error = provider
+        .submit_prepared(&request(), Some(submit_before))
+        .await
+        .expect_err("expired staged media must stop after schema lookup and before paid POST");
+    assert!(started.elapsed() >= schema_delay);
+    assert_eq!(error.kind, ProviderErrorKind::Validation);
+    assert!(error.message.contains("too close to expiring"));
+    let requests = executor.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, Method::GET);
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == Method::POST)
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn paid_5xx_is_uncertain_and_never_retried_even_with_retries_configured() {
+    let mut replies = Vec::from(catalog_replies());
+    replies.extend([
+        Reply::Json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": {"message": "runner failed after accepting the request"}}),
+        ),
+        Reply::Json(StatusCode::OK, json!({"request_id": "must-not-be-read"})),
+    ]);
+    let executor = ScriptedExecutor::with_replies(replies);
+    let provider = FalProvider::with_executor(
+        SecretString::from(KEY.to_owned()),
+        FalOptions {
+            max_retries: 5,
+            backoff_base: Duration::ZERO,
+            ..FalOptions::default()
+        },
+        executor.clone(),
+    )
+    .expect("fixture fal provider");
+    provider.load_catalog().await.expect("cache fixture model");
+
+    let error = provider
+        .submit(&request())
+        .await
+        .expect_err("a paid 5xx response cannot prove rejection");
+    assert_eq!(error.kind, ProviderErrorKind::SubmissionUncertain);
+    assert_eq!(error.status_code, Some(503));
+    assert!(!error.retryable());
+    assert!(error.message.contains("may exist"));
+    let requests = executor.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == Method::POST)
+            .count(),
+        1
+    );
+    assert_eq!(requests.len(), 4);
+}
+
+#[tokio::test]
+async fn fal_nonstandard_4xx_cannot_prove_rejection_and_is_not_retried() {
+    let mut replies = Vec::from(catalog_replies());
+    replies.extend([
+        Reply::Json(
+            StatusCode::from_u16(499).expect("fixture status"),
+            json!({"error": {"message": "proxy closed after forwarding the request"}}),
+        ),
+        Reply::Json(StatusCode::OK, json!({"request_id": "must-not-be-read"})),
+    ]);
+    let executor = ScriptedExecutor::with_replies(replies);
+    let provider = FalProvider::with_executor(
+        SecretString::from(KEY.to_owned()),
+        FalOptions {
+            max_retries: 5,
+            backoff_base: Duration::ZERO,
+            ..FalOptions::default()
+        },
+        executor.clone(),
+    )
+    .expect("fixture fal provider");
+    provider.load_catalog().await.expect("cache fixture model");
+
+    let error = provider
+        .submit(&request())
+        .await
+        .expect_err("an unknown proxy status cannot prove paid-request rejection");
+    assert_eq!(error.kind, ProviderErrorKind::SubmissionUncertain);
+    assert_eq!(error.status_code, Some(499));
+    assert!(!error.retryable());
+    assert_eq!(
+        executor
+            .requests()
+            .iter()
+            .filter(|request| request.method == Method::POST)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn fal_paid_submission_preserves_deterministic_4xx_rejection() {
+    let mut replies = Vec::from(catalog_replies());
+    replies.push(Reply::Json(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        json!({"error": {"message": "fixture validation rejection"}}),
+    ));
+    let executor = ScriptedExecutor::with_replies(replies);
+    let provider = provider(executor.clone());
+    provider.load_catalog().await.expect("cache fixture model");
+
+    let error = provider
+        .submit(&request())
+        .await
+        .expect_err("422 proves the paid request was rejected");
+    assert_eq!(error.kind, ProviderErrorKind::Validation);
+    assert_eq!(error.status_code, Some(422));
+    assert_eq!(
+        executor
+            .requests()
+            .iter()
+            .filter(|request| request.method == Method::POST)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn advanced_json_cannot_override_common_fields() {
     let executor = ScriptedExecutor::with_replies(catalog_replies());
     let provider = provider(executor.clone());
@@ -429,6 +660,45 @@ async fn schema_constraints_reject_advanced_json_before_paid_post() {
             .requests()
             .iter()
             .all(|request| request.method == Method::GET)
+    );
+}
+
+#[tokio::test]
+async fn dry_validation_rejects_advanced_json_before_local_reference_upload() {
+    let directory = tempdir().expect("temporary media");
+    let media_path = directory.path().join("reference.png");
+    fs::write(&media_path, PNG_FIXTURE).expect("fixture media");
+    let executor = ScriptedExecutor::with_replies(catalog_replies());
+    let upload_executor = Arc::new(ScriptedUploadExecutor::default());
+    let provider = provider_with_upload(executor.clone(), upload_executor.clone());
+    provider.load_catalog().await.expect("cache fixture model");
+
+    let mut draft = GenerationDraft::new(
+        ProviderId::fal(),
+        "fal-ai/fixture/text-to-video",
+        "A dry-validation fixture",
+    )
+    .expect("fixture draft");
+    draft.duration = Some(4);
+    draft.aspect_ratio = Some("16:9".into());
+    draft.adapter_options = Some(json!({"prompt": "hidden override"}));
+    draft
+        .media
+        .push(DraftMedia::local(media_path, MediaRole::Reference));
+
+    let error = provider
+        .validate_draft(&draft)
+        .await
+        .expect_err("invalid advanced JSON must fail before staging local media");
+    assert_eq!(error.kind, ProviderErrorKind::Validation);
+    assert!(error.message.contains("cannot override"));
+    assert!(upload_executor.uploads().is_empty());
+    assert!(
+        executor
+            .requests()
+            .iter()
+            .all(|request| request.method == Method::GET),
+        "dry validation must not initiate an upload or paid queue POST"
     );
 }
 
@@ -589,9 +859,8 @@ async fn anonymous_download_does_not_overwrite_a_racing_destination() {
     let directory = tempdir().expect("temporary output");
     let destination = directory.path().join("race.mp4");
     executor.create_destination_during_download(destination.clone(), b"existing video");
-    let artifact =
-        openrouter_video_studio::domain::VideoArtifact::new("https://cdn.fal.media/race.mp4", 0)
-            .expect("artifact");
+    let artifact = video_harness::domain::VideoArtifact::new("https://cdn.fal.media/race.mp4", 0)
+        .expect("artifact");
 
     let error = provider
         .download(&artifact, &destination, None)
@@ -608,11 +877,9 @@ async fn anonymous_download_does_not_overwrite_a_racing_destination() {
 
 #[tokio::test]
 async fn failed_or_empty_download_cleans_up_the_partial_file() {
-    let artifact = openrouter_video_studio::domain::VideoArtifact::new(
-        "https://cdn.fal.media/incomplete.mp4",
-        0,
-    )
-    .expect("artifact");
+    let artifact =
+        video_harness::domain::VideoArtifact::new("https://cdn.fal.media/incomplete.mp4", 0)
+            .expect("artifact");
     for reply in [Reply::InterruptedBody, Reply::Bytes(Vec::new())] {
         let executor = ScriptedExecutor::with_replies([reply]);
         let provider = provider(executor);
@@ -626,4 +893,155 @@ async fn failed_or_empty_download_cleans_up_the_partial_file() {
         assert!(!destination.exists());
         assert!(!directory.path().join("incomplete.mp4.part").exists());
     }
+}
+
+#[tokio::test]
+async fn local_media_uses_documented_cdn_initiation_and_reuses_valid_receipt() {
+    let directory = tempdir().expect("temporary media");
+    let media_path = directory.path().join("first-frame.png");
+    fs::write(&media_path, PNG_FIXTURE).expect("fixture media");
+    let executor = ScriptedExecutor::with_replies([Reply::Json(
+        StatusCode::OK,
+        json!({
+            "file_url": "https://v3.fal.media/files/fixture/first-frame.png",
+            "upload_url": "https://uploads.example/signed/object?signature=placeholder"
+        }),
+    )]);
+    let upload_executor = Arc::new(ScriptedUploadExecutor::default());
+    let provider = provider_with_upload(executor.clone(), upload_executor.clone());
+    assert!(provider.media_capabilities().local_files);
+    assert!(provider.media_capabilities().uploaded_files_public);
+    assert_eq!(
+        provider.media_capabilities().upload_retention,
+        Some(Duration::from_secs(24 * 60 * 60))
+    );
+
+    let media = DraftMedia::local(&media_path, MediaRole::StartFrame);
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let staged = provider
+        .stage_media(&media, None, Some(progress_tx))
+        .await
+        .expect("stage local fal media");
+    let receipt = staged.receipt.clone().expect("upload receipt");
+    assert_eq!(receipt.provider_id, ProviderId::fal());
+    assert_eq!(receipt.size_bytes, PNG_FIXTURE.len() as u64);
+    assert_eq!(receipt.content_type.as_deref(), Some("image/png"));
+    assert_eq!(receipt.sha256.len(), 64);
+    assert_eq!(
+        receipt.expires_at - receipt.uploaded_at,
+        chrono::Duration::hours(24)
+    );
+    assert_eq!(
+        progress_rx.recv().await.expect("upload progress"),
+        UploadProgress {
+            sent: receipt.size_bytes,
+            total: receipt.size_bytes,
+        }
+    );
+
+    let requests = executor.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, Method::POST);
+    assert!(requests[0].authorized);
+    assert_eq!(requests[0].url.host_str(), Some("rest.fal.ai"));
+    assert_eq!(requests[0].url.path(), "/storage/upload/initiate");
+    assert!(
+        requests[0]
+            .url
+            .query_pairs()
+            .any(|(key, value)| key == "storage_type" && value == "fal-cdn-v3")
+    );
+    assert_eq!(
+        requests[0].object_lifecycle.as_deref(),
+        Some("{\"expiration_duration_seconds\":86400}")
+    );
+    assert_eq!(
+        requests[0].body.as_ref().expect("initiation body")["file_name"],
+        "first-frame.png"
+    );
+    let uploads = upload_executor.uploads();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].url.host_str(), Some("uploads.example"));
+    assert_eq!(uploads[0].path, media_path);
+    assert_eq!(uploads[0].content_type, "image/png");
+    assert_eq!(uploads[0].size_bytes, receipt.size_bytes);
+    assert!(!uploads[0].multipart);
+
+    let reused = provider
+        .stage_media(&media, Some(&receipt), None)
+        .await
+        .expect("reuse unexpired matching receipt");
+    assert_eq!(reused.receipt.as_ref(), Some(&receipt));
+    assert_eq!(
+        executor.requests().len(),
+        1,
+        "cache reuse must not initiate"
+    );
+    assert_eq!(
+        upload_executor.uploads().len(),
+        1,
+        "cache reuse must not upload"
+    );
+}
+
+#[tokio::test]
+async fn fal_rejects_non_public_signed_upload_urls_before_sending_bytes() {
+    let directory = tempdir().expect("temporary media");
+    let media_path = directory.path().join("reference.jpg");
+    fs::write(&media_path, b"\xff\xd8\xff\xe0fixture").expect("fixture media");
+    let executor = ScriptedExecutor::with_replies([Reply::Json(
+        StatusCode::OK,
+        json!({
+            "file_url": "https://v3.fal.media/files/fixture/reference.jpg",
+            "upload_url": "https://127.0.0.1/private-upload"
+        }),
+    )]);
+    let upload_executor = Arc::new(ScriptedUploadExecutor::default());
+    let provider = provider_with_upload(executor, upload_executor.clone());
+    let error = provider
+        .stage_media(
+            &DraftMedia::local(media_path, MediaRole::Reference),
+            None,
+            None,
+        )
+        .await
+        .expect_err("local signed target must be rejected");
+    assert_eq!(error.kind, ProviderErrorKind::UnsafeEndpoint);
+    assert!(upload_executor.uploads().is_empty());
+}
+
+#[tokio::test]
+async fn large_local_media_selects_fal_multipart_protocol() {
+    let directory = tempdir().expect("temporary media");
+    let media_path = directory.path().join("large-reference.png");
+    fs::write(&media_path, PNG_FIXTURE).expect("fixture image header");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(&media_path)
+        .expect("create sparse media");
+    file.set_len(90 * 1024 * 1024 + 1)
+        .expect("size sparse media");
+    drop(file);
+    let executor = ScriptedExecutor::with_replies([Reply::Json(
+        StatusCode::OK,
+        json!({
+            "file_url": "https://v3.fal.media/files/fixture/large-reference.png",
+            "upload_url": "https://uploads.example/multipart/session?signature=placeholder"
+        }),
+    )]);
+    let upload_executor = Arc::new(ScriptedUploadExecutor::default());
+    let provider = provider_with_upload(executor.clone(), upload_executor.clone());
+    provider
+        .stage_media(
+            &DraftMedia::local(media_path, MediaRole::Reference),
+            None,
+            None,
+        )
+        .await
+        .expect("stage sparse multipart fixture");
+    assert_eq!(
+        executor.requests()[0].url.path(),
+        "/storage/upload/initiate-multipart"
+    );
+    assert!(upload_executor.uploads()[0].multipart);
 }
