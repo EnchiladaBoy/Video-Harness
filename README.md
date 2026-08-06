@@ -1,8 +1,8 @@
 # Video Harness
 
-Video Harness is a native Linux workspace for generating AI video across providers. It gives prompts, reference frames, model controls, price review, job monitoring, downloads, and playback a proper graphical home instead of making you assemble API requests by hand.
+Video Harness is a native Linux application for generating AI video across providers. It gives prompts, reference frames, model controls, price review, job monitoring, downloads, and playback a proper graphical home instead of making you assemble API requests by hand.
 
-The v0.3 release supports OpenRouter and fal.ai. It saves finished videos to your XDG Videos directory (normally `~/Videos`) and keeps the transition-release terminal interface available as `video-harness-tui`.
+The v0.4.0 release supports OpenRouter and fal.ai. Finished videos are saved to your XDG Videos directory, normally `~/Videos`.
 
 ## What it does
 
@@ -24,7 +24,7 @@ Install the native build prerequisites once:
 sudo dnf install gcc gtk4-devel libadwaita-devel
 ```
 
-Then build and install both native interfaces plus the desktop entry:
+Then build and install the application and desktop entry:
 
 ```bash
 chmod +x install.sh
@@ -37,7 +37,7 @@ Launch **Video Harness** from GNOME's app grid or run:
 video-harness
 ```
 
-The immutable release lives under `~/.local/lib/openrouter-video-studio/releases/0.3.0/`. The legacy internal directory is intentional: it preserves existing credentials, catalog caches, settings, and `history.sqlite3`. New GUI-only state is isolated in `gui-state.sqlite3`.
+The immutable release lives under `~/.local/lib/openrouter-video-studio/releases/0.4.0/`. The legacy internal directory name is intentional: it preserves existing credentials, catalog caches, settings, and `history.sqlite3`. GUI draft and upload state is isolated in `gui-state.sqlite3`.
 
 ## First generation
 
@@ -47,20 +47,7 @@ The immutable release lives under `~/.local/lib/openrouter-video-studio/releases
 4. Choose **Generate — one paid request** once. Video Harness never automatically retries an ambiguous paid submission.
 5. Follow the job in **Jobs**. Closing the app pauses local monitoring only; the remote provider continues. Use **Resume all** after relaunch.
 
-If a paid request is accepted, the remote job ID is surfaced before local persistence work so it remains recoverable even if a later disk write fails.
-If the connection disappears before an ID comes back, a durable safety hold blocks that exact draft across restarts. Video Harness asks you to check the provider dashboard before explicitly allowing another paid attempt; editing creates a distinct draft, and undoing the edit restores the hold.
-
-## Terminal and Python transition
-
-The Rust terminal UI remains available for one transition release:
-
-```bash
-video-harness-tui
-# compatibility alias
-openrouter-video-rs
-```
-
-`openrouter-video` and its Python environment are not replaced by a normal Video Harness install. Existing installations are captured as `openrouter-video-python`; the native installer's explicit `promote` and `rollback` commands retain the previous safety behavior. To install the old Python interface directly, use `./install-python-legacy.sh`.
+If a paid request is accepted, the remote job ID is surfaced before local persistence work so it remains recoverable even if a later disk write fails. If the connection disappears before an ID comes back, a durable safety hold blocks that exact draft across restarts. Video Harness asks you to check the provider dashboard before explicitly allowing another paid attempt; editing creates a distinct draft, and undoing the edit restores the hold.
 
 ## Development
 
@@ -71,7 +58,7 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
 ```
 
-The Rust integration suite uses in-memory credentials, temporary databases, and deterministic mock transports. It does not contact inference providers or spend credits. The preserved Python compatibility suite can be run with `pytest` from its existing virtual environment.
+The Rust integration suite uses in-memory credentials, temporary databases, and deterministic mock transports. It does not contact inference providers or spend credits.
 
 ## Data and privacy
 

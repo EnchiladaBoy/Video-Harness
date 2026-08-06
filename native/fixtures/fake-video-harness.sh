@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ "${1:-}" == "--version" ]]; then
-    echo "video-harness 0.3.0-test"
+    echo "video-harness 0.4.0-test"
     exit 0
 fi
 

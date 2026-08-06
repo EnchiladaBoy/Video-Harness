@@ -749,8 +749,11 @@ impl FalProvider {
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_str(&format!("video-harness/0.3 {DEFAULT_APP_TITLE}"))
-                .map_err(|_| configuration("Invalid application title"))?,
+            HeaderValue::from_str(&format!(
+                "video-harness/{} {DEFAULT_APP_TITLE}",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .map_err(|_| configuration("Invalid application title"))?,
         );
         if authenticated {
             let mut authorization =
@@ -948,7 +951,11 @@ impl FalProvider {
             );
             headers.insert(
                 USER_AGENT,
-                HeaderValue::from_static("video-harness/0.3 Video Harness"),
+                HeaderValue::from_static(concat!(
+                    "video-harness/",
+                    env!("CARGO_PKG_VERSION"),
+                    " Video Harness"
+                )),
             );
             let current = self
                 .executor

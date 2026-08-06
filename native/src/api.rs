@@ -946,7 +946,11 @@ impl OpenRouterClient {
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_static("video-harness/0.3 Video Harness"),
+            HeaderValue::from_static(concat!(
+                "video-harness/",
+                env!("CARGO_PKG_VERSION"),
+                " Video Harness"
+            )),
         );
         if let Some(referer) = &self.options.http_referer {
             headers.insert(

@@ -13,7 +13,7 @@ fn unique_temp_dir() -> PathBuf {
         .expect("system time")
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "openrouter-video-installer-{}-{nonce}",
+        "video-harness-installer-{}-{nonce}",
         std::process::id()
     ))
 }
@@ -26,6 +26,7 @@ fn run_installer(root: &Path, arguments: &[&str]) -> std::process::Output {
         .env("OPENROUTER_VIDEO_LIB_DIR", root.join("lib"))
         .env("OPENROUTER_VIDEO_BIN_DIR", root.join("bin"))
         .env("VIDEO_HARNESS_DATA_DIR", root.join("share"))
+        .env("VIDEO_HARNESS_PROJECT_DIR", root.join("project"))
         .output()
         .expect("run installer")
 }
@@ -52,6 +53,20 @@ fn resolved(path: &Path) -> PathBuf {
     fs::canonicalize(path).expect("resolve symlink")
 }
 
+fn fixture_version(fixture: &Path) -> String {
+    let output = Command::new(fixture)
+        .arg("--version")
+        .output()
+        .expect("read fixture version");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .expect("UTF-8 fixture version")
+        .split_whitespace()
+        .last()
+        .expect("version token")
+        .to_owned()
+}
+
 fn cleanup(root: &Path) {
     let releases = root.join("lib/releases");
     if let Ok(entries) = fs::read_dir(&releases) {
@@ -63,60 +78,83 @@ fn cleanup(root: &Path) {
 }
 
 #[test]
-fn fresh_install_does_not_require_or_create_the_legacy_python_command() {
+fn install_is_gui_only_and_retires_owned_native_transition_aliases() {
     if std::env::consts::ARCH != "aarch64" {
         return;
     }
 
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let fixture = manifest.join("fixtures/fake-openrouter-video.sh");
+    let fixture = manifest.join("fixtures/fake-video-harness.sh");
+    let version = fixture_version(&fixture);
     let root = unique_temp_dir();
     fs::create_dir_all(root.join("bin")).expect("create test bin directory");
 
-    assert_success(run_installer(
-        &root,
-        &["install", fixture.to_str().expect("UTF-8 fixture path")],
-    ));
-    assert!(root.join("bin/video-harness").is_symlink());
-    assert!(root.join("bin/video-harness-tui").is_symlink());
-    assert!(root.join("bin/openrouter-video-rs").is_symlink());
-    assert!(!root.join("bin/openrouter-video").exists());
-    assert!(!root.join("bin/openrouter-video-python").exists());
+    let old_release = root.join("lib/releases/0.2.0");
+    fs::create_dir_all(&old_release).expect("create old release directory");
+    let old_tui = old_release.join("video-harness-tui");
+    fs::copy(&fixture, &old_tui).expect("copy old TUI fixture");
+    fs::set_permissions(&old_tui, fs::Permissions::from_mode(0o555))
+        .expect("make old TUI executable");
+    symlink(&old_tui, root.join("bin/video-harness-tui")).expect("create old TUI link");
+    symlink(&old_tui, root.join("bin/openrouter-video-rs")).expect("create old Rust link");
 
-    cleanup(&root);
-}
-
-#[test]
-fn beta_install_promotion_and_rollback_preserve_python_target() {
-    if std::env::consts::ARCH != "aarch64" {
-        // The production installer intentionally rejects non-ARM64 hosts.
-        return;
-    }
-
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let fixture = manifest.join("fixtures/fake-openrouter-video.sh");
-    let root = unique_temp_dir();
-    fs::create_dir_all(root.join("bin")).expect("create test bin directory");
-
-    let python_target = root.join("python-openrouter-video");
-    fs::copy(&fixture, &python_target).expect("copy fake Python launcher");
+    let python_target = root.join("project/.venv/bin/openrouter-video");
+    fs::create_dir_all(python_target.parent().expect("Python target parent"))
+        .expect("create project Python environment");
+    fs::copy(&fixture, &python_target).expect("copy external Python launcher");
     fs::set_permissions(&python_target, fs::Permissions::from_mode(0o755))
-        .expect("make fake Python launcher executable");
+        .expect("make external Python launcher executable");
     let stable = root.join("bin/openrouter-video");
-    symlink(&python_target, &stable).expect("create current stable launcher");
+    symlink(&python_target, &stable).expect("create existing stable launcher");
+    symlink(&python_target, root.join("bin/openrouter-video-python"))
+        .expect("create owned Python alias");
 
     assert_success(run_installer(
         &root,
         &["install", fixture.to_str().expect("UTF-8 fixture path")],
     ));
+    assert_eq!(
+        resolved(&root.join("bin/video-harness")),
+        root.join(format!("lib/releases/{version}/video-harness"))
+    );
+    assert!(!root.join("bin/video-harness-tui").exists());
+    assert!(!root.join("bin/openrouter-video-rs").exists());
+    assert!(!root.join("bin/openrouter-video-python").exists());
+    assert!(
+        python_target.is_file(),
+        "retirement must not delete its target"
+    );
+    assert_eq!(resolved(&stable), python_target);
+    assert!(
+        root.join("share/applications/io.github.EnchiladaBoy.VideoHarness.desktop")
+            .is_file()
+    );
+    assert!(
+        root.join("share/metainfo/io.github.EnchiladaBoy.VideoHarness.metainfo.xml")
+            .is_file()
+    );
+    assert!(
+        root.join("share/icons/hicolor/scalable/apps/io.github.EnchiladaBoy.VideoHarness.svg")
+            .is_file()
+    );
+    assert_eq!(
+        fs::metadata(root.join(format!("lib/releases/{version}")))
+            .expect("release metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o555
+    );
+
     // Reinstalling identical bytes is idempotent.
     assert_success(run_installer(
         &root,
         &["install", fixture.to_str().expect("UTF-8 fixture path")],
     ));
+    assert_eq!(resolved(&stable), python_target);
 
     // A release version is immutable even if another executable reports the same version.
-    let altered_fixture = root.join("altered-openrouter-video");
+    let altered_fixture = root.join("altered-video-harness");
     fs::copy(&fixture, &altered_fixture).expect("copy altered fixture");
     fs::OpenOptions::new()
         .append(true)
@@ -139,73 +177,123 @@ fn beta_install_promotion_and_rollback_preserve_python_target() {
         "already exists with different bytes",
     );
 
-    let beta = root.join("bin/openrouter-video-rs");
-    let gui = root.join("bin/video-harness");
-    let tui = root.join("bin/video-harness-tui");
-    let python_alias = root.join("bin/openrouter-video-python");
-    assert_eq!(resolved(&stable), python_target);
-    assert_eq!(resolved(&python_alias), python_target);
-    assert_eq!(
-        resolved(&beta),
-        root.join("lib/releases/0.3.0-test/video-harness-tui")
-    );
-    assert_eq!(
-        resolved(&gui),
-        root.join("lib/releases/0.3.0-test/video-harness")
-    );
-    assert_eq!(resolved(&tui), resolved(&beta));
-    assert!(
-        root.join("share/applications/io.github.EnchiladaBoy.VideoHarness.desktop")
-            .is_file()
-    );
-    assert!(
-        root.join("share/metainfo/io.github.EnchiladaBoy.VideoHarness.metainfo.xml")
-            .is_file()
-    );
-    assert!(
-        root.join("share/icons/hicolor/scalable/apps/io.github.EnchiladaBoy.VideoHarness.svg")
-            .is_file()
-    );
-    assert_eq!(
-        fs::metadata(root.join("lib/releases/0.3.0-test"))
-            .expect("release metadata")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o555
-    );
+    assert_success(run_installer(&root, &["status"]));
+    assert_failure(run_installer(&root, &["promote"]), "Usage:");
+    assert_failure(run_installer(&root, &["rollback"]), "Usage:");
 
-    assert_success(run_installer(&root, &["promote"]));
-    assert_eq!(resolved(&stable), resolved(&beta));
-    assert_eq!(
-        resolved(&root.join("lib/rollback/openrouter-video.previous")),
-        python_target
-    );
+    cleanup(&root);
+}
 
-    // Repeating promotion is a no-op and must not replace Python rollback metadata.
-    assert_success(run_installer(&root, &["promote"]));
-    assert_eq!(
-        resolved(&root.join("lib/rollback/openrouter-video.previous")),
-        python_target
-    );
+#[test]
+fn install_preserves_unowned_legacy_links_and_the_stable_command() {
+    if std::env::consts::ARCH != "aarch64" {
+        return;
+    }
 
-    // A user-created regular file is never overwritten during rollback.
-    fs::remove_file(&stable).expect("remove test stable symlink");
-    fs::copy(&fixture, &stable).expect("create regular stable file");
-    let output = run_installer(&root, &["rollback"]);
-    assert_failure(output, "Refusing to replace the regular file");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture = manifest.join("fixtures/fake-video-harness.sh");
+    let root = unique_temp_dir();
+    fs::create_dir_all(root.join("bin")).expect("create test bin directory");
+
+    let external_tui = root.join("external-tui");
+    let external_python = root.join("external-python");
+    let stable = root.join("bin/openrouter-video");
+    fs::copy(&fixture, &external_tui).expect("copy external TUI");
+    fs::copy(&fixture, &external_python).expect("copy external Python launcher");
+    fs::copy(&fixture, &stable).expect("create regular stable launcher");
+    fs::set_permissions(&external_tui, fs::Permissions::from_mode(0o755))
+        .expect("make external TUI executable");
+    fs::set_permissions(&external_python, fs::Permissions::from_mode(0o755))
+        .expect("make external Python executable");
+    fs::set_permissions(&stable, fs::Permissions::from_mode(0o755))
+        .expect("make stable executable");
+    symlink(&external_tui, root.join("bin/video-harness-tui")).expect("create user TUI link");
+    symlink(&external_tui, root.join("bin/openrouter-video-rs")).expect("create user Rust link");
+    symlink(&external_python, root.join("bin/openrouter-video-python"))
+        .expect("create user Python link");
+
+    assert_success(run_installer(
+        &root,
+        &["install", fixture.to_str().expect("UTF-8 fixture path")],
+    ));
+    assert_eq!(resolved(&root.join("bin/video-harness-tui")), external_tui);
+    assert_eq!(
+        resolved(&root.join("bin/openrouter-video-rs")),
+        external_tui
+    );
+    assert_eq!(
+        resolved(&root.join("bin/openrouter-video-python")),
+        external_python
+    );
     assert!(
         !fs::symlink_metadata(&stable)
-            .expect("regular stable metadata")
+            .expect("stable metadata")
             .file_type()
             .is_symlink()
     );
-    fs::remove_file(&stable).expect("remove regular stable fixture");
-    symlink(&beta, &stable).expect("restore native stable symlink");
 
-    assert_success(run_installer(&root, &["rollback"]));
-    assert_eq!(resolved(&stable), python_target);
-    assert_eq!(resolved(&python_alias), python_target);
+    cleanup(&root);
+}
+
+#[test]
+fn install_preserves_regular_files_at_legacy_alias_names() {
+    if std::env::consts::ARCH != "aarch64" {
+        return;
+    }
+
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture = manifest.join("fixtures/fake-video-harness.sh");
+    let root = unique_temp_dir();
+    fs::create_dir_all(root.join("bin")).expect("create test bin directory");
+
+    for name in [
+        "video-harness-tui",
+        "openrouter-video-rs",
+        "openrouter-video-python",
+    ] {
+        let path = root.join("bin").join(name);
+        fs::copy(&fixture, &path).expect("create regular legacy sentinel");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("make legacy sentinel executable");
+    }
+
+    assert_success(run_installer(
+        &root,
+        &["install", fixture.to_str().expect("UTF-8 fixture path")],
+    ));
+    for name in [
+        "video-harness-tui",
+        "openrouter-video-rs",
+        "openrouter-video-python",
+    ] {
+        let metadata =
+            fs::symlink_metadata(root.join("bin").join(name)).expect("legacy sentinel remains");
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+    }
+
+    cleanup(&root);
+}
+
+#[test]
+fn install_refuses_to_replace_a_regular_gui_launcher() {
+    if std::env::consts::ARCH != "aarch64" {
+        return;
+    }
+
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture = manifest.join("fixtures/fake-video-harness.sh");
+    let root = unique_temp_dir();
+    fs::create_dir_all(root.join("bin")).expect("create test bin directory");
+    fs::copy(&fixture, root.join("bin/video-harness")).expect("create regular GUI launcher");
+
+    assert_failure(
+        run_installer(
+            &root,
+            &["install", fixture.to_str().expect("UTF-8 fixture path")],
+        ),
+        "Refusing to replace the regular file",
+    );
 
     cleanup(&root);
 }
