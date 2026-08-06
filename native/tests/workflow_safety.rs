@@ -16,8 +16,8 @@ use url::Url;
 use video_harness::AppPaths;
 use video_harness::api::{ClientOptions, HttpExecutor, HttpRequest, HttpResponse, TransportError};
 use video_harness::domain::{
-    DraftMedia, GenerationDraft, JobLocator, JobStatus, MediaRole, ProviderId, ProviderJobKey,
-    VideoCatalog, VideoJob, VideoRequest,
+    DraftMedia, GenerationDraft, InputReference, InputReferenceKind, JobLocator, JobStatus,
+    MediaRole, ProviderId, ProviderJobKey, VideoCatalog, VideoJob, VideoRequest,
 };
 use video_harness::gui_state::{DraftEditorState, GuiStateStore, StoredDraft};
 use video_harness::history::HistoryStore;
@@ -691,6 +691,76 @@ async fn generate_surfaces_id_then_persists_polls_and_downloads_with_one_post() 
         1
     );
     assert_eq!(requests.len(), 4);
+    shutdown(&mut service).await;
+}
+
+#[tokio::test]
+async fn direct_typed_media_fails_before_safety_marker_or_paid_post() {
+    let (_root, paths) = fixture_paths();
+    let executor = WorkflowExecutor::scripted([
+        Reply::Json(StatusCode::OK, json!({"data": {"label": "fixture"}})),
+        Reply::Json(
+            StatusCode::OK,
+            json!({"data": [{"id": "bytedance/seedance-2.0"}]}),
+        ),
+        Reply::Json(
+            StatusCode::OK,
+            json!({"data": [{
+                "id": "bytedance/seedance-2.0",
+                "architecture": {
+                    "input_modalities": ["text", "image", "audio"],
+                    "output_modalities": ["video"]
+                }
+            }]}),
+        ),
+    ]);
+    let mut service =
+        spawn_service_with_executor(paths.clone(), config(Duration::ZERO), executor.clone())
+            .expect("spawn service");
+    connect_fixture_key(&mut service, 1).await;
+    let mut request =
+        VideoRequest::new("bytedance/seedance-2.0", "Typed direct fixture").expect("request");
+    request.input_references.push(
+        InputReference::with_kind(
+            "https://media.example/reference.mp4",
+            InputReferenceKind::Video,
+        )
+        .expect("video reference"),
+    );
+    service
+        .commands
+        .send(ServiceCommand::Generate {
+            op_id: 73,
+            provider_id: ProviderId::openrouter(),
+            request,
+        })
+        .await
+        .expect("send typed direct generation");
+
+    let error = event_matching(&mut service, |event| {
+        matches!(event, ServiceEvent::Error { op_id: 73, .. })
+    })
+    .await;
+    assert!(matches!(
+        error,
+        ServiceEvent::Error {
+            scope: ServiceScope::Generation,
+            ref message,
+            ..
+        } if message.contains("video input references are not supported")
+    ));
+    assert!(
+        executor
+            .requests()
+            .iter()
+            .all(|request| request.method != Method::POST)
+    );
+    assert!(
+        GuiStateStore::new(paths.gui_state_db())
+            .uncertain_submissions()
+            .expect("safety state")
+            .is_empty()
+    );
     shutdown(&mut service).await;
 }
 

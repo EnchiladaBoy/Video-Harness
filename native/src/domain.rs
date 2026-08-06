@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -11,7 +12,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
-use url::Url;
+use url::{Host, Url};
 
 pub const PREFERRED_MODEL_ID: &str = "black-forest-labs/flux-3-video";
 pub const OPENROUTER_PROVIDER_ID: &str = "openrouter";
@@ -336,7 +337,7 @@ pub struct ProviderDescriptor {
     pub website: String,
 }
 
-fn validate_public_https_url(value: &str, label: &str) -> Result<(), DomainError> {
+pub(crate) fn validate_public_https_url(value: &str, label: &str) -> Result<(), DomainError> {
     let url = Url::parse(value)
         .map_err(|_| DomainError::Validation(format!("{label} must be a public HTTPS URL")))?;
     if url.scheme() != "https" || url.host_str().is_none() {
@@ -349,7 +350,95 @@ fn validate_public_https_url(value: &str, label: &str) -> Result<(), DomainError
             "{label} must not contain embedded credentials"
         )));
     }
+    if url.host().is_some_and(host_is_non_public) {
+        return Err(DomainError::Validation(format!(
+            "{label} must use a public host"
+        )));
+    }
     Ok(())
+}
+
+fn host_is_non_public(host: Host<&str>) -> bool {
+    match host {
+        Host::Domain(domain) => {
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            matches!(domain.as_str(), "localhost" | "local")
+                || domain.ends_with(".localhost")
+                || domain.ends_with(".local")
+        }
+        Host::Ipv4(address) => ipv4_is_non_global(address),
+        Host::Ipv6(address) => ipv6_is_non_global(address),
+    }
+}
+
+fn ipv4_is_non_global(address: Ipv4Addr) -> bool {
+    // Explicit IANA special-purpose ranges keep this check stable across Rust
+    // releases and fail closed for literal-IP SSRF targets.
+    [
+        ([0, 0, 0, 0], 8),       // current network / unspecified
+        ([10, 0, 0, 0], 8),      // private
+        ([100, 64, 0, 0], 10),   // shared address space (CGNAT)
+        ([127, 0, 0, 0], 8),     // loopback
+        ([169, 254, 0, 0], 16),  // link-local
+        ([172, 16, 0, 0], 12),   // private
+        ([192, 0, 0, 0], 24),    // IETF protocol assignments
+        ([192, 0, 2, 0], 24),    // TEST-NET-1
+        ([192, 88, 99, 0], 24),  // deprecated 6to4 relay anycast
+        ([192, 168, 0, 0], 16),  // private
+        ([198, 18, 0, 0], 15),   // benchmarking
+        ([198, 51, 100, 0], 24), // TEST-NET-2
+        ([203, 0, 113, 0], 24),  // TEST-NET-3
+        ([224, 0, 0, 0], 4),     // multicast
+        ([240, 0, 0, 0], 4),     // reserved / limited broadcast
+    ]
+    .into_iter()
+    .any(|(network, prefix)| ipv4_in_prefix(address, network, prefix))
+}
+
+fn ipv4_in_prefix(address: Ipv4Addr, network: [u8; 4], prefix: u32) -> bool {
+    let mask = u32::MAX << (32 - prefix);
+    u32::from_be_bytes(address.octets()) & mask == u32::from_be_bytes(network) & mask
+}
+
+fn ipv6_is_non_global(address: Ipv6Addr) -> bool {
+    let octets = address.octets();
+    let mapped_ipv4 = octets[..10] == [0; 10] && octets[10..12] == [0xff, 0xff];
+    if mapped_ipv4 {
+        return ipv4_is_non_global(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    // Deprecated IPv4-compatible literals are never treated as public IPv6,
+    // even when their final four bytes spell a globally routed IPv4 address.
+    if octets[..12] == [0; 12] {
+        return true;
+    }
+    // IANA currently allocates ordinary IPv6 global unicast from 2000::/3.
+    // Treat all other literal space as reserved unless it was the explicitly
+    // handled IPv4-mapped form above.
+    if !ipv6_in_prefix(
+        address,
+        [0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        3,
+    ) {
+        return true;
+    }
+    [
+        ([0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 23),
+        (
+            [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            32,
+        ),
+        ([0x20, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16),
+        ([0x3f, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 20),
+    ]
+    .into_iter()
+    .any(|(network, prefix)| ipv6_in_prefix(address, network, prefix))
+}
+
+fn ipv6_in_prefix(address: Ipv6Addr, network: [u8; 16], prefix: u32) -> bool {
+    let mask = u128::MAX << (128 - prefix);
+    u128::from_be_bytes(address.octets()) & mask == u128::from_be_bytes(network) & mask
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,11 +489,25 @@ impl FrameImage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputReference {
     pub url: String,
+    pub kind: InputReferenceKind,
 }
 
 impl InputReference {
+    /// Construct the legacy image reference form. Keeping this constructor
+    /// image-specific preserves the v0.4 request wire format and persisted
+    /// request fingerprints.
     pub fn new(url: impl Into<String>) -> Result<Self, DomainError> {
-        let value = Self { url: url.into() };
+        Self::with_kind(url, InputReferenceKind::Image)
+    }
+
+    pub fn with_kind(
+        url: impl Into<String>,
+        kind: impl Into<InputReferenceKind>,
+    ) -> Result<Self, DomainError> {
+        let value = Self {
+            url: url.into(),
+            kind: kind.into(),
+        };
         value.validate()?;
         Ok(value)
     }
@@ -414,7 +517,149 @@ impl InputReference {
     }
 
     pub fn to_payload(&self) -> Value {
-        json!({"type": "image_url", "image_url": {"url": self.url}})
+        let wire_name = self.kind.wire_name();
+        let mut payload = Map::new();
+        payload.insert("type".into(), Value::String(wire_name.into()));
+        payload.insert(wire_name.into(), json!({"url": self.url}));
+        Value::Object(payload)
+    }
+
+    pub fn from_payload(payload: &Value) -> Result<Self, DomainError> {
+        let object = payload.as_object().ok_or_else(|| {
+            DomainError::Validation("input reference must be a JSON object".into())
+        })?;
+        let media_fields = [
+            ("image_url", InputReferenceKind::Image),
+            ("video_url", InputReferenceKind::Video),
+            ("audio_url", InputReferenceKind::Audio),
+        ]
+        .into_iter()
+        .filter(|(name, _)| object.contains_key(*name))
+        .collect::<Vec<_>>();
+        let [(_, field_kind)] = media_fields.as_slice() else {
+            return Err(DomainError::Validation(
+                "input reference must contain exactly one image_url, video_url, or audio_url"
+                    .into(),
+            ));
+        };
+        let kind = match object.get("type") {
+            Some(Value::String(value)) => match value.as_str() {
+                "image_url" => InputReferenceKind::Image,
+                "video_url" => InputReferenceKind::Video,
+                "audio_url" => InputReferenceKind::Audio,
+                _ => {
+                    return Err(DomainError::Validation(
+                        "input reference type must be image_url, video_url, or audio_url".into(),
+                    ));
+                }
+            },
+            // Older persisted requests omitted the redundant discriminator.
+            None => *field_kind,
+            Some(_) => {
+                return Err(DomainError::Validation(
+                    "input reference type must be a string".into(),
+                ));
+            }
+        };
+        if kind != *field_kind {
+            return Err(DomainError::Validation(
+                "input reference type must match its media URL field".into(),
+            ));
+        }
+        let url = object
+            .get(kind.wire_name())
+            .and_then(Value::as_object)
+            .and_then(|reference| reference.get("url"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Self::with_kind(url, kind)
+    }
+}
+
+impl Serialize for InputReference {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.to_payload().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for InputReference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        Self::from_payload(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaKind {
+    #[default]
+    Image,
+    Video,
+    Audio,
+}
+
+impl MediaKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Video => "video",
+            Self::Audio => "audio",
+        }
+    }
+}
+
+impl std::fmt::Display for MediaKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum InputReferenceKind {
+    #[default]
+    Image,
+    Video,
+    Audio,
+}
+
+impl InputReferenceKind {
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Image => "image_url",
+            Self::Video => "video_url",
+            Self::Audio => "audio_url",
+        }
+    }
+}
+
+impl From<MediaKind> for InputReferenceKind {
+    fn from(kind: MediaKind) -> Self {
+        match kind {
+            MediaKind::Image => Self::Image,
+            MediaKind::Video => Self::Video,
+            MediaKind::Audio => Self::Audio,
+        }
+    }
+}
+
+impl From<InputReferenceKind> for MediaKind {
+    fn from(kind: InputReferenceKind) -> Self {
+        match kind {
+            InputReferenceKind::Image => Self::Image,
+            InputReferenceKind::Video => Self::Video,
+            InputReferenceKind::Audio => Self::Audio,
+        }
     }
 }
 
@@ -439,7 +684,12 @@ impl MediaSource {
         Ok(source)
     }
 
+    /// Validate a source as a legacy image reference.
     pub fn validate(&self) -> Result<(), DomainError> {
+        self.validate_for_kind(MediaKind::Image)
+    }
+
+    pub fn validate_for_kind(&self, kind: MediaKind) -> Result<(), DomainError> {
         match self {
             Self::LocalFile { path } => {
                 if path.as_os_str().is_empty() {
@@ -470,7 +720,7 @@ impl MediaSource {
                         path.display()
                     )));
                 }
-                validate_local_reference_image(path)?;
+                validate_local_reference(path, kind)?;
             }
             Self::RemoteUrl { url } => validate_public_https_url(url, "Reference media")?,
         }
@@ -492,21 +742,30 @@ impl MediaSource {
     }
 }
 
-fn validate_local_reference_image(path: &Path) -> Result<(), DomainError> {
+fn validate_local_reference(path: &Path, kind: MediaKind) -> Result<(), DomainError> {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase)
         .ok_or_else(|| {
-            DomainError::Validation("Local references must use a supported image extension".into())
+            DomainError::Validation(format!(
+                "Local {} references must use a supported extension",
+                kind.as_str()
+            ))
         })?;
-    if !matches!(
-        extension.as_str(),
-        "png" | "jpg" | "jpeg" | "webp" | "gif" | "avif" | "bmp" | "tif" | "tiff"
-    ) {
+    let extension_supported = match kind {
+        MediaKind::Image => matches!(
+            extension.as_str(),
+            "png" | "jpg" | "jpeg" | "webp" | "gif" | "avif" | "bmp" | "tif" | "tiff"
+        ),
+        MediaKind::Video => matches!(extension.as_str(), "mp4" | "mov"),
+        MediaKind::Audio => matches!(extension.as_str(), "mp3" | "wav"),
+    };
+    if !extension_supported {
         return Err(DomainError::Validation(format!(
-            "Local reference {} is not a supported image; video and audio files cannot be sent as image_url inputs",
-            path.display()
+            "Local reference {} is not a supported {}",
+            path.display(),
+            kind.as_str()
         )));
     }
     let mut file = fs::File::open(path).map_err(|error| {
@@ -523,27 +782,54 @@ fn validate_local_reference_image(path: &Path) -> Result<(), DomainError> {
         ))
     })?;
     let bytes = &header[..read];
-    let signature_matches = match extension.as_str() {
-        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "jpg" | "jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-        "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
-        "webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
-        "bmp" => bytes.starts_with(b"BM"),
-        "tif" | "tiff" => bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*"),
-        "avif" => {
-            bytes.len() >= 12
-                && &bytes[4..8] == b"ftyp"
-                && matches!(&bytes[8..12], b"avif" | b"avis" | b"mif1" | b"miaf")
+    let signature_matches = match kind {
+        MediaKind::Image => match extension.as_str() {
+            "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "jpg" | "jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+            "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+            "webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
+            "bmp" => bytes.starts_with(b"BM"),
+            "tif" | "tiff" => bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*"),
+            "avif" => {
+                bytes.len() >= 12
+                    && &bytes[4..8] == b"ftyp"
+                    && matches!(&bytes[8..12], b"avif" | b"avis" | b"mif1" | b"miaf")
+            }
+            _ => false,
+        },
+        MediaKind::Video => {
+            let brand = (bytes.len() >= 12 && &bytes[4..8] == b"ftyp").then(|| &bytes[8..12]);
+            match extension.as_str() {
+                "mp4" => brand.is_some_and(is_mp4_brand),
+                "mov" => brand == Some(b"qt  ".as_slice()),
+                _ => false,
+            }
         }
-        _ => false,
+        MediaKind::Audio => match extension.as_str() {
+            "mp3" => {
+                bytes.starts_with(b"ID3")
+                    || (bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] & 0xe0 == 0xe0)
+            }
+            "wav" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE",
+            _ => false,
+        },
     };
     if !signature_matches {
         return Err(DomainError::Validation(format!(
-            "Local reference {} does not match its image format",
-            path.display()
+            "Local reference {} does not match its {} format",
+            path.display(),
+            kind.as_str()
         )));
     }
     Ok(())
+}
+
+fn is_mp4_brand(brand: &[u8]) -> bool {
+    matches!(
+        brand,
+        b"avc1" | b"dash" | b"M4V " | b"M4VH" | b"M4VP" | b"MSNV"
+    ) || brand.starts_with(b"iso")
+        || brand.starts_with(b"mp4")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -552,6 +838,8 @@ pub enum MediaRole {
     StartFrame,
     EndFrame,
     Reference,
+    VideoInput,
+    AudioInput,
 }
 
 impl MediaRole {
@@ -559,7 +847,15 @@ impl MediaRole {
         match self {
             Self::StartFrame => Some(FrameType::FirstFrame),
             Self::EndFrame => Some(FrameType::LastFrame),
-            Self::Reference => None,
+            Self::Reference | Self::VideoInput | Self::AudioInput => None,
+        }
+    }
+
+    pub const fn kind(self) -> MediaKind {
+        match self {
+            Self::StartFrame | Self::EndFrame | Self::Reference => MediaKind::Image,
+            Self::VideoInput => MediaKind::Video,
+            Self::AudioInput => MediaKind::Audio,
         }
     }
 }
@@ -586,7 +882,7 @@ impl DraftMedia {
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
-        self.source.validate()
+        self.source.validate_for_kind(self.role.kind())
     }
 }
 
@@ -767,7 +1063,7 @@ impl GenerationDraft {
             match media.role {
                 MediaRole::StartFrame => start_frames += 1,
                 MediaRole::EndFrame => end_frames += 1,
-                MediaRole::Reference => {}
+                MediaRole::Reference | MediaRole::VideoInput | MediaRole::AudioInput => {}
             }
         }
         if start_frames > 1 || end_frames > 1 {
@@ -799,9 +1095,10 @@ impl GenerationDraft {
                     frame_type,
                 )?);
             } else {
-                request
-                    .input_references
-                    .push(InputReference::new(staged_media.public_url.clone())?);
+                request.input_references.push(InputReference::with_kind(
+                    staged_media.public_url.clone(),
+                    staged_media.role.kind(),
+                )?);
             }
         }
         request.validate()?;
@@ -909,8 +1206,19 @@ impl VideoRequest {
                 "adapter_options must be a JSON object".into(),
             ));
         }
+        let mut first_frames = 0usize;
+        let mut last_frames = 0usize;
         for frame in &self.frame_images {
             frame.validate()?;
+            match frame.frame_type {
+                FrameType::FirstFrame => first_frames += 1,
+                FrameType::LastFrame => last_frames += 1,
+            }
+        }
+        if first_frames > 1 || last_frames > 1 {
+            return Err(DomainError::Validation(
+                "A video request can contain at most one first_frame and one last_frame".into(),
+            ));
         }
         for reference in &self.input_references {
             reference.validate()?;
@@ -990,12 +1298,15 @@ impl VideoRequest {
             .get("prompt")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let provider_id = object
-            .get("provider_id")
-            .and_then(Value::as_str)
-            .map(ProviderId::new)
-            .transpose()?
-            .unwrap_or_else(ProviderId::openrouter);
+        let provider_id = match object.get("provider_id") {
+            None | Some(Value::Null) => ProviderId::openrouter(),
+            Some(Value::String(value)) => ProviderId::new(value)?,
+            Some(_) => {
+                return Err(DomainError::Validation(
+                    "provider_id must be a string or null".into(),
+                ));
+            }
+        };
         let mut request = Self::for_provider(provider_id, model, prompt)?;
         request.duration = match object.get("duration") {
             None | Some(Value::Null) => None,
@@ -1010,10 +1321,10 @@ impl VideoRequest {
                     })?,
             ),
         };
-        request.resolution = string_option(object.get("resolution"));
-        request.aspect_ratio = string_option(object.get("aspect_ratio"));
-        request.size = string_option(object.get("size"));
-        request.generate_audio = object.get("generate_audio").and_then(Value::as_bool);
+        request.resolution = optional_string_field(object, "resolution")?;
+        request.aspect_ratio = optional_string_field(object, "aspect_ratio")?;
+        request.size = optional_string_field(object, "size")?;
+        request.generate_audio = optional_bool_field(object, "generate_audio")?;
         request.seed = match object.get("seed") {
             None | Some(Value::Null) => None,
             Some(value) => Some(
@@ -1022,47 +1333,104 @@ impl VideoRequest {
                     .ok_or_else(|| DomainError::Validation("seed must be an integer".into()))?,
             ),
         };
-        request.adapter_options = object
+        let adapter_options = object
             .get("adapter_options")
-            .or_else(|| object.get("provider"))
-            .filter(|value| !value.is_null())
-            .cloned();
+            .filter(|value| !value.is_null());
+        let provider_options = object.get("provider").filter(|value| !value.is_null());
+        request.adapter_options = match (adapter_options, provider_options) {
+            (Some(adapter), Some(provider)) if adapter != provider => {
+                return Err(DomainError::Validation(
+                    "adapter_options and provider cannot specify different values".into(),
+                ));
+            }
+            (Some(value), Some(_)) | (Some(value), None) | (None, Some(value)) => {
+                Some(value.clone())
+            }
+            (None, None) => None,
+        };
 
-        if let Some(frames) = object.get("frame_images").and_then(Value::as_array) {
-            for frame in frames {
-                let Some(frame_object) = frame.as_object() else {
-                    continue;
-                };
-                let url = frame_object
-                    .get("image_url")
-                    .and_then(Value::as_object)
-                    .and_then(|image| image.get("url"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let frame_type = match frame_object.get("frame_type").and_then(Value::as_str) {
-                    None | Some("first_frame") => FrameType::FirstFrame,
-                    Some("last_frame") => FrameType::LastFrame,
-                    Some(_) => {
-                        return Err(DomainError::Validation(
-                            "frame_type must be first_frame or last_frame".into(),
-                        ));
+        match object.get("frame_images") {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(frames)) => {
+                for (index, frame) in frames.iter().enumerate() {
+                    let Some(frame_object) = frame.as_object() else {
+                        return Err(DomainError::Validation(format!(
+                            "frame_images[{index}] must be a JSON object"
+                        )));
+                    };
+                    let frame_media_fields = ["image_url", "video_url", "audio_url"]
+                        .into_iter()
+                        .filter(|name| frame_object.contains_key(*name))
+                        .collect::<Vec<_>>();
+                    if frame_media_fields != ["image_url"] {
+                        return Err(DomainError::Validation(format!(
+                            "frame_images[{index}] must contain exactly one image_url field"
+                        )));
                     }
-                };
-                request.frame_images.push(FrameImage::new(url, frame_type)?);
+                    match frame_object.get("type") {
+                        None => {}
+                        Some(Value::String(value)) if value == "image_url" => {}
+                        Some(Value::String(_)) => {
+                            return Err(DomainError::Validation(
+                                "frame image type must be image_url".into(),
+                            ));
+                        }
+                        Some(_) => {
+                            return Err(DomainError::Validation(
+                                "frame image type must be a string".into(),
+                            ));
+                        }
+                    }
+                    let url = frame_object
+                        .get("image_url")
+                        .and_then(Value::as_object)
+                        .and_then(|image| image.get("url"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let frame_type = match frame_object.get("frame_type") {
+                        None => FrameType::FirstFrame,
+                        Some(Value::String(value)) if value == "first_frame" => {
+                            FrameType::FirstFrame
+                        }
+                        Some(Value::String(value)) if value == "last_frame" => FrameType::LastFrame,
+                        Some(Value::String(_)) => {
+                            return Err(DomainError::Validation(
+                                "frame_type must be first_frame or last_frame".into(),
+                            ));
+                        }
+                        Some(_) => {
+                            return Err(DomainError::Validation(
+                                "frame_type must be a string".into(),
+                            ));
+                        }
+                    };
+                    request.frame_images.push(FrameImage::new(url, frame_type)?);
+                }
+            }
+            Some(_) => {
+                return Err(DomainError::Validation(
+                    "frame_images must be an array".into(),
+                ));
             }
         }
-        if let Some(references) = object.get("input_references").and_then(Value::as_array) {
-            for reference in references {
-                let Some(reference_object) = reference.as_object() else {
-                    continue;
-                };
-                let url = reference_object
-                    .get("image_url")
-                    .and_then(Value::as_object)
-                    .and_then(|image| image.get("url"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                request.input_references.push(InputReference::new(url)?);
+        match object.get("input_references") {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(references)) => {
+                for (index, reference) in references.iter().enumerate() {
+                    if !reference.is_object() {
+                        return Err(DomainError::Validation(format!(
+                            "input_references[{index}] must be a JSON object"
+                        )));
+                    }
+                    request
+                        .input_references
+                        .push(InputReference::from_payload(reference)?);
+                }
+            }
+            Some(_) => {
+                return Err(DomainError::Validation(
+                    "input_references must be an array".into(),
+                ));
             }
         }
         request.validate()?;
@@ -1088,6 +1456,32 @@ impl<'de> Deserialize<'de> for VideoRequest {
     {
         let value = Value::deserialize(deserializer)?;
         Self::from_payload(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+fn optional_string_field(
+    object: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, DomainError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(DomainError::Validation(format!(
+            "{key} must be a string or null"
+        ))),
+    }
+}
+
+fn optional_bool_field(
+    object: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<bool>, DomainError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(DomainError::Validation(format!(
+            "{key} must be a boolean or null"
+        ))),
     }
 }
 
@@ -1139,6 +1533,109 @@ fn decimal(value: &Value) -> Option<Decimal> {
     Decimal::from_str(&text).ok()
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaCardinality {
+    #[default]
+    Scalar,
+    List,
+}
+
+/// Describes how a provider-specific model schema binds one media kind to an
+/// input property. OpenRouter uses its typed input-reference union directly,
+/// while schema-driven adapters such as fal use these bindings to construct
+/// the provider input without guessing property names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaBinding {
+    pub kind: MediaKind,
+    pub property_name: String,
+    #[serde(default)]
+    pub cardinality: MediaCardinality,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_items: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl MediaBinding {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.property_name.trim().is_empty()
+            || self.property_name.len() > 256
+            || self.property_name.chars().any(char::is_control)
+        {
+            return Err(DomainError::Validation(
+                "media binding property name is invalid".into(),
+            ));
+        }
+        if self
+            .min_items
+            .zip(self.max_items)
+            .is_some_and(|(minimum, maximum)| minimum > maximum)
+        {
+            return Err(DomainError::Validation(
+                "media binding min_items cannot exceed max_items".into(),
+            ));
+        }
+        for (label, value) in [
+            ("title", self.title.as_deref()),
+            ("description", self.description.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.chars().any(char::is_control)) {
+                return Err(DomainError::Validation(format!(
+                    "media binding {label} is invalid"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn media_kind(value: &Value) -> Option<MediaKind> {
+    match value.as_str()? {
+        "image" => Some(MediaKind::Image),
+        "video" => Some(MediaKind::Video),
+        "audio" => Some(MediaKind::Audio),
+        _ => None,
+    }
+}
+
+fn input_modalities(object: &Map<String, Value>) -> Option<Vec<MediaKind>> {
+    let value = object.get("input_modalities").or_else(|| {
+        object
+            .get("architecture")
+            .and_then(Value::as_object)
+            .and_then(|architecture| architecture.get("input_modalities"))
+    })?;
+    if value.is_null() {
+        return None;
+    }
+    value
+        .as_array()
+        .map(|values| values.iter().filter_map(media_kind).collect())
+}
+
+fn media_bindings(object: &Map<String, Value>) -> Result<Vec<MediaBinding>, DomainError> {
+    let Some(value) = object.get("media_bindings") else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let bindings: Vec<MediaBinding> = serde_json::from_value(value.clone()).map_err(|error| {
+        DomainError::Validation(format!("model media_bindings are invalid: {error}"))
+    })?;
+    for binding in &bindings {
+        binding.validate()?;
+    }
+    Ok(bindings)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VideoModel {
     pub provider_id: ProviderId,
@@ -1152,6 +1649,13 @@ pub struct VideoModel {
     pub supported_sizes: Vec<String>,
     pub supported_durations: Vec<u32>,
     pub supported_frame_images: Vec<String>,
+    /// Explicit media accepted by a model. `None` means the catalog did not
+    /// advertise this capability; legacy image references remain compatible,
+    /// while video and audio fail closed.
+    pub input_modalities: Option<Vec<MediaKind>>,
+    /// Provider-schema property bindings. An empty list means the provider
+    /// uses its native typed reference union or did not advertise bindings.
+    pub media_bindings: Vec<MediaBinding>,
     pub generate_audio: Option<bool>,
     pub seed: Option<bool>,
     pub allowed_passthrough_parameters: Vec<String>,
@@ -1207,6 +1711,8 @@ impl VideoModel {
             supported_sizes: strings(object.get("supported_sizes")),
             supported_durations: integers(object.get("supported_durations")),
             supported_frame_images: strings(object.get("supported_frame_images")),
+            input_modalities: input_modalities(object),
+            media_bindings: media_bindings(object)?,
             generate_audio: object.get("generate_audio").and_then(Value::as_bool),
             seed: object.get("seed").and_then(Value::as_bool),
             allowed_passthrough_parameters: strings(object.get("allowed_passthrough_parameters")),
@@ -1268,13 +1774,91 @@ impl VideoModel {
         }
         for frame in &request.frame_images {
             let frame_type = frame.frame_type.as_str().to_owned();
-            if !self.supported_frame_images.is_empty()
-                && !self.supported_frame_images.contains(&frame_type)
-            {
+            if !self.supported_frame_images.contains(&frame_type) {
                 problems.push(format!("{frame_type} is not supported"));
             }
         }
+
+        let mut reference_counts = BTreeMap::<MediaKind, usize>::new();
+        for reference in &request.input_references {
+            *reference_counts
+                .entry(MediaKind::from(reference.kind))
+                .or_default() += 1;
+        }
+        for (&kind, &count) in &reference_counts {
+            match &self.input_modalities {
+                Some(modalities) if !modalities.contains(&kind) => problems.push(format!(
+                    "{} input references are not supported",
+                    kind.as_str()
+                )),
+                None if kind != MediaKind::Image => problems.push(format!(
+                    "{} input support is not advertised by this model",
+                    kind.as_str()
+                )),
+                Some(_) | None => {}
+            }
+            if !self.has_reference_transport(kind) {
+                problems.push(format!(
+                    "{} input has no provider media binding",
+                    kind.as_str()
+                ));
+            }
+            if let Some(binding) = self.media_binding(kind) {
+                match binding.cardinality {
+                    MediaCardinality::Scalar if count > 1 => problems.push(format!(
+                        "{} accepts at most one {} input",
+                        binding.property_name,
+                        kind.as_str()
+                    )),
+                    MediaCardinality::List => {
+                        if binding.min_items.is_some_and(|minimum| count < minimum) {
+                            problems.push(format!(
+                                "{} requires at least {} {} input item(s)",
+                                binding.property_name,
+                                binding.min_items.unwrap_or_default(),
+                                kind.as_str()
+                            ));
+                        }
+                        if binding.max_items.is_some_and(|maximum| count > maximum) {
+                            problems.push(format!(
+                                "{} accepts at most {} {} input item(s)",
+                                binding.property_name,
+                                binding.max_items.unwrap_or_default(),
+                                kind.as_str()
+                            ));
+                        }
+                    }
+                    MediaCardinality::Scalar => {}
+                }
+            }
+        }
         problems
+    }
+
+    pub fn media_binding(&self, kind: MediaKind) -> Option<&MediaBinding> {
+        self.media_bindings
+            .iter()
+            .find(|binding| binding.kind == kind)
+    }
+
+    pub fn supports_media_kind(&self, kind: MediaKind) -> bool {
+        let modality_supported = match &self.input_modalities {
+            Some(modalities) => modalities.contains(&kind),
+            None => kind == MediaKind::Image,
+        };
+        modality_supported && self.has_reference_transport(kind)
+    }
+
+    fn has_reference_transport(&self, kind: MediaKind) -> bool {
+        if self.provider_id == ProviderId::openrouter() {
+            return true;
+        }
+        if self.media_binding(kind).is_some() {
+            return true;
+        }
+        self.provider_id == ProviderId::fal()
+            && kind == MediaKind::Image
+            && self.field_map.contains_key("references")
     }
 }
 
@@ -1691,5 +2275,406 @@ fn unavailable(reason: &str, pricing: &BTreeMap<String, Decimal>) -> CostEstimat
         currency: "USD".into(),
         raw_pricing: pricing.clone(),
         confidence: QuoteConfidence::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn typed_input_references_keep_the_legacy_image_wire_shape() {
+        let url = "https://media.example/reference.png";
+        let image = InputReference::new(url).expect("image reference");
+        assert_eq!(image.kind, InputReferenceKind::Image);
+        assert_eq!(
+            image.to_payload(),
+            json!({"type": "image_url", "image_url": {"url": url}})
+        );
+        assert_eq!(
+            serde_json::to_value(&image).expect("serialize image reference"),
+            json!({"type": "image_url", "image_url": {"url": url}})
+        );
+
+        for (kind, wire_name, extension) in [
+            (InputReferenceKind::Video, "video_url", "mp4"),
+            (InputReferenceKind::Audio, "audio_url", "wav"),
+        ] {
+            let url = format!("https://media.example/reference.{extension}");
+            let reference = InputReference::with_kind(&url, kind).expect("typed reference");
+            assert_eq!(
+                reference.to_payload(),
+                json!({"type": wire_name, wire_name: {"url": url}})
+            );
+            assert_eq!(
+                InputReference::from_payload(&reference.to_payload())
+                    .expect("round-trip typed reference"),
+                reference
+            );
+        }
+    }
+
+    #[test]
+    fn request_payload_rejects_malformed_media_arrays_and_discriminators() {
+        let base = json!({"model": "example/video", "prompt": "test"});
+        for (field, invalid) in [
+            ("frame_images", json!({})),
+            ("frame_images", json!("not-an-array")),
+            ("input_references", json!({})),
+            ("input_references", json!(false)),
+        ] {
+            let mut payload = base.clone();
+            payload[field] = invalid;
+            assert!(
+                VideoRequest::from_payload(&payload).is_err(),
+                "accepted malformed {field}: {payload}"
+            );
+        }
+
+        for (field, invalid_item) in [
+            ("frame_images", json!(null)),
+            ("frame_images", json!(7)),
+            ("input_references", json!(null)),
+            ("input_references", json!("reference")),
+        ] {
+            let mut payload = base.clone();
+            payload[field] = json!([invalid_item]);
+            assert!(
+                VideoRequest::from_payload(&payload).is_err(),
+                "silently dropped malformed {field} element: {payload}"
+            );
+        }
+
+        let mut frame_type_confusion = base.clone();
+        frame_type_confusion["frame_images"] = json!([{
+            "type": "image_url",
+            "image_url": {"url": "https://media.example/start.png"},
+            "frame_type": false
+        }]);
+        assert!(VideoRequest::from_payload(&frame_type_confusion).is_err());
+
+        let mut reference_type_confusion = base.clone();
+        reference_type_confusion["input_references"] = json!([{
+            "type": 7,
+            "image_url": {"url": "https://media.example/reference.png"}
+        }]);
+        assert!(VideoRequest::from_payload(&reference_type_confusion).is_err());
+
+        for reference in [
+            json!({
+                "type": "image_url",
+                "video_url": {"url": "https://media.example/reference.mp4"}
+            }),
+            json!({
+                "type": "video_url",
+                "image_url": {"url": "https://media.example/reference.png"},
+                "video_url": {"url": "https://media.example/reference.mp4"}
+            }),
+            json!({
+                "image_url": {"url": "https://media.example/reference.png"},
+                "audio_url": {"url": "https://media.example/reference.wav"}
+            }),
+        ] {
+            let mut payload = base.clone();
+            payload["input_references"] = json!([reference]);
+            assert!(VideoRequest::from_payload(&payload).is_err());
+        }
+
+        for frame in [
+            json!({
+                "type": "video_url",
+                "image_url": {"url": "https://media.example/start.png"},
+                "frame_type": "first_frame"
+            }),
+            json!({
+                "type": "image_url",
+                "image_url": {"url": "https://media.example/start.png"},
+                "video_url": {"url": "https://media.example/start.mp4"},
+                "frame_type": "first_frame"
+            }),
+        ] {
+            let mut payload = base.clone();
+            payload["frame_images"] = json!([frame]);
+            assert!(VideoRequest::from_payload(&payload).is_err());
+        }
+
+        let mut partial_references = base.clone();
+        partial_references["input_references"] = json!([
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://media.example/reference.png"}
+            },
+            7
+        ]);
+        assert!(
+            VideoRequest::from_payload(&partial_references).is_err(),
+            "a valid prefix must not hide a malformed later media item"
+        );
+
+        let mut nullable = base;
+        nullable["provider_id"] = Value::Null;
+        nullable["resolution"] = Value::Null;
+        nullable["aspect_ratio"] = Value::Null;
+        nullable["size"] = Value::Null;
+        nullable["generate_audio"] = Value::Null;
+        nullable["frame_images"] = Value::Null;
+        nullable["input_references"] = Value::Null;
+        let parsed = VideoRequest::from_payload(&nullable).expect("nullable legacy request");
+        assert_eq!(parsed.provider_id, ProviderId::openrouter());
+        assert!(parsed.frame_images.is_empty());
+        assert!(parsed.input_references.is_empty());
+
+        let mut missing_frame_type = nullable;
+        missing_frame_type["frame_images"] = json!([{
+            "type": "image_url",
+            "image_url": {"url": "https://media.example/start.png"}
+        }]);
+        assert_eq!(
+            VideoRequest::from_payload(&missing_frame_type)
+                .expect("legacy frame without discriminator")
+                .frame_images[0]
+                .frame_type,
+            FrameType::FirstFrame
+        );
+    }
+
+    #[test]
+    fn request_payload_rejects_wrong_typed_optional_controls() {
+        let base = json!({"model": "example/video", "prompt": "test"});
+        for (field, invalid) in [
+            ("provider_id", json!(false)),
+            ("resolution", json!(720)),
+            ("aspect_ratio", json!(["16:9"])),
+            ("size", json!({"width": 1280, "height": 720})),
+            ("generate_audio", json!("true")),
+        ] {
+            let mut payload = base.clone();
+            payload[field] = invalid;
+            assert!(
+                VideoRequest::from_payload(&payload).is_err(),
+                "silently erased wrong-typed {field}: {payload}"
+            );
+        }
+
+        let mut provider_fallback = base.clone();
+        provider_fallback["adapter_options"] = Value::Null;
+        provider_fallback["provider"] = json!({"options": {"route": "fixture"}});
+        assert_eq!(
+            VideoRequest::from_payload(&provider_fallback)
+                .expect("wire provider options")
+                .adapter_options,
+            Some(json!({"options": {"route": "fixture"}}))
+        );
+
+        let mut conflicting = base;
+        conflicting["adapter_options"] = json!({"route": "one"});
+        conflicting["provider"] = json!({"route": "two"});
+        assert!(VideoRequest::from_payload(&conflicting).is_err());
+    }
+
+    #[test]
+    fn video_request_rejects_duplicate_frame_destinations() {
+        let first = || {
+            FrameImage::new("https://media.example/first.png", FrameType::FirstFrame)
+                .expect("first frame")
+        };
+        let mut request = VideoRequest::new("example/video", "test").expect("request");
+        request.frame_images = vec![first(), first()];
+        assert!(request.validate().is_err());
+        assert!(request.to_payload().is_err());
+
+        let duplicate_payload = json!({
+            "model": "example/video",
+            "prompt": "test",
+            "frame_images": [first().to_payload(), first().to_payload()]
+        });
+        assert!(VideoRequest::from_payload(&duplicate_payload).is_err());
+
+        request.frame_images = vec![
+            first(),
+            FrameImage::new("https://media.example/last.png", FrameType::LastFrame)
+                .expect("last frame"),
+        ];
+        request.validate().expect("one frame per destination");
+    }
+
+    #[test]
+    fn local_media_validation_uses_the_selected_role_kind() {
+        let directory = tempdir().expect("media directory");
+        let image = directory.path().join("reference.png");
+        let video = directory.path().join("reference.mp4");
+        let movie = directory.path().join("reference.mov");
+        let audio = directory.path().join("reference.mp3");
+        let wave = directory.path().join("reference.wav");
+        fs::write(&image, b"\x89PNG\r\n\x1a\nfixture").expect("image fixture");
+        fs::write(&video, b"\0\0\0\x18ftypmp42fixture").expect("video fixture");
+        fs::write(&movie, b"\0\0\0\x14ftypqt  fixture").expect("mov fixture");
+        fs::write(&audio, b"ID3fixture").expect("audio fixture");
+        fs::write(&wave, b"RIFF\0\0\0\0WAVEfixture").expect("wave fixture");
+
+        DraftMedia::local(&image, MediaRole::Reference)
+            .validate()
+            .expect("legacy image");
+        DraftMedia::local(&video, MediaRole::VideoInput)
+            .validate()
+            .expect("MP4 video");
+        DraftMedia::local(&movie, MediaRole::VideoInput)
+            .validate()
+            .expect("MOV video");
+        DraftMedia::local(&audio, MediaRole::AudioInput)
+            .validate()
+            .expect("MP3 audio");
+        DraftMedia::local(&wave, MediaRole::AudioInput)
+            .validate()
+            .expect("WAV audio");
+        assert!(
+            DraftMedia::local(&video, MediaRole::Reference)
+                .validate()
+                .is_err(),
+            "an MP4 must not be serialized as a legacy image_url"
+        );
+        assert!(
+            DraftMedia::local(&image, MediaRole::VideoInput)
+                .validate()
+                .is_err(),
+            "an image must not be serialized as a video_url"
+        );
+    }
+
+    #[test]
+    fn model_media_capabilities_fail_closed_for_new_reference_kinds() {
+        let unknown = VideoModel::from_api(&json!({"id": "example/unknown"}))
+            .expect("model without modalities");
+        assert!(unknown.supports_media_kind(MediaKind::Image));
+        assert!(!unknown.supports_media_kind(MediaKind::Video));
+
+        let mut request = VideoRequest::new("example/unknown", "test").expect("request");
+        request.input_references.push(
+            InputReference::with_kind(
+                "https://media.example/reference.mp4",
+                InputReferenceKind::Video,
+            )
+            .expect("video reference"),
+        );
+        assert!(
+            unknown
+                .supports_request(&request)
+                .iter()
+                .any(|problem| problem.contains("video input support"))
+        );
+
+        let capable = VideoModel::from_api(&json!({
+            "id": "example/capable",
+            "input_modalities": ["text", "video", "audio"],
+            "media_bindings": [{
+                "kind": "video",
+                "property_name": "video_url"
+            }]
+        }))
+        .expect("typed model");
+        assert_eq!(
+            capable.input_modalities,
+            Some(vec![MediaKind::Video, MediaKind::Audio])
+        );
+        assert!(capable.supports_media_kind(MediaKind::Video));
+        assert!(
+            capable.supports_media_kind(MediaKind::Audio),
+            "OpenRouter's native union does not require per-property bindings"
+        );
+        assert_eq!(
+            capable.media_bindings[0].cardinality,
+            MediaCardinality::Scalar
+        );
+
+        request.model = capable.id.clone();
+        assert!(capable.supports_request(&request).is_empty());
+
+        let fal_frame_only = VideoModel::from_provider_api(
+            ProviderId::fal(),
+            &json!({
+                "id": "fal/frame-only",
+                "input_modalities": ["image", "video"],
+                "supported_frame_images": ["first_frame"],
+                "field_map": {"first_frame": "image_url"}
+            }),
+        )
+        .expect("fal frame-only model");
+        assert!(!fal_frame_only.supports_media_kind(MediaKind::Image));
+        assert!(!fal_frame_only.supports_media_kind(MediaKind::Video));
+
+        let fal_legacy_references = VideoModel::from_provider_api(
+            ProviderId::fal(),
+            &json!({
+                "id": "fal/legacy-references",
+                "field_map": {"references": "reference_images"}
+            }),
+        )
+        .expect("legacy fal model");
+        assert!(fal_legacy_references.supports_media_kind(MediaKind::Image));
+    }
+
+    #[test]
+    fn public_https_validation_rejects_local_and_non_public_literal_hosts() {
+        for url in [
+            "https://localhost/reference.png",
+            "https://LOCALHOST./reference.png",
+            "https://media.localhost/reference.png",
+            "https://renderbox.local/reference.png",
+            "https://RENDERBOX.LOCAL./reference.png",
+            "https://127.0.0.1/reference.png",
+            "https://10.0.0.1/reference.png",
+            "https://172.16.0.1/reference.png",
+            "https://192.168.0.1/reference.png",
+            "https://169.254.1.1/reference.png",
+            "https://0.0.0.0/reference.png",
+            "https://0.1.2.3/reference.png",
+            "https://100.64.0.1/reference.png",
+            "https://100.127.255.254/reference.png",
+            "https://192.0.0.1/reference.png",
+            "https://192.0.2.1/reference.png",
+            "https://192.88.99.1/reference.png",
+            "https://198.18.0.1/reference.png",
+            "https://198.19.255.254/reference.png",
+            "https://198.51.100.1/reference.png",
+            "https://203.0.113.1/reference.png",
+            "https://224.0.0.1/reference.png",
+            "https://240.0.0.1/reference.png",
+            "https://255.255.255.255/reference.png",
+            "https://[::1]/reference.png",
+            "https://[::]/reference.png",
+            "https://[::808:808]/reference.png",
+            "https://[fc00::1]/reference.png",
+            "https://[fe80::1]/reference.png",
+            "https://[fec0::1]/reference.png",
+            "https://[ff02::1]/reference.png",
+            "https://[::ffff:c0a8:1]/reference.png",
+            "https://[64:ff9b::808:808]/reference.png",
+            "https://[64:ff9b:1::1]/reference.png",
+            "https://[100::1]/reference.png",
+            "https://[2001::1]/reference.png",
+            "https://[2001:db8::1]/reference.png",
+            "https://[2002::1]/reference.png",
+            "https://[3fff::1]/reference.png",
+            "https://[4000::1]/reference.png",
+            "https://[5f00::1]/reference.png",
+        ] {
+            assert!(
+                validate_public_https_url(url, "fixture").is_err(),
+                "accepted non-public URL {url}"
+            );
+        }
+
+        for url in [
+            "https://media.example/reference.png?X-Signature=abc123&expires=123",
+            "https://8.8.8.8/reference.png",
+            "https://100.128.0.1/reference.png",
+            "https://[2606:4700:4700::1111]/reference.png",
+            "https://[2001:4860:4860::8888]/reference.png",
+            "https://[::ffff:808:808]/reference.png",
+        ] {
+            validate_public_https_url(url, "fixture")
+                .unwrap_or_else(|error| panic!("rejected public URL {url}: {error}"));
+        }
     }
 }

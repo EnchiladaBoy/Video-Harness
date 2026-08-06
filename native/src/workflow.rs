@@ -20,14 +20,14 @@ use crate::config::{
 };
 use crate::credentials::{CredentialStatus, CredentialStore};
 use crate::domain::{
-    CostQuote, DraftMedia, GenerationDraft, JobLocator, JobStatus, MediaRole, MediaSource,
-    ProviderDescriptor, ProviderId, ProviderJobKey, StagedMedia, UploadReceipt, VideoCatalog,
-    VideoJob, VideoRequest,
+    CostQuote, DraftMedia, GenerationDraft, InputReferenceKind, JobLocator, JobStatus, MediaRole,
+    MediaSource, ProviderDescriptor, ProviderId, ProviderJobKey, StagedMedia, UploadReceipt,
+    VideoCatalog, VideoJob, VideoRequest,
 };
 use crate::gui_state::{
     BeginUncertainSubmission, DraftEditorState, GenerationMediaAssociation, GuiStateError,
     GuiStateStore, ResumableJob, StoredDraft, StoredDraftMedia, StoredMediaSource,
-    StoredUploadReceipt, UncertainSubmissionRecord, generation_draft_fingerprint,
+    StoredUploadReceipt, UncertainSubmissionRecord, generation_draft_fingerprint_candidates,
 };
 use crate::history::{HistoryError, HistoryStore, JobRecord};
 use crate::providers::fal::{FalOptions, FalProvider};
@@ -471,6 +471,7 @@ struct PreparedGeneration {
     expires_at: DateTime<Utc>,
     deadline: Instant,
     draft_fingerprint: String,
+    draft_fingerprint_candidates: Vec<String>,
 }
 
 struct PreparedPayload {
@@ -480,6 +481,7 @@ struct PreparedPayload {
     staged_media: Vec<StagedMedia>,
     quote: CostQuote,
     draft_fingerprint: String,
+    draft_fingerprint_candidates: Vec<String>,
 }
 
 struct PreparationOutcome {
@@ -695,6 +697,7 @@ async fn run_service(
                                     expires_at,
                                     deadline: Instant::now() + lifetime,
                                     draft_fingerprint: payload.draft_fingerprint,
+                                    draft_fingerprint_candidates: payload.draft_fingerprint_candidates,
                                 };
                                 let _ = events.send(ServiceEvent::ReviewReady {
                                     op_id: outcome.op_id,
@@ -934,20 +937,21 @@ async fn run_service(
                             emit_error(&events, op_id, Some(provider_id), ServiceScope::Preparation, error.to_string(), true, None);
                             continue;
                         }
-                        let draft_fingerprint = match generation_draft_fingerprint(&draft) {
-                            Ok(fingerprint) => fingerprint,
+                        let draft_fingerprints = match generation_draft_fingerprint_candidates(&draft) {
+                            Ok(fingerprints) => fingerprints,
                             Err(error) => {
                                 emit_gui_state_error(&events, op_id, ServiceScope::Preparation, error);
                                 continue;
                             }
                         };
+                        let draft_fingerprint = draft_fingerprints[0].clone();
                         let safety_state = gui_state.clone();
                         let safety_provider = provider_id.clone();
-                        let safety_fingerprint = draft_fingerprint.clone();
+                        let safety_fingerprints = draft_fingerprints.clone();
                         match tokio::task::spawn_blocking(move || {
-                            safety_state.uncertain_submission(
+                            safety_state.uncertain_submission_for_fingerprints(
                                 &safety_provider,
-                                &safety_fingerprint,
+                                &safety_fingerprints,
                             )
                         }).await {
                             Ok(Ok(Some(record))) => {
@@ -991,6 +995,7 @@ async fn run_service(
                             revision,
                             draft,
                             draft_fingerprint,
+                            draft_fingerprints,
                             provider,
                             gui_state.clone(),
                             Arc::clone(&cancel),
@@ -1067,8 +1072,12 @@ async fn run_service(
                         );
                         let safety_state = gui_state.clone();
                         let safety_candidate = safety_record.clone();
+                        let safety_fingerprints = item.draft_fingerprint_candidates.clone();
                         match tokio::task::spawn_blocking(move || {
-                            safety_state.begin_uncertain_submission(&safety_candidate)
+                            safety_state.begin_uncertain_submission_with_aliases(
+                                &safety_candidate,
+                                &safety_fingerprints,
+                            )
                         }).await {
                             Ok(Ok(BeginUncertainSubmission::Inserted(record))) => {
                                 let _ = events.send(ServiceEvent::UncertainSubmissionSaved {
@@ -1411,13 +1420,32 @@ async fn run_service(
                                 continue;
                             }
                         };
-                        let draft_fingerprint = match video_request_fingerprint(&request) {
-                            Ok(fingerprint) => fingerprint,
+                        // The legacy direct command remains available for
+                        // integrations, but media-bearing requests must pass
+                        // the same current catalog/schema checks as Review
+                        // before a durable paid-submission safety marker is
+                        // written.
+                        if (!request.frame_images.is_empty()
+                            || !request.input_references.is_empty())
+                            && let Err(error) = provider.validate_request(&request).await
+                        {
+                            emit_provider_error(
+                                &events,
+                                op_id,
+                                ServiceScope::Generation,
+                                error,
+                                None,
+                            );
+                            continue;
+                        }
+                        let draft_fingerprints = match video_request_fingerprint_candidates(&request) {
+                            Ok(fingerprints) => fingerprints,
                             Err(error) => {
                                 emit_gui_state_error(&events, op_id, ServiceScope::Generation, error);
                                 continue;
                             }
                         };
+                        let draft_fingerprint = draft_fingerprints[0].clone();
                         let safety_record = UncertainSubmissionRecord::new(
                             provider_id.clone(),
                             draft_fingerprint,
@@ -1425,8 +1453,12 @@ async fn run_service(
                         );
                         let safety_state = gui_state.clone();
                         let safety_candidate = safety_record.clone();
+                        let safety_fingerprints = draft_fingerprints.clone();
                         match tokio::task::spawn_blocking(move || {
-                            safety_state.begin_uncertain_submission(&safety_candidate)
+                            safety_state.begin_uncertain_submission_with_aliases(
+                                &safety_candidate,
+                                &safety_fingerprints,
+                            )
                         }).await {
                             Ok(Ok(BeginUncertainSubmission::Inserted(record))) => {
                                 let _ = events.send(ServiceEvent::UncertainSubmissionSaved {
@@ -1899,6 +1931,7 @@ async fn run_prepare_generation(
     revision: u64,
     draft: GenerationDraft,
     draft_fingerprint: String,
+    draft_fingerprint_candidates: Vec<String>,
     provider: Arc<dyn VideoProvider>,
     gui_state: GuiStateStore,
     cancel: Arc<AtomicBool>,
@@ -1910,6 +1943,7 @@ async fn run_prepare_generation(
         revision,
         draft,
         draft_fingerprint,
+        draft_fingerprint_candidates,
         provider,
         gui_state,
         cancel,
@@ -1925,6 +1959,7 @@ async fn prepare_generation_inner(
     revision: u64,
     draft: GenerationDraft,
     draft_fingerprint: String,
+    draft_fingerprint_candidates: Vec<String>,
     provider: Arc<dyn VideoProvider>,
     gui_state: GuiStateStore,
     cancel: Arc<AtomicBool>,
@@ -2043,6 +2078,9 @@ async fn prepare_generation_inner(
         });
         staged_media.push(staged);
     }
+    provider
+        .validate_staged_media_constraints(&draft, &staged_media)
+        .map_err(|error| TaskFailure::provider(ServiceScope::Preparation, error, None))?;
     if cancel.load(Ordering::Acquire) {
         return Err(preparation_cancelled(provider_id));
     }
@@ -2069,6 +2107,7 @@ async fn prepare_generation_inner(
         staged_media,
         quote,
         draft_fingerprint,
+        draft_fingerprint_candidates,
     })
 }
 
@@ -2312,7 +2351,9 @@ fn generation_from_stored_draft(stored: &StoredDraft) -> Result<GenerationDraft,
     Ok(draft)
 }
 
-fn video_request_fingerprint(request: &VideoRequest) -> Result<String, GuiStateError> {
+fn video_request_fingerprint_candidates(
+    request: &VideoRequest,
+) -> Result<Vec<String>, GuiStateError> {
     let mut media = request
         .frame_images
         .iter()
@@ -2330,9 +2371,13 @@ fn video_request_fingerprint(request: &VideoRequest) -> Result<String, GuiStateE
         source: MediaSource::RemoteUrl {
             url: reference.url.clone(),
         },
-        role: MediaRole::Reference,
+        role: match reference.kind {
+            InputReferenceKind::Image => MediaRole::Reference,
+            InputReferenceKind::Video => MediaRole::VideoInput,
+            InputReferenceKind::Audio => MediaRole::AudioInput,
+        },
     }));
-    generation_draft_fingerprint(&GenerationDraft {
+    generation_draft_fingerprint_candidates(&GenerationDraft {
         provider_id: request.provider_id.clone(),
         model: request.model.clone(),
         prompt: request.prompt.clone(),
@@ -2375,6 +2420,8 @@ fn media_role_name(role: MediaRole) -> &'static str {
         MediaRole::StartFrame => "start_frame",
         MediaRole::EndFrame => "end_frame",
         MediaRole::Reference => "reference",
+        MediaRole::VideoInput => "video_input",
+        MediaRole::AudioInput => "audio_input",
     }
 }
 
@@ -2383,6 +2430,8 @@ fn parse_media_role(value: &str) -> Result<MediaRole, GuiStateError> {
         "start_frame" => Ok(MediaRole::StartFrame),
         "end_frame" => Ok(MediaRole::EndFrame),
         "reference" => Ok(MediaRole::Reference),
+        "video_input" => Ok(MediaRole::VideoInput),
+        "audio_input" => Ok(MediaRole::AudioInput),
         _ => Err(GuiStateError::InvalidValue(format!(
             "unknown draft media role {value}"
         ))),
@@ -3480,5 +3529,52 @@ mod tests {
             now
         ));
         assert!(staged_media_valid_for_submission(&[safe], now));
+    }
+
+    #[test]
+    fn direct_request_fingerprints_follow_provider_media_ordering() {
+        let reference = |url: &str, kind| {
+            crate::domain::InputReference::with_kind(url, kind).expect("typed reference")
+        };
+        let mut fal =
+            VideoRequest::for_provider(ProviderId::fal(), "model", "prompt").expect("fal request");
+        fal.input_references = vec![
+            reference(
+                "https://media.example/video-a.mp4",
+                InputReferenceKind::Video,
+            ),
+            reference("https://media.example/audio.wav", InputReferenceKind::Audio),
+            reference(
+                "https://media.example/video-b.mp4",
+                InputReferenceKind::Video,
+            ),
+        ];
+        let mut cross_kind = fal.clone();
+        cross_kind.input_references.swap(0, 1);
+        let fal_fingerprints =
+            video_request_fingerprint_candidates(&fal).expect("fal fingerprints");
+        assert_eq!(fal_fingerprints.len(), 2);
+        assert_eq!(
+            fal_fingerprints[0],
+            video_request_fingerprint_candidates(&cross_kind).expect("cross-kind fingerprints")[0]
+        );
+
+        let mut same_kind = fal.clone();
+        same_kind.input_references.swap(0, 2);
+        assert_ne!(
+            fal_fingerprints[0],
+            video_request_fingerprint_candidates(&same_kind).expect("same-kind fingerprints")[0]
+        );
+
+        let mut openrouter = fal;
+        openrouter.provider_id = ProviderId::openrouter();
+        let mut reordered_openrouter = openrouter.clone();
+        reordered_openrouter.input_references.swap(0, 1);
+        assert_ne!(
+            video_request_fingerprint_candidates(&openrouter).expect("OpenRouter fingerprints")[0],
+            video_request_fingerprint_candidates(&reordered_openrouter)
+                .expect("reordered OpenRouter fingerprints")[0],
+            "OpenRouter's documented mixed input_references array remains ordered"
+        );
     }
 }

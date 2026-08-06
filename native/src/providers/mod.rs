@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::api::DownloadProgress;
 use crate::domain::{
-    CostQuote, DraftMedia, GenerationDraft, JobLocator, MediaSource, ProviderDescriptor,
+    CostQuote, DraftMedia, GenerationDraft, JobLocator, MediaKind, MediaSource, ProviderDescriptor,
     ProviderId, StagedMedia, UploadReceipt, VideoArtifact, VideoCatalog, VideoJob, VideoRequest,
 };
 
@@ -141,6 +141,27 @@ pub trait VideoProvider: Send + Sync {
         MediaCapabilities::urls_only()
     }
 
+    /// Provider/model-specific local constraints that can be checked without
+    /// uploading bytes or submitting a generation.
+    fn validate_draft_media_constraints(
+        &self,
+        _draft: &GenerationDraft,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    /// Provider/model-specific constraints checked against the media that was
+    /// actually staged. This closes the gap between early draft validation
+    /// and async upload work: implementations can trust uploaded receipt sizes
+    /// here before Review, quoting, or any potentially billable submission.
+    fn validate_staged_media_constraints(
+        &self,
+        _draft: &GenerationDraft,
+        _staged_media: &[StagedMedia],
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
     /// Validate an editable draft without uploading media or performing a
     /// potentially billable submission. Local files are represented by inert
     /// public-HTTPS placeholders only after their paths and provider media
@@ -161,6 +182,7 @@ pub trait VideoProvider: Send + Sync {
                 error.to_string(),
             )
         })?;
+        self.validate_draft_media_constraints(draft)?;
 
         let capabilities = self.media_capabilities();
         let mut validation_media = Vec::with_capacity(draft.media.len());
@@ -177,11 +199,12 @@ pub trait VideoProvider: Send + Sync {
                         ),
                     ));
                 }
-                MediaSource::LocalFile { path } if capabilities.local_files => {
-                    let extension = path
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .unwrap_or("png");
+                MediaSource::LocalFile { .. } if capabilities.local_files => {
+                    let extension = match media.role.kind() {
+                        MediaKind::Image => "png",
+                        MediaKind::Video => "mp4",
+                        MediaKind::Audio => "mp3",
+                    };
                     format!(
                         "https://validation.invalid/reference-{}.{extension}",
                         index + 1
@@ -248,7 +271,7 @@ pub trait VideoProvider: Send + Sync {
         _cached_receipt: Option<&UploadReceipt>,
         _progress: Option<mpsc::UnboundedSender<UploadProgress>>,
     ) -> Result<StagedMedia, ProviderError> {
-        media.source.validate().map_err(|error| {
+        media.validate().map_err(|error| {
             ProviderError::new(
                 self.descriptor().id,
                 ProviderErrorKind::Validation,

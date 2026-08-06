@@ -21,7 +21,7 @@ use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::domain::{
-    GenerationDraft, JobLocator, MediaRole, MediaSource, ProviderId, ProviderJobKey,
+    DraftMedia, GenerationDraft, JobLocator, MediaRole, MediaSource, ProviderId, ProviderJobKey,
 };
 
 const SCHEMA_VERSION: i64 = 1;
@@ -687,9 +687,30 @@ impl GuiStateStore {
         &self,
         record: &UncertainSubmissionRecord,
     ) -> Result<BeginUncertainSubmission, GuiStateError> {
+        self.begin_uncertain_submission_with_aliases(record, &[])
+    }
+
+    /// Atomically create a canonical pre-submit row, while treating legacy
+    /// fingerprints for the same provider request as an existing safety hold.
+    pub fn begin_uncertain_submission_with_aliases(
+        &self,
+        record: &UncertainSubmissionRecord,
+        aliases: &[String],
+    ) -> Result<BeginUncertainSubmission, GuiStateError> {
         validate_uncertain_submission(record)?;
+        for alias in aliases {
+            validate_fingerprint(alias)?;
+        }
         let mut connection = self.ready_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for fingerprint in std::iter::once(&record.draft_fingerprint).chain(aliases) {
+            if let Some(existing) =
+                query_uncertain_submission(&transaction, &record.provider_id, fingerprint)?
+            {
+                transaction.commit()?;
+                return Ok(BeginUncertainSubmission::Existing(existing));
+            }
+        }
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO uncertain_submissions
                  (provider_id, draft_fingerprint, recorded_at, message)
@@ -722,9 +743,25 @@ impl GuiStateStore {
         provider_id: &ProviderId,
         draft_fingerprint: &str,
     ) -> Result<Option<UncertainSubmissionRecord>, GuiStateError> {
-        validate_fingerprint(draft_fingerprint)?;
+        self.uncertain_submission_for_fingerprints(provider_id, &[draft_fingerprint.to_owned()])
+    }
+
+    pub fn uncertain_submission_for_fingerprints(
+        &self,
+        provider_id: &ProviderId,
+        draft_fingerprints: &[String],
+    ) -> Result<Option<UncertainSubmissionRecord>, GuiStateError> {
+        for fingerprint in draft_fingerprints {
+            validate_fingerprint(fingerprint)?;
+        }
         let connection = self.ready_connection()?;
-        query_uncertain_submission(&connection, provider_id, draft_fingerprint)
+        for fingerprint in draft_fingerprints {
+            if let Some(record) = query_uncertain_submission(&connection, provider_id, fingerprint)?
+            {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
     }
 
     pub fn clear_uncertain_submission(
@@ -776,9 +813,77 @@ impl GuiStateStore {
 /// Return a stable semantic digest without reading or retaining media bytes.
 /// JSON object order, Unicode composition, and cosmetic string whitespace do
 /// not change the result. Local references use their canonical path identity.
+/// Typed media are ordered by provider wire destinations; v0.4-compatible
+/// image-only drafts retain their historical global ordering for safety.
 pub fn generation_draft_fingerprint(draft: &GenerationDraft) -> Result<String, GuiStateError> {
-    let media = draft
+    Ok(generation_draft_fingerprint_candidates(draft)?[0].clone())
+}
+
+/// For typed-media drafts, return the provider-semantic fingerprint followed,
+/// when different, by the v0.4-style global-media-order fingerprint. Image-only
+/// drafts retain only the legacy digest as a rollback/concurrent-v0.4 safety
+/// exception. Callers enforcing the paid-submission barrier must check every
+/// returned candidate.
+pub fn generation_draft_fingerprint_candidates(
+    draft: &GenerationDraft,
+) -> Result<Vec<String>, GuiStateError> {
+    let legacy_order = draft.media.iter().collect::<Vec<_>>();
+    let legacy = fingerprint_draft_with_media(draft, &legacy_order)?;
+    // v0.4 can represent only image roles and may still be reading the same
+    // safety database after rollback. Keep its exact global-order digest as
+    // the stored primary for those drafts. Typed drafts cannot be submitted
+    // by v0.4, so they can safely use provider-wire canonical ordering.
+    if !draft
         .media
+        .iter()
+        .any(|item| matches!(item.role, MediaRole::VideoInput | MediaRole::AudioInput))
+    {
+        return Ok(vec![legacy]);
+    }
+    let canonical_order = provider_canonical_media_order(draft);
+    let canonical = fingerprint_draft_with_media(draft, &canonical_order)?;
+    let mut fingerprints = vec![canonical];
+    if legacy != fingerprints[0] {
+        fingerprints.push(legacy);
+    }
+    Ok(fingerprints)
+}
+
+fn provider_canonical_media_order(draft: &GenerationDraft) -> Vec<&DraftMedia> {
+    if draft.provider_id == ProviderId::fal() {
+        let mut media = Vec::with_capacity(draft.media.len());
+        for role in [
+            MediaRole::StartFrame,
+            MediaRole::EndFrame,
+            MediaRole::Reference,
+            MediaRole::VideoInput,
+            MediaRole::AudioInput,
+        ] {
+            media.extend(draft.media.iter().filter(|item| item.role == role));
+        }
+        media
+    } else if draft.provider_id == ProviderId::openrouter() {
+        draft
+            .media
+            .iter()
+            .filter(|item| item.role.frame_type().is_some())
+            .chain(
+                draft
+                    .media
+                    .iter()
+                    .filter(|item| item.role.frame_type().is_none()),
+            )
+            .collect()
+    } else {
+        draft.media.iter().collect()
+    }
+}
+
+fn fingerprint_draft_with_media(
+    draft: &GenerationDraft,
+    ordered_media: &[&DraftMedia],
+) -> Result<String, GuiStateError> {
+    let media = ordered_media
         .iter()
         .map(|item| {
             let source = match &item.source {
@@ -796,6 +901,8 @@ pub fn generation_draft_fingerprint(draft: &GenerationDraft) -> Result<String, G
                     MediaRole::StartFrame => "start_frame",
                     MediaRole::EndFrame => "end_frame",
                     MediaRole::Reference => "reference",
+                    MediaRole::VideoInput => "video_input",
+                    MediaRole::AudioInput => "audio_input",
                 },
                 "source": source,
             })
@@ -1195,6 +1302,18 @@ mod tests {
                     role: "reference".into(),
                     source: StoredMediaSource::RemoteUrl("https://example.test/ref.png".into()),
                 },
+                StoredDraftMedia {
+                    id: "video".into(),
+                    role: "video_input".into(),
+                    source: StoredMediaSource::RemoteUrl(
+                        "https://example.test/reference.mp4".into(),
+                    ),
+                },
+                StoredDraftMedia {
+                    id: "audio".into(),
+                    role: "audio_input".into(),
+                    source: StoredMediaSource::LocalFile(PathBuf::from("/tmp/reference.wav")),
+                },
             ],
         }
     }
@@ -1576,6 +1695,168 @@ mod tests {
         assert_ne!(
             generation_draft_fingerprint(&first).expect("original fingerprint"),
             generation_draft_fingerprint(&same).expect("distinct fingerprint")
+        );
+    }
+
+    #[test]
+    fn semantic_fingerprint_distinguishes_typed_reference_roles() {
+        let mut video =
+            GenerationDraft::new(ProviderId::fal(), "model", "prompt").expect("video draft");
+        video.media.push(
+            crate::domain::DraftMedia::remote(
+                "https://example.test/reference",
+                MediaRole::VideoInput,
+            )
+            .expect("video reference"),
+        );
+        let mut audio = video.clone();
+        audio.media[0].role = MediaRole::AudioInput;
+
+        assert_ne!(
+            generation_draft_fingerprint(&video).expect("video fingerprint"),
+            generation_draft_fingerprint(&audio).expect("audio fingerprint")
+        );
+    }
+
+    fn fingerprint_media(role: MediaRole, name: &str) -> DraftMedia {
+        DraftMedia::remote(format!("https://media.example/{name}"), role).expect("remote media")
+    }
+
+    #[test]
+    fn fal_typed_fingerprint_groups_destinations_and_preserves_same_kind_order() {
+        let mut first =
+            GenerationDraft::new(ProviderId::fal(), "model", "prompt").expect("fal draft");
+        first.media = vec![
+            fingerprint_media(MediaRole::VideoInput, "video-a.mp4"),
+            fingerprint_media(MediaRole::StartFrame, "start.png"),
+            fingerprint_media(MediaRole::AudioInput, "audio.wav"),
+            fingerprint_media(MediaRole::Reference, "image.png"),
+            fingerprint_media(MediaRole::VideoInput, "video-b.mp4"),
+        ];
+        let mut cross_destination_reorder = first.clone();
+        cross_destination_reorder.media = vec![
+            first.media[3].clone(),
+            first.media[0].clone(),
+            first.media[4].clone(),
+            first.media[2].clone(),
+            first.media[1].clone(),
+        ];
+        assert_eq!(
+            generation_draft_fingerprint(&first).expect("first fingerprint"),
+            generation_draft_fingerprint(&cross_destination_reorder)
+                .expect("cross-destination fingerprint")
+        );
+
+        let mut same_kind_reorder = cross_destination_reorder;
+        same_kind_reorder.media.swap(1, 2);
+        assert_ne!(
+            generation_draft_fingerprint(&first).expect("first fingerprint"),
+            generation_draft_fingerprint(&same_kind_reorder).expect("same-kind fingerprint")
+        );
+    }
+
+    #[test]
+    fn openrouter_typed_fingerprint_separates_frame_and_general_arrays_only() {
+        let mut first = GenerationDraft::new(ProviderId::openrouter(), "model", "prompt")
+            .expect("OpenRouter draft");
+        first.media = vec![
+            fingerprint_media(MediaRole::VideoInput, "video.mp4"),
+            fingerprint_media(MediaRole::StartFrame, "start.png"),
+            fingerprint_media(MediaRole::AudioInput, "audio.wav"),
+            fingerprint_media(MediaRole::EndFrame, "end.png"),
+            fingerprint_media(MediaRole::Reference, "image.png"),
+        ];
+        let mut partition_reorder = first.clone();
+        partition_reorder.media = vec![
+            first.media[1].clone(),
+            first.media[3].clone(),
+            first.media[0].clone(),
+            first.media[2].clone(),
+            first.media[4].clone(),
+        ];
+        assert_eq!(
+            generation_draft_fingerprint(&first).expect("first fingerprint"),
+            generation_draft_fingerprint(&partition_reorder).expect("partitioned fingerprint")
+        );
+
+        let mut general_reorder = partition_reorder.clone();
+        general_reorder.media.swap(2, 3);
+        assert_ne!(
+            generation_draft_fingerprint(&first).expect("first fingerprint"),
+            generation_draft_fingerprint(&general_reorder).expect("general-order fingerprint")
+        );
+
+        let mut frame_reorder = partition_reorder;
+        frame_reorder.media.swap(0, 1);
+        assert_ne!(
+            generation_draft_fingerprint(&first).expect("first fingerprint"),
+            generation_draft_fingerprint(&frame_reorder).expect("frame-order fingerprint")
+        );
+    }
+
+    #[test]
+    fn image_only_fingerprint_keeps_v04_global_order_as_primary() {
+        let mut legacy =
+            GenerationDraft::new(ProviderId::fal(), "model", "prompt").expect("legacy draft");
+        legacy.media = vec![
+            fingerprint_media(MediaRole::Reference, "image.png"),
+            fingerprint_media(MediaRole::StartFrame, "start.png"),
+        ];
+        let legacy_order = legacy.media.iter().collect::<Vec<_>>();
+        let exact_v04 = fingerprint_draft_with_media(&legacy, &legacy_order).expect("v0.4 digest");
+        assert_eq!(
+            exact_v04, "2d1e5b69f3910bce1d217f7549fb7c150707b7349f9ed8ca511d1af4196d6bd4",
+            "the persisted v0.4 safety digest must remain byte-for-byte stable"
+        );
+        assert_eq!(
+            generation_draft_fingerprint_candidates(&legacy).expect("fingerprints"),
+            vec![exact_v04]
+        );
+
+        let mut reordered = legacy.clone();
+        reordered.media.reverse();
+        assert_ne!(
+            generation_draft_fingerprint(&legacy).expect("legacy fingerprint"),
+            generation_draft_fingerprint(&reordered).expect("reordered fingerprint"),
+            "global order intentionally remains significant for v0.4-compatible drafts"
+        );
+    }
+
+    #[test]
+    fn atomic_uncertain_begin_blocks_a_legacy_fingerprint_alias() {
+        let (_directory, store) = store();
+        let mut draft =
+            GenerationDraft::new(ProviderId::fal(), "model", "prompt").expect("typed draft");
+        draft.media = vec![
+            fingerprint_media(MediaRole::VideoInput, "video.mp4"),
+            fingerprint_media(MediaRole::Reference, "image.png"),
+        ];
+        let candidates = generation_draft_fingerprint_candidates(&draft).expect("fingerprints");
+        assert_eq!(candidates.len(), 2, "fixture must have a legacy alias");
+
+        let legacy =
+            UncertainSubmissionRecord::new(ProviderId::fal(), candidates[1].clone(), Utc::now());
+        assert!(matches!(
+            store
+                .begin_uncertain_submission(&legacy)
+                .expect("save legacy hold"),
+            BeginUncertainSubmission::Inserted(_)
+        ));
+        let canonical = UncertainSubmissionRecord::new(
+            ProviderId::fal(),
+            candidates[0].clone(),
+            legacy.recorded_at + TimeDelta::seconds(1),
+        );
+        assert!(matches!(
+            store
+                .begin_uncertain_submission_with_aliases(&canonical, &candidates)
+                .expect("check aliases atomically"),
+            BeginUncertainSubmission::Existing(ref found) if found == &legacy
+        ));
+        assert_eq!(
+            store.uncertain_submissions().expect("saved holds"),
+            vec![legacy],
+            "the canonical row must not be inserted past an existing alias"
         );
     }
 

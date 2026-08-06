@@ -22,6 +22,11 @@
   <url type="homepage">https://github.com/EnchiladaBoy/video-harness-cli</url>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.5.0" date="2026-08-06">
+      <description>
+        <p>Adds typed image, video, and audio inputs with model-aware validation.</p>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-08-06">
       <description>
         <p>Completes the move to a focused native GTK application.</p>

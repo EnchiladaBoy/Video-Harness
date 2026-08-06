@@ -15,7 +15,7 @@ use video_harness::api::{
     ApiErrorKind, ClientOptions, HttpExecutor, HttpRequest, HttpResponse, OpenRouterClient,
     TransportError,
 };
-use video_harness::domain::VideoRequest;
+use video_harness::domain::{MediaKind, VideoRequest};
 
 const BASE_URL: &str = "https://api.fixture.invalid/api/v1";
 const FIXTURE_KEY: &str = "sk-test-placeholder";
@@ -109,6 +109,68 @@ fn fixture_json(name: &str) -> Value {
 
 fn has_authorization(request: &CapturedRequest) -> bool {
     request.headers.contains_key(AUTHORIZATION)
+}
+
+#[tokio::test]
+async fn typed_reference_models_are_enriched_from_the_public_general_catalog() {
+    let executor = ScriptedExecutor::with_replies([
+        Reply::Json(
+            StatusCode::OK,
+            json!({"data": [{
+                "id": "bytedance/seedance-2.0",
+                "name": "Seedance 2.0"
+            }]}),
+        ),
+        Reply::Json(
+            StatusCode::OK,
+            json!({"data": [{
+                "id": "bytedance/seedance-2.0",
+                "architecture": {
+                    "input_modalities": ["text", "image", "video", "audio"],
+                    "output_modalities": ["video"]
+                }
+            }]}),
+        ),
+    ]);
+    let catalog = client(executor.clone(), 0)
+        .list_video_models()
+        .await
+        .expect("enriched video catalog");
+    assert_eq!(
+        catalog.models[0].input_modalities,
+        Some(vec![MediaKind::Image, MediaKind::Video, MediaKind::Audio])
+    );
+    let requests = executor.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].url.path(), "/api/v1/videos/models");
+    assert_eq!(requests[1].url.path(), "/api/v1/models");
+    assert!(
+        requests[1]
+            .url
+            .query_pairs()
+            .any(|(key, value)| key == "output_modalities" && value == "video")
+    );
+    assert!(requests.iter().all(|request| !has_authorization(request)));
+}
+
+#[tokio::test]
+async fn failed_typed_capability_enrichment_leaves_modalities_unknown() {
+    let executor = ScriptedExecutor::with_replies([
+        Reply::Json(
+            StatusCode::OK,
+            json!({"data": [{"id": "bytedance/seedance-2.0"}]}),
+        ),
+        Reply::Json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": {"message": "fixture outage"}}),
+        ),
+    ]);
+    let catalog = client(executor.clone(), 0)
+        .list_video_models()
+        .await
+        .expect("base catalog remains usable");
+    assert_eq!(catalog.models[0].input_modalities, None);
+    assert_eq!(executor.requests().len(), 2);
 }
 
 #[tokio::test]
@@ -372,6 +434,41 @@ async fn cross_origin_download_redirect_strips_authorization() {
 }
 
 #[tokio::test]
+async fn download_redirect_to_a_non_public_host_stops_before_the_second_get() {
+    let mut redirect_headers = HeaderMap::new();
+    redirect_headers.insert(
+        LOCATION,
+        HeaderValue::from_static("https://127.0.0.1/private-video.mp4"),
+    );
+    let executor = ScriptedExecutor::with_replies([Reply::Bytes(
+        StatusCode::FOUND,
+        redirect_headers,
+        Vec::new(),
+    )]);
+    let client = client(executor.clone(), 0);
+    let directory = tempdir().expect("temporary directory");
+    let destination = directory.path().join("blocked-redirect.mp4");
+
+    let error = client
+        .download(
+            &client.content_url("job-fixture-1", 0).expect("content URL"),
+            &destination,
+            None,
+        )
+        .await
+        .expect_err("private redirect must fail");
+
+    assert_eq!(error.kind, ApiErrorKind::UnsafeUrl);
+    assert_eq!(executor.requests().len(), 1, "no private-host GET was sent");
+    assert!(!destination.exists());
+    assert!(
+        !destination
+            .with_file_name("blocked-redirect.mp4.part")
+            .exists()
+    );
+}
+
+#[tokio::test]
 async fn unsafe_or_existing_download_targets_are_rejected_before_transport() {
     let executor = ScriptedExecutor::with_replies([]);
     let client = client(executor.clone(), 0);
@@ -380,6 +477,8 @@ async fn unsafe_or_existing_download_targets_are_rejected_before_transport() {
         "http://cdn.fixture.invalid/video.mp4",
         "file:///tmp/video.mp4",
         "https://name:password@cdn.fixture.invalid/video.mp4",
+        "https://100.64.0.1/video.mp4",
+        "https://renderbox.local/video.mp4",
     ]
     .into_iter()
     .enumerate()

@@ -1,6 +1,6 @@
 //! Asynchronous, origin-safe OpenRouter video API client.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -26,16 +26,78 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use crate::config::partial_path;
-use crate::domain::{DomainError, VideoCatalog, VideoJob, VideoRequest};
+use crate::domain::{DomainError, VideoCatalog, VideoJob, VideoRequest, validate_public_https_url};
 
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_APP_TITLE: &str = "Video Harness";
 pub const MAX_REDIRECTS: usize = 5;
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 1024 * 1024;
+const OPENROUTER_TYPED_REFERENCE_MODELS: &[&str] =
+    &["bytedance/seedance-2.0", "bytedance/seedance-2.0-fast"];
 
 fn retryable_statuses() -> BTreeSet<u16> {
     [408, 425, 429, 500, 502, 503, 504].into_iter().collect()
+}
+
+fn catalog_needs_input_modality_enrichment(payload: &Value) -> bool {
+    payload
+        .get("data")
+        .and_then(Value::as_array)
+        .is_some_and(|models| {
+            models.iter().any(|model| {
+                model
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_typed_reference_model)
+            })
+        })
+}
+
+fn is_typed_reference_model(model_id: &str) -> bool {
+    OPENROUTER_TYPED_REFERENCE_MODELS.contains(&model_id)
+}
+
+fn enrich_video_model_input_modalities(video_catalog: &mut Value, model_catalog: &Value) {
+    let advertised = model_catalog
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model.get("id")?.as_str()?;
+            if !is_typed_reference_model(id) {
+                return None;
+            }
+            let modalities = model
+                .get("architecture")
+                .and_then(|architecture| architecture.get("input_modalities"))
+                .or_else(|| model.get("input_modalities"))
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|modality| matches!(*modality, "image" | "video" | "audio"))
+                .map(|modality| Value::String(modality.to_owned()))
+                .collect::<Vec<_>>();
+            Some((id.to_owned(), modalities))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let Some(models) = video_catalog.get_mut("data").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for model in models {
+        let Some(object) = model.as_object_mut() else {
+            continue;
+        };
+        let Some(id) = object.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(modalities) = advertised.get(id) else {
+            continue;
+        };
+        object.insert("input_modalities".into(), Value::Array(modalities.clone()));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,7 +475,7 @@ impl OpenRouterClient {
 
     pub async fn list_video_models(&self) -> Result<VideoCatalog, ApiError> {
         // Catalog metadata is public, so no credential is attached.
-        let payload = self
+        let mut payload = self
             .request_json(
                 Method::GET,
                 self.api_url("videos/models")?,
@@ -422,6 +484,24 @@ impl OpenRouterClient {
                 None,
             )
             .await?;
+        // The dedicated generation catalog does not currently expose input
+        // modalities. Enrich only models whose video endpoint is documented
+        // to accept typed media, using the public general model catalog. A
+        // failed enrichment deliberately leaves those capabilities unknown;
+        // callers can still use text/image generation but must fail closed for
+        // video and audio references.
+        if catalog_needs_input_modality_enrichment(&payload) {
+            let mut models_url = self.api_url("models")?;
+            models_url
+                .query_pairs_mut()
+                .append_pair("output_modalities", "video");
+            if let Ok(modality_catalog) = self
+                .request_json(Method::GET, models_url, false, true, None)
+                .await
+            {
+                enrich_video_model_input_modalities(&mut payload, &modality_catalog);
+            }
+        }
         VideoCatalog::from_api(&payload).map_err(|_| {
             ApiError::simple(
                 ApiErrorKind::ResponseFormat,
@@ -1102,19 +1182,12 @@ fn validate_base_url(url: &Url) -> Result<(), ApiError> {
 }
 
 fn validate_download_url(url: &Url) -> Result<(), ApiError> {
-    if url.scheme() != "https" || url.host_str().is_none() {
-        return Err(ApiError::simple(
+    validate_public_https_url(url.as_str(), "Video download").map_err(|_| {
+        ApiError::simple(
             ApiErrorKind::UnsafeUrl,
-            "Video downloads must use HTTPS",
-        ));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(ApiError::simple(
-            ApiErrorKind::UnsafeUrl,
-            "Video download URL must not contain embedded credentials",
-        ));
-    }
-    Ok(())
+            "Video download URL must use public HTTPS without embedded credentials",
+        )
+    })
 }
 
 fn origin(url: &Url) -> Option<(String, String, u16)> {

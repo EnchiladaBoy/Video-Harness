@@ -1,6 +1,6 @@
 # Video Harness native workspace
 
-This directory contains the Rust backend and GTK4/libadwaita application for Video Harness v0.4.0. See the [project README](../README.md) for product behavior and installation.
+This directory contains the Rust backend and GTK4/libadwaita application for Video Harness v0.5.0. See the [project README](../README.md) for product behavior and installation.
 
 ## Fedora prerequisites
 

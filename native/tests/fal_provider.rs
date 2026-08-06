@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{TimeDelta, Utc};
-use reqwest::header::{AUTHORIZATION, HeaderMap};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, LOCATION};
 use reqwest::{Method, StatusCode};
 use secrecy::SecretString;
 use serde_json::{Value, json};
@@ -36,6 +36,7 @@ struct CapturedRequest {
 enum Reply {
     Json(StatusCode, Value),
     DelayedJson(Duration, StatusCode, Value),
+    Redirect(String),
     Bytes(Vec<u8>),
     InterruptedBody,
 }
@@ -91,6 +92,19 @@ impl HttpExecutor for ScriptedExecutor {
                 tokio::time::sleep(delay).await;
                 HttpResponse::from_json(status, request.url, &value).map_err(|_| TransportError)
             }
+            Some(Reply::Redirect(location)) => {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    LOCATION,
+                    HeaderValue::from_str(&location).map_err(|_| TransportError)?,
+                );
+                Ok(HttpResponse::from_bytes(
+                    StatusCode::FOUND,
+                    request.url,
+                    headers,
+                    Bytes::new(),
+                ))
+            }
             Some(Reply::Bytes(body)) => {
                 if let Some((path, contents)) = self
                     .create_during_download
@@ -130,11 +144,19 @@ struct CapturedUpload {
 #[derive(Default)]
 struct ScriptedUploadExecutor {
     uploads: Mutex<Vec<CapturedUpload>>,
+    replace_during_upload: Mutex<Option<Vec<u8>>>,
 }
 
 impl ScriptedUploadExecutor {
     fn uploads(&self) -> Vec<CapturedUpload> {
         self.uploads.lock().expect("upload lock").clone()
+    }
+
+    fn replace_file_during_upload(&self, contents: &[u8]) {
+        *self
+            .replace_during_upload
+            .lock()
+            .expect("upload mutation lock") = Some(contents.to_vec());
     }
 }
 
@@ -159,6 +181,14 @@ impl FalUploadExecutor for ScriptedUploadExecutor {
                 size_bytes,
                 multipart,
             });
+        if let Some(contents) = self
+            .replace_during_upload
+            .lock()
+            .expect("upload mutation lock")
+            .take()
+        {
+            fs::write(path, contents).expect("replace fixture during upload");
+        }
         if let Some(progress) = progress {
             let _ = progress.send(UploadProgress {
                 sent: size_bytes,
@@ -292,11 +322,19 @@ fn expanded_string_duration_model() -> Value {
     model
 }
 
-fn catalog_replies() -> [Reply; 3] {
+fn catalog_replies() -> [Reply; 5] {
     [
         Reply::Json(
             StatusCode::OK,
             json!({"models": [discovery_model()], "next_cursor": null, "has_more": false}),
+        ),
+        Reply::Json(
+            StatusCode::OK,
+            json!({"models": [], "next_cursor": null, "has_more": false}),
+        ),
+        Reply::Json(
+            StatusCode::OK,
+            json!({"models": [], "next_cursor": null, "has_more": false}),
         ),
         Reply::Json(
             StatusCode::OK,
@@ -409,11 +447,11 @@ async fn catalog_queue_pricing_and_download_use_the_correct_auth_scope() {
     );
 
     let requests = executor.requests();
-    assert_eq!(requests.len(), 8);
-    assert!(requests[..3].iter().all(|request| !request.authorized));
-    assert!(requests[3..7].iter().all(|request| request.authorized));
-    assert!(!requests[7].authorized);
-    assert_eq!(requests[4].method, Method::POST);
+    assert_eq!(requests.len(), 10);
+    assert!(requests[..5].iter().all(|request| !request.authorized));
+    assert!(requests[5..9].iter().all(|request| request.authorized));
+    assert!(!requests[9].authorized);
+    assert_eq!(requests[6].method, Method::POST);
     assert_eq!(
         requests
             .iter()
@@ -421,13 +459,13 @@ async fn catalog_queue_pricing_and_download_use_the_correct_auth_scope() {
             .count(),
         1
     );
-    let body = requests[4].body.as_ref().expect("paid POST body");
+    let body = requests[6].body.as_ref().expect("paid POST body");
     assert_eq!(body["prompt"], "A harmless offline fixture");
     assert_eq!(body["duration"], 4);
     assert_eq!(body["custom_strength"], 0.75);
-    assert_eq!(requests[7].url.host_str(), Some("cdn.fal.media"));
+    assert_eq!(requests[9].url.host_str(), Some("cdn.fal.media"));
     assert_eq!(
-        requests[6].url.path(),
+        requests[8].url.path(),
         "/fal-ai/fixture/text-to-video/requests/request-fixture/response"
     );
 }
@@ -457,7 +495,7 @@ async fn interrupted_paid_response_is_uncertain_and_never_retried() {
             .count(),
         1
     );
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 6);
 }
 
 #[tokio::test]
@@ -538,7 +576,7 @@ async fn paid_5xx_is_uncertain_and_never_retried_even_with_retries_configured() 
             .count(),
         1
     );
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 6);
 }
 
 #[tokio::test]
@@ -755,7 +793,7 @@ async fn malformed_accepted_job_is_uncertain_and_not_retried() {
         .expect_err("missing accepted id must be uncertain");
     assert_eq!(error.kind, ProviderErrorKind::SubmissionUncertain);
     let requests = executor.requests();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 6);
     assert_eq!(
         requests
             .iter()
@@ -876,6 +914,38 @@ async fn anonymous_download_does_not_overwrite_a_racing_destination() {
 }
 
 #[tokio::test]
+async fn anonymous_download_rejects_non_public_redirects_before_a_second_get() {
+    for location in [
+        "https://127.0.0.1/private.mp4",
+        "https://100.64.0.1/private.mp4",
+        "https://240.0.0.1/private.mp4",
+        "https://[4000::1]/private.mp4",
+    ] {
+        let executor = ScriptedExecutor::with_replies([Reply::Redirect(location.into())]);
+        let provider = provider(executor.clone());
+        let directory = tempdir().expect("temporary output");
+        let destination = directory.path().join("redirect.mp4");
+        let artifact = video_harness::domain::VideoArtifact::new(
+            "https://cdn.fal.media/public-artifact.mp4",
+            0,
+        )
+        .expect("public artifact");
+
+        let error = provider
+            .download(&artifact, &destination, None)
+            .await
+            .expect_err("non-public redirect must fail closed");
+
+        assert_eq!(error.kind, ProviderErrorKind::UnsafeEndpoint);
+        let requests = executor.requests();
+        assert_eq!(requests.len(), 1, "followed unsafe redirect {location}");
+        assert_eq!(requests[0].url.host_str(), Some("cdn.fal.media"));
+        assert!(!destination.exists());
+        assert!(!directory.path().join("redirect.mp4.part").exists());
+    }
+}
+
+#[tokio::test]
 async fn failed_or_empty_download_cleans_up_the_partial_file() {
     let artifact =
         video_harness::domain::VideoArtifact::new("https://cdn.fal.media/incomplete.mp4", 0)
@@ -982,6 +1052,103 @@ async fn local_media_uses_documented_cdn_initiation_and_reuses_valid_receipt() {
         1,
         "cache reuse must not upload"
     );
+}
+
+#[tokio::test]
+async fn changed_local_media_is_rejected_after_upload_without_a_receipt() {
+    let directory = tempdir().expect("temporary media");
+    let media_path = directory.path().join("changing.png");
+    fs::write(&media_path, PNG_FIXTURE).expect("fixture media");
+    let executor = ScriptedExecutor::with_replies([Reply::Json(
+        StatusCode::OK,
+        json!({
+            "file_url": "https://v3.fal.media/files/fixture/changing.png",
+            "upload_url": "https://uploads.example/signed/changing?signature=placeholder"
+        }),
+    )]);
+    let upload_executor = Arc::new(ScriptedUploadExecutor::default());
+    upload_executor.replace_file_during_upload(b"different bytes and size");
+    let provider = provider_with_upload(executor, upload_executor.clone());
+
+    let error = provider
+        .stage_media(
+            &DraftMedia::local(&media_path, MediaRole::Reference),
+            None,
+            None,
+        )
+        .await
+        .expect_err("changed input must invalidate the upload");
+    assert_eq!(error.kind, ProviderErrorKind::Validation);
+    assert!(error.message.contains("changed while fal was preparing"));
+    assert_eq!(upload_executor.uploads().len(), 1);
+}
+
+#[test]
+fn seedance_local_byte_limits_are_checked_before_upload() {
+    let directory = tempdir().expect("temporary media");
+    let audio_path = directory.path().join("oversized.mp3");
+    fs::write(&audio_path, b"ID3fixture").expect("audio fixture");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&audio_path)
+        .expect("open audio fixture")
+        .set_len(15_000_001)
+        .expect("size sparse audio");
+    let mut draft = GenerationDraft::new(
+        ProviderId::fal(),
+        "bytedance/seedance-2.0/reference-to-video",
+        "A local size fixture",
+    )
+    .expect("draft");
+    draft
+        .media
+        .push(DraftMedia::local(audio_path, MediaRole::AudioInput));
+    let provider = provider(ScriptedExecutor::with_replies([]));
+    let error = provider
+        .validate_draft_media_constraints(&draft)
+        .expect_err("oversized Seedance audio must fail before upload");
+    assert_eq!(error.kind, ProviderErrorKind::Validation);
+    assert!(error.message.contains("15 MB"));
+
+    let image_path = directory.path().join("oversized.png");
+    fs::write(&image_path, b"\x89PNG\r\n\x1a\nfixture").expect("image fixture");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&image_path)
+        .expect("open image fixture")
+        .set_len(30_000_001)
+        .expect("extend image fixture");
+    let mut image_draft = GenerationDraft::new(
+        ProviderId::fal(),
+        "bytedance/seedance-2.0/reference-to-video",
+        "Animate it",
+    )
+    .expect("image draft");
+    image_draft
+        .media
+        .push(DraftMedia::local(image_path, MediaRole::Reference));
+    let error = provider
+        .validate_draft_media_constraints(&image_draft)
+        .expect_err("oversized Seedance image must fail before upload");
+    assert_eq!(error.kind, ProviderErrorKind::Validation);
+    assert!(error.message.contains("30 MB"));
+
+    let gif_path = directory.path().join("reference.gif");
+    fs::write(&gif_path, b"GIF89a").expect("GIF fixture");
+    let mut gif_draft = GenerationDraft::new(
+        ProviderId::fal(),
+        "bytedance/seedance-2.0/reference-to-video",
+        "Animate it",
+    )
+    .expect("GIF draft");
+    gif_draft
+        .media
+        .push(DraftMedia::local(gif_path, MediaRole::Reference));
+    let error = provider
+        .validate_draft_media_constraints(&gif_draft)
+        .expect_err("unsupported Seedance image format must fail before upload");
+    assert_eq!(error.kind, ProviderErrorKind::Validation);
+    assert!(error.message.contains("JPEG, PNG, or WebP"));
 }
 
 #[tokio::test]

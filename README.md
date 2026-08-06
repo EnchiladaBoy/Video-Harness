@@ -1,20 +1,20 @@
 # Video Harness
 
-Video Harness is a native Linux application for generating AI video across providers. It gives prompts, reference frames, model controls, price review, job monitoring, downloads, and playback a proper graphical home instead of making you assemble API requests by hand.
+Video Harness is a native Linux application for generating AI video across providers. It gives prompts, typed reference media, model controls, price review, job monitoring, downloads, and playback a proper graphical home instead of making you assemble API requests by hand.
 
-The v0.4.0 release supports OpenRouter and fal.ai. Finished videos are saved to your XDG Videos directory, normally `~/Videos`.
+The v0.5.0 release supports OpenRouter and fal.ai. Finished videos are saved to your XDG Videos directory, normally `~/Videos`.
 
 ## What it does
 
 - Builds a generation visually with a prompt, model options, and ordered reference media.
-- Accepts local image files through a picker or drag and drop, as well as public HTTPS URLs.
+- Accepts image, MP4/MOV video, and MP3/WAV audio inputs. fal.ai can stage local files selected through the picker or drag and drop; both providers accept public HTTPS URLs where the selected model supports them.
 - Checks each model/provider combination before Review instead of silently dropping unsupported inputs.
 - Shows a fresh quote and a complete request summary before enabling the single paid **Generate** action.
 - Monitors multiple accepted remote jobs independently, with honest provider states and a small waiting animation.
 - Downloads atomically to `~/Videos`, plays completed work in the app, and can open it in the system player.
 - Autosaves draft text, options, and source paths locally. It never copies draft media or writes API keys into settings/history.
 
-Local reference files are uploaded only when you choose **Review**. fal.ai inputs are staged on fal's public CDN with a 24-hour expiry preference and reusable receipts are cached until expiry. OpenRouter currently documents video references as stable public HTTPS URLs, so Video Harness clearly blocks local files for OpenRouter rather than uploading them somewhere you did not choose.
+Local reference files are uploaded only when you choose **Review**. fal.ai inputs are staged on fal's public CDN with a 24-hour expiry preference and reusable receipts are cached until expiry. OpenRouter reference media must use public HTTPS URLs, so Video Harness clearly blocks local files for OpenRouter rather than uploading them somewhere you did not choose. Video and audio inputs fail closed unless the current model catalog explicitly advertises that capability.
 
 ## Install on Fedora
 
@@ -37,7 +37,7 @@ Launch **Video Harness** from GNOME's app grid or run:
 video-harness
 ```
 
-The immutable release lives under `~/.local/lib/openrouter-video-studio/releases/0.4.0/`. The legacy internal directory name is intentional: it preserves existing credentials, catalog caches, settings, and `history.sqlite3`. GUI draft and upload state is isolated in `gui-state.sqlite3`.
+The immutable release lives under `~/.local/lib/openrouter-video-studio/releases/0.5.0/`. The legacy internal directory name is intentional: it preserves existing credentials, catalog caches, settings, and `history.sqlite3`. GUI draft and upload state is isolated in `gui-state.sqlite3`.
 
 ## First generation
 

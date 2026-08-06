@@ -4,16 +4,23 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use url::Url;
 
 use crate::api::{ApiError, ApiErrorKind, DownloadProgress, OpenRouterClient};
 use crate::domain::{
-    CostQuote, JobLocator, ProviderDescriptor, ProviderId, VideoArtifact, VideoCatalog, VideoJob,
-    VideoModel, VideoRequest, estimate_cost,
+    CostQuote, InputReferenceKind, JobLocator, ProviderDescriptor, ProviderId, QuoteConfidence,
+    VideoArtifact, VideoCatalog, VideoJob, VideoModel, VideoRequest, estimate_cost,
 };
 
 use super::{MediaCapabilities, ProviderAccount, ProviderError, ProviderErrorKind, VideoProvider};
+
+const TYPED_REFERENCE_MODELS: &[&str] = &["bytedance/seedance-2.0", "bytedance/seedance-2.0-fast"];
+const MAX_REFERENCE_IMAGES: usize = 9;
+const MAX_REFERENCE_VIDEOS: usize = 3;
+const MAX_REFERENCE_AUDIO: usize = 3;
+const MAX_REFERENCES_TOTAL: usize = 12;
 
 #[derive(Debug)]
 pub struct OpenRouterProvider {
@@ -87,11 +94,19 @@ impl VideoProvider for OpenRouterProvider {
 
     async fn quote(&self, request: &VideoRequest) -> Result<CostQuote, ProviderError> {
         let model = self.validated_model(request).await?;
-        Ok(estimate_cost(&model, request))
+        let mut quote = estimate_cost(&model, request);
+        if request_has_variable_cost_inputs(request) && quote.amount.is_some() {
+            quote.exact = false;
+            quote.confidence = QuoteConfidence::Estimated;
+            quote.basis.push_str(
+                "; input media or provider-specific options can affect final usage, so the final charge is authoritative",
+            );
+        }
+        Ok(quote)
     }
 
     async fn submit(&self, request: &VideoRequest) -> Result<VideoJob, ProviderError> {
-        ensure_provider(request)?;
+        self.validate_submission_request(request).await?;
         let job = self.client.submit(request).await.map_err(map_error)?;
         self.with_artifact(job)
     }
@@ -101,13 +116,16 @@ impl VideoProvider for OpenRouterProvider {
         request: &VideoRequest,
         submit_before: Option<DateTime<Utc>>,
     ) -> Result<VideoJob, ProviderError> {
-        ensure_provider(request)?;
         if submit_before.is_some_and(|deadline| Utc::now() >= deadline) {
-            return Err(ProviderError::new(
-                ProviderId::openrouter(),
-                ProviderErrorKind::Validation,
-                "Review or staged input media expired before submission; Review again before generating",
-            ));
+            return Err(expired_review());
+        }
+        // A prepared request can enter through the public direct-generate
+        // command as well as Review. Revalidate media-bearing requests before
+        // the paid POST, then recheck the Review deadline after safe catalog
+        // work. Text-only direct requests retain the legacy lightweight path.
+        self.validate_submission_request(request).await?;
+        if submit_before.is_some_and(|deadline| Utc::now() >= deadline) {
+            return Err(expired_review());
         }
         let job = self.client.submit(request).await.map_err(map_error)?;
         self.with_artifact(job)
@@ -146,6 +164,24 @@ impl VideoProvider for OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
+    async fn validate_submission_request(
+        &self,
+        request: &VideoRequest,
+    ) -> Result<(), ProviderError> {
+        ensure_provider(request)?;
+        request.validate().map_err(|error| {
+            ProviderError::new(
+                ProviderId::openrouter(),
+                ProviderErrorKind::Validation,
+                error.to_string(),
+            )
+        })?;
+        if request.frame_images.is_empty() && request.input_references.is_empty() {
+            return Ok(());
+        }
+        self.validated_model(request).await.map(|_| ())
+    }
+
     async fn ensure_model(&self, model_id: &str) -> Result<VideoModel, ProviderError> {
         if let Some(model) = self
             .models
@@ -188,6 +224,7 @@ impl OpenRouterProvider {
                 ),
             ));
         }
+        validate_reference_policy(&model.id, request)?;
         Ok(model)
     }
 
@@ -205,6 +242,85 @@ impl OpenRouterProvider {
         }
         Ok(job)
     }
+}
+
+fn validate_reference_policy(model_id: &str, request: &VideoRequest) -> Result<(), ProviderError> {
+    if !request.frame_images.is_empty() && !request.input_references.is_empty() {
+        return Err(validation(
+            "OpenRouter frame_images cannot be combined with general input references because the frame inputs take precedence",
+        ));
+    }
+    let images = request
+        .input_references
+        .iter()
+        .filter(|reference| reference.kind == InputReferenceKind::Image)
+        .count();
+    let videos = request
+        .input_references
+        .iter()
+        .filter(|reference| reference.kind == InputReferenceKind::Video)
+        .count();
+    let audio = request
+        .input_references
+        .iter()
+        .filter(|reference| reference.kind == InputReferenceKind::Audio)
+        .count();
+    if videos + audio > 0 && !TYPED_REFERENCE_MODELS.contains(&model_id) {
+        return Err(validation(format!(
+            "OpenRouter model {} is not currently verified for video or audio references",
+            model_id
+        )));
+    }
+    if images > MAX_REFERENCE_IMAGES {
+        return Err(validation(format!(
+            "OpenRouter accepts at most {MAX_REFERENCE_IMAGES} reference images"
+        )));
+    }
+    if videos > MAX_REFERENCE_VIDEOS {
+        return Err(validation(format!(
+            "OpenRouter accepts at most {MAX_REFERENCE_VIDEOS} reference videos"
+        )));
+    }
+    if audio > MAX_REFERENCE_AUDIO {
+        return Err(validation(format!(
+            "OpenRouter accepts at most {MAX_REFERENCE_AUDIO} reference audio files"
+        )));
+    }
+    if images + videos + audio > MAX_REFERENCES_TOTAL {
+        return Err(validation(format!(
+            "OpenRouter accepts at most {MAX_REFERENCES_TOTAL} reference media items"
+        )));
+    }
+    if audio > 0 && images + videos == 0 {
+        return Err(validation(
+            "OpenRouter audio references require at least one image or video reference",
+        ));
+    }
+    Ok(())
+}
+
+fn request_has_variable_cost_inputs(request: &VideoRequest) -> bool {
+    !request.frame_images.is_empty()
+        || !request.input_references.is_empty()
+        || request
+            .adapter_options
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_some_and(|options| !options.is_empty())
+}
+
+fn validation(message: impl Into<String>) -> ProviderError {
+    ProviderError::new(
+        ProviderId::openrouter(),
+        ProviderErrorKind::Validation,
+        message,
+    )
+}
+
+fn expired_review() -> ProviderError {
+    validation(
+        "Review or staged input media expired before submission; Review again before generating",
+    )
 }
 
 fn ensure_provider(request: &VideoRequest) -> Result<(), ProviderError> {
@@ -243,5 +359,85 @@ fn map_error(error: ApiError) -> ProviderError {
         code: error.code,
         details: error.details,
         retry_after: error.retry_after,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::domain::{FrameImage, FrameType, InputReference};
+
+    fn seedance_model() -> VideoModel {
+        VideoModel::from_api(&json!({
+            "id": "bytedance/seedance-2.0",
+            "input_modalities": ["image", "video", "audio"]
+        }))
+        .expect("Seedance fixture model")
+    }
+
+    #[test]
+    fn typed_reference_policy_enforces_companions_and_precedence() {
+        let model = seedance_model();
+        let mut audio_only = VideoRequest::new(&model.id, "fixture prompt").expect("request");
+        audio_only.input_references.push(
+            InputReference::with_kind("https://media.example/audio.mp3", InputReferenceKind::Audio)
+                .expect("audio reference"),
+        );
+        assert!(validate_reference_policy(&model.id, &audio_only).is_err());
+
+        audio_only.input_references.push(
+            InputReference::with_kind("https://media.example/video.mp4", InputReferenceKind::Video)
+                .expect("video reference"),
+        );
+        validate_reference_policy(&model.id, &audio_only).expect("mixed references");
+
+        audio_only.frame_images.push(
+            FrameImage::new("https://media.example/frame.png", FrameType::FirstFrame)
+                .expect("frame"),
+        );
+        assert!(validate_reference_policy(&model.id, &audio_only).is_err());
+    }
+
+    #[test]
+    fn typed_reference_policy_rejects_unverified_models_and_limits() {
+        let unverified = VideoModel::from_api(&json!({
+            "id": "example/future-video-model",
+            "input_modalities": ["video"]
+        }))
+        .expect("unverified fixture model");
+        let mut request = VideoRequest::new(&unverified.id, "fixture prompt").expect("request");
+        request.input_references.push(
+            InputReference::with_kind("https://media.example/video.mp4", InputReferenceKind::Video)
+                .expect("video reference"),
+        );
+        assert!(validate_reference_policy(&unverified.id, &request).is_err());
+
+        let verified = seedance_model();
+        request.model = verified.id.clone();
+        for index in 1..=MAX_REFERENCE_VIDEOS {
+            request.input_references.push(
+                InputReference::with_kind(
+                    format!("https://media.example/video-{index}.mp4"),
+                    InputReferenceKind::Video,
+                )
+                .expect("video reference"),
+            );
+        }
+        assert!(validate_reference_policy(&verified.id, &request).is_err());
+    }
+
+    #[test]
+    fn provider_options_make_price_confidence_conservative() {
+        let mut request = VideoRequest::new("example/video", "fixture prompt").expect("request");
+        assert!(!request_has_variable_cost_inputs(&request));
+        request.adapter_options = Some(json!({
+            "options": {"byteplus": {"parameters": {"quality": "high"}}}
+        }));
+        assert!(request_has_variable_cost_inputs(&request));
+
+        request.adapter_options = Some(json!({}));
+        assert!(!request_has_variable_cost_inputs(&request));
     }
 }

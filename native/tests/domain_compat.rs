@@ -133,6 +133,23 @@ fn model_reports_every_incompatible_setting() {
 }
 
 #[test]
+fn frame_inputs_require_an_explicit_catalog_capability() {
+    let model =
+        VideoModel::from_api(&json!({"id": "example/unknown-frames"})).expect("parse model");
+    let mut request = VideoRequest::new(&model.id, "test").expect("request");
+    request.frame_images.push(
+        FrameImage::new("https://images.example/first.png", FrameType::FirstFrame).expect("frame"),
+    );
+
+    assert!(
+        model
+            .supports_request(&request)
+            .iter()
+            .any(|problem| problem.contains("first_frame is not supported"))
+    );
+}
+
+#[test]
 fn cost_estimates_only_known_units_and_never_guess_token_pricing() {
     let catalog = VideoCatalog::from_api(&fixture("catalog.json")).expect("catalog");
     let flux = catalog

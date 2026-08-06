@@ -13,10 +13,12 @@ use tokio::sync::mpsc;
 
 use crate::config::AppPaths;
 use crate::domain::{
-    CostQuote, DraftMedia, GenerationDraft, MediaRole, MediaSource, ProviderId, ProviderJobKey,
-    VideoCatalog, VideoModel,
+    CostQuote, DraftMedia, GenerationDraft, MediaCardinality, MediaKind, MediaRole, MediaSource,
+    ProviderId, ProviderJobKey, VideoCatalog, VideoModel,
 };
-use crate::gui_state::{DraftEditorState, UncertainSubmissionRecord, generation_draft_fingerprint};
+use crate::gui_state::{
+    DraftEditorState, UncertainSubmissionRecord, generation_draft_fingerprint_candidates,
+};
 use crate::history::JobRecord;
 use crate::workflow::{
     PreparedGenerationId, ProviderConnection, RecoveryStore, ServiceCommand, ServiceConfig,
@@ -196,7 +198,13 @@ struct HarnessWindow {
     media: RefCell<Vec<MediaItem>>,
     media_list: gtk::ListBox,
     media_empty: gtk::Label,
+    add_files: gtk::Button,
+    add_url: gtk::Button,
+    drop_zone: gtk::Box,
+    drop_title: gtk::Label,
+    drop_hint: gtk::Label,
     remote_url: gtk::Entry,
+    remote_kind: gtk::DropDown,
     remote_role: gtk::DropDown,
     compatibility: gtk::Label,
     review: gtk::Button,
@@ -292,7 +300,13 @@ impl HarnessWindow {
             media: RefCell::new(Vec::new()),
             media_list: compose.media_list,
             media_empty: compose.media_empty,
+            add_files: compose.add_files,
+            add_url: compose.add_url,
+            drop_zone: compose.drop_zone,
+            drop_title: compose.drop_title,
+            drop_hint: compose.drop_hint,
             remote_url: compose.remote_url,
+            remote_kind: compose.remote_kind,
             remote_role: compose.remote_role,
             compatibility: compose.compatibility,
             review: compose.review,
@@ -305,13 +319,8 @@ impl HarnessWindow {
             provider_widgets: providers.providers,
             default_provider: providers.default_provider,
         });
-        this.connect(
-            compose.add_files,
-            compose.add_url,
-            compose.drop_zone,
-            jobs.resume_all,
-            jobs.pause_all,
-        );
+        this.connect(jobs.resume_all, jobs.pause_all);
+        this.update_media_input_availability();
         this.start_event_pump();
         this.start_animation();
         this
@@ -361,14 +370,7 @@ impl HarnessWindow {
         self.toast_overlay.add_toast(toast);
     }
 
-    fn connect(
-        self: &Rc<Self>,
-        add_files: gtk::Button,
-        add_url: gtk::Button,
-        drop_zone: gtk::Box,
-        resume_all: gtk::Button,
-        pause_all: gtk::Button,
-    ) {
+    fn connect(self: &Rc<Self>, resume_all: gtk::Button, pause_all: gtk::Button) {
         let weak = Self::weak(self);
         self.prompt.buffer().connect_changed(move |_| {
             if let Some(this) = weak.upgrade() {
@@ -383,6 +385,8 @@ impl HarnessWindow {
                     return;
                 }
                 this.refresh_models();
+                this.update_media_input_availability();
+                this.rebuild_media();
                 this.draft_changed();
             }
         });
@@ -430,13 +434,13 @@ impl HarnessWindow {
         });
 
         let weak = Self::weak(self);
-        add_files.connect_clicked(move |_| {
+        self.add_files.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
                 this.choose_files();
             }
         });
         let weak = Self::weak(self);
-        add_url.connect_clicked(move |_| {
+        self.add_url.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
                 this.add_from_entry();
             }
@@ -445,6 +449,12 @@ impl HarnessWindow {
         self.remote_url.connect_activate(move |_| {
             if let Some(this) = weak.upgrade() {
                 this.add_from_entry();
+            }
+        });
+        let weak = Self::weak(self);
+        self.remote_kind.connect_selected_notify(move |dropdown| {
+            if let Some(this) = weak.upgrade() {
+                this.configure_remote_role(remote_kind_for_index(dropdown.selected()));
             }
         });
 
@@ -457,17 +467,24 @@ impl HarnessWindow {
             let Some(this) = weak.upgrade() else {
                 return false;
             };
+            if this.selected_provider() == ProviderId::openrouter() {
+                this.toast(
+                    "OpenRouter accepts reference media by public HTTPS URL only.",
+                    "dialog-warning-symbolic",
+                );
+                return false;
+            }
             let mut added = 0usize;
             let mut rejected = 0usize;
             for file in files.files() {
                 if let Some(path) = file.path() {
-                    if !is_supported_reference_image(&path) {
+                    let Some(kind) = classify_local_reference(&path) else {
                         rejected += 1;
                         continue;
-                    }
+                    };
                     this.media.borrow_mut().push(MediaItem {
                         source: MediaSource::local(path),
-                        role: MediaRole::Reference,
+                        role: default_role_for_kind(kind),
                     });
                     added += 1;
                 }
@@ -477,7 +494,7 @@ impl HarnessWindow {
                 this.draft_changed();
                 if rejected > 0 {
                     this.toast(
-                        &format!("Skipped {rejected} non-image file(s). References must be images."),
+                        &format!("Skipped {rejected} unsupported file(s)."),
                         "dialog-warning-symbolic",
                     );
                 }
@@ -485,14 +502,14 @@ impl HarnessWindow {
             } else {
                 if rejected > 0 {
                     this.toast(
-                        "Reference inputs must be image files (PNG, JPEG, WebP, GIF, AVIF, BMP, or TIFF).",
+                        "Reference media must be an image, MP4/MOV video, or MP3/WAV audio file.",
                         "dialog-warning-symbolic",
                     );
                 }
                 false
             }
         });
-        drop_zone.add_controller(drop_target);
+        self.drop_zone.add_controller(drop_target);
 
         let weak = Self::weak(self);
         self.review.connect_clicked(move |_| {
@@ -646,11 +663,13 @@ impl HarnessWindow {
 
     fn current_uncertain_submission(&self) -> Option<UncertainSubmissionRecord> {
         let draft = self.build_draft(true).ok()?;
-        let fingerprint = generation_draft_fingerprint(&draft).ok()?;
-        self.uncertain_submissions
-            .borrow()
-            .get(&(draft.provider_id, fingerprint))
-            .cloned()
+        let fingerprints = generation_draft_fingerprint_candidates(&draft).ok()?;
+        let records = self.uncertain_submissions.borrow();
+        fingerprints.into_iter().find_map(|fingerprint| {
+            records
+                .get(&(draft.provider_id.clone(), fingerprint))
+                .cloned()
+        })
     }
 
     fn review_or_resolve(self: &Rc<Self>) {
@@ -756,7 +775,7 @@ impl HarnessWindow {
                     .any(|media| matches!(media.source, MediaSource::LocalFile { .. }))
             {
                 return Err(
-                    "OpenRouter video references must be public HTTPS URLs. Switch to fal.ai to upload local reference images."
+                    "OpenRouter reference media must use public HTTPS URLs. Local rows are kept in your draft, but cannot be reviewed with OpenRouter; switch to fal.ai or replace them with URLs."
                         .into(),
                 );
             }
@@ -769,14 +788,93 @@ impl HarnessWindow {
         let Some(model) = self.selected_model() else {
             return Err("The selected model is not in the provider catalog".into());
         };
+        let has_video_or_audio = draft
+            .media
+            .iter()
+            .any(|media| media.role.kind() != MediaKind::Image);
+        if has_video_or_audio
+            && self
+                .catalogs
+                .borrow()
+                .get(&draft.provider_id)
+                .is_some_and(|catalog| catalog.stale)
+        {
+            return Err(
+                "Refresh this provider's model catalog before reviewing video or audio references. Cached capabilities may be out of date."
+                    .into(),
+            );
+        }
+        for kind in [MediaKind::Image, MediaKind::Video, MediaKind::Audio] {
+            if !draft.media.iter().any(|media| media.role.kind() == kind) {
+                continue;
+            }
+            match &model.input_modalities {
+                Some(modalities) if !modalities.contains(&kind) => {
+                    return Err(format!(
+                        "{} does not support {} references. Choose another model or remove the incompatible media.",
+                        model.name,
+                        media_kind_plural(kind)
+                    ));
+                }
+                None if kind != MediaKind::Image => {
+                    return Err(format!(
+                        "{} does not publish confirmed {} input support. Refresh the catalog or choose a model that explicitly supports it.",
+                        model.name,
+                        media_kind_plural(kind)
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if draft.provider_id == ProviderId::fal() {
+            for (role, kind) in [
+                (MediaRole::Reference, MediaKind::Image),
+                (MediaRole::VideoInput, MediaKind::Video),
+                (MediaRole::AudioInput, MediaKind::Audio),
+            ] {
+                let count = draft
+                    .media
+                    .iter()
+                    .filter(|media| media.role == role)
+                    .count();
+                if count == 0 {
+                    continue;
+                }
+                let bindings = model
+                    .media_bindings
+                    .iter()
+                    .filter(|binding| binding.kind == kind)
+                    .collect::<Vec<_>>();
+                if bindings.is_empty() {
+                    return Err(format!(
+                        "{} cannot bind {} references to a fal.ai input field. Choose another model or remove them.",
+                        model.name,
+                        media_kind_plural(kind)
+                    ));
+                }
+                let capacity = bindings.iter().fold(0usize, |capacity, binding| {
+                    let binding_capacity = match binding.cardinality {
+                        MediaCardinality::Scalar => 1,
+                        MediaCardinality::List => binding.max_items.unwrap_or(usize::MAX),
+                    };
+                    capacity.saturating_add(binding_capacity)
+                });
+                if count > capacity {
+                    return Err(format!(
+                        "{} accepts at most {capacity} {} reference(s); this draft has {count}.",
+                        model.name,
+                        kind.as_str()
+                    ));
+                }
+            }
+        }
         for media in &draft.media {
             let required = match media.role {
                 MediaRole::StartFrame => Some("first_frame"),
                 MediaRole::EndFrame => Some("last_frame"),
-                MediaRole::Reference => None,
+                MediaRole::Reference | MediaRole::VideoInput | MediaRole::AudioInput => None,
             };
             if let Some(required) = required
-                && !model.supported_frame_images.is_empty()
                 && !model
                     .supported_frame_images
                     .iter()
@@ -855,7 +953,7 @@ impl HarnessWindow {
                 .iter()
                 .any(|item| matches!(item.source, MediaSource::LocalFile { .. }))
             {
-                "Checking and uploading reference images…"
+                "Checking and uploading local reference media…"
             } else {
                 "Validating controls and fetching a fresh price…"
             },
@@ -937,7 +1035,7 @@ impl HarnessWindow {
                     .set_sensitive(self.pending_submit_op.get().is_none());
                 self.review.set_label("Review generation");
                 self.show_compatibility(
-                    "Ready to review. Local files upload to a public fal CDN at Review and expire after 24 hours.",
+                    "Ready to review. Local reference media uploads to a public fal CDN at Review and expires after 24 hours.",
                     "harness-good",
                 );
                 return;
@@ -983,13 +1081,53 @@ impl HarnessWindow {
             || self.shutdown_requested.get()
     }
 
+    fn update_media_input_availability(&self) {
+        let local_allowed = self.selected_provider() != ProviderId::openrouter();
+        self.add_files.set_sensitive(local_allowed);
+        self.drop_zone.set_sensitive(local_allowed);
+        if local_allowed {
+            self.add_files
+                .set_tooltip_text(Some("Choose local image, video, or audio reference files"));
+            self.drop_title.set_text("Drop reference media here");
+            self.drop_hint
+                .set_text("Files stay local until you press Review");
+        } else {
+            self.add_files
+                .set_tooltip_text(Some("OpenRouter accepts public HTTPS reference URLs only"));
+            self.drop_title.set_text("OpenRouter uses URL references");
+            self.drop_hint
+                .set_text("Choose a media type and add a public HTTPS URL below");
+        }
+    }
+
+    fn configure_remote_role(&self, kind: Option<MediaKind>) {
+        let labels: &[&str] = match kind {
+            Some(MediaKind::Image) => &["Reference", "Start frame", "End frame"],
+            Some(MediaKind::Video) => &["Video input"],
+            Some(MediaKind::Audio) => &["Audio input"],
+            None => &["Image role"],
+        };
+        self.remote_role
+            .set_model(Some(&gtk::StringList::new(labels)));
+        self.remote_role.set_selected(0);
+        self.remote_role
+            .set_sensitive(kind == Some(MediaKind::Image));
+    }
+
     fn choose_files(self: &Rc<Self>) {
+        if self.selected_provider() == ProviderId::openrouter() {
+            self.toast(
+                "OpenRouter accepts reference media by public HTTPS URL only.",
+                "dialog-warning-symbolic",
+            );
+            return;
+        }
         let dialog = gtk::FileDialog::builder()
-            .title("Choose reference images")
+            .title("Choose reference media")
             .modal(true)
             .build();
         let filter = gtk::FileFilter::new();
-        filter.set_name(Some("Reference images"));
+        filter.set_name(Some("Supported reference media"));
         for mime in [
             "image/png",
             "image/jpeg",
@@ -998,8 +1136,19 @@ impl HarnessWindow {
             "image/avif",
             "image/bmp",
             "image/tiff",
+            "video/mp4",
+            "video/quicktime",
+            "audio/mpeg",
+            "audio/wav",
+            "audio/x-wav",
         ] {
             filter.add_mime_type(mime);
+        }
+        for suffix in [
+            "png", "jpg", "jpeg", "webp", "gif", "avif", "bmp", "tif", "tiff", "mp4", "mov", "mp3",
+            "wav",
+        ] {
+            filter.add_suffix(suffix);
         }
         let filters = gio::ListStore::new::<gtk::FileFilter>();
         filters.append(&filter);
@@ -1017,12 +1166,12 @@ impl HarnessWindow {
                         continue;
                     };
                     if let Some(path) = file.path() {
-                        if !is_supported_reference_image(&path) {
+                        let Some(kind) = classify_local_reference(&path) else {
                             continue;
-                        }
+                        };
                         media.push(MediaItem {
                             source: MediaSource::local(path),
-                            role: MediaRole::Reference,
+                            role: default_role_for_kind(kind),
                         });
                     }
                 }
@@ -1042,18 +1191,41 @@ impl HarnessWindow {
             );
             return;
         }
-        let role = role_for_index(self.remote_role.selected());
+        let Some(kind) = remote_kind_for_index(self.remote_kind.selected()) else {
+            self.toast(
+                "Choose whether the URL contains an image, video, or audio reference.",
+                "dialog-warning-symbolic",
+            );
+            return;
+        };
+        let role = role_for_kind(kind, self.remote_role.selected());
         let source = if value.starts_with("file:") {
+            if self.selected_provider() == ProviderId::openrouter() {
+                self.toast(
+                    "OpenRouter accepts reference media by public HTTPS URL only. The local file was not added.",
+                    "dialog-error-symbolic",
+                );
+                return;
+            }
             let file = gio::File::for_uri(&value);
             match file.path() {
-                Some(path) if is_supported_reference_image(&path) => MediaSource::local(path),
-                Some(_) => {
-                    self.toast(
-                        "Local references must be image files (PNG, JPEG, WebP, GIF, AVIF, BMP, or TIFF).",
-                        "dialog-error-symbolic",
-                    );
-                    return;
-                }
+                Some(path) => match classify_local_reference(&path) {
+                    Some(actual) if actual == kind => MediaSource::local(path),
+                    Some(_) => {
+                        self.toast(
+                            "The selected media type does not match that local file.",
+                            "dialog-error-symbolic",
+                        );
+                        return;
+                    }
+                    None => {
+                        self.toast(
+                            "Reference media must be a valid image, MP4/MOV video, or MP3/WAV audio file.",
+                            "dialog-error-symbolic",
+                        );
+                        return;
+                    }
+                },
                 None => {
                     self.toast(
                         "That file URI does not point to a local file.",
@@ -1073,6 +1245,8 @@ impl HarnessWindow {
         };
         self.media.borrow_mut().push(MediaItem { source, role });
         self.remote_url.set_text("");
+        self.remote_kind.set_selected(0);
+        self.remote_role.set_selected(0);
         self.rebuild_media();
         self.draft_changed();
     }
@@ -1084,19 +1258,28 @@ impl HarnessWindow {
         let items = self.media.borrow().clone();
         self.media_empty.set_visible(items.is_empty());
         self.media_list.set_visible(!items.is_empty());
+        let mut ordinals = [0usize; 3];
 
         for (index, item) in items.into_iter().enumerate() {
+            let kind = item.role.kind();
+            let kind_index = media_kind_index(kind);
+            ordinals[kind_index] += 1;
+            let typed_ordinal = format!("{} {}", media_kind_label(kind), ordinals[kind_index]);
             let row = gtk::ListBoxRow::new();
             row.set_activatable(false);
             row.set_selectable(false);
+            row.set_tooltip_text(Some(&format!(
+                "{typed_ordinal}: {}",
+                media_name(&item.source)
+            )));
             let body = gtk::Box::new(gtk::Orientation::Horizontal, 10);
             body.add_css_class("harness-story-row");
 
             let preview = gtk::Button::new();
             preview.add_css_class("flat");
-            preview.set_tooltip_text(Some("Preview reference"));
+            preview.set_tooltip_text(Some(&format!("Preview {typed_ordinal}")));
             match &item.source {
-                MediaSource::LocalFile { path } => {
+                MediaSource::LocalFile { path } if kind == MediaKind::Image => {
                     let picture = gtk::Picture::for_file(&gio::File::for_path(path));
                     picture.set_size_request(72, 72);
                     picture.set_content_fit(gtk::ContentFit::Cover);
@@ -1105,14 +1288,28 @@ impl HarnessWindow {
                     let path = path.clone();
                     preview.connect_clicked(move |_| {
                         if let Some(this) = weak.upgrade() {
-                            this.preview_file(&path);
+                            this.preview_file(&path, kind);
+                        }
+                    });
+                }
+                MediaSource::LocalFile { path } => {
+                    let icon = gtk::Image::from_icon_name(media_kind_icon(kind));
+                    icon.set_pixel_size(32);
+                    preview.set_child(Some(&icon));
+                    let weak = Self::weak(self);
+                    let path = path.clone();
+                    preview.connect_clicked(move |_| {
+                        if let Some(this) = weak.upgrade() {
+                            this.preview_file(&path, kind);
                         }
                     });
                 }
                 MediaSource::RemoteUrl { .. } => {
-                    let icon = gtk::Image::from_icon_name("web-browser-symbolic");
+                    let icon = gtk::Image::from_icon_name(media_kind_icon(kind));
                     icon.set_pixel_size(32);
                     preview.set_child(Some(&icon));
+                    preview.set_sensitive(false);
+                    preview.set_tooltip_text(Some("Remote media is previewed by the provider"));
                 }
             }
             body.append(&preview);
@@ -1123,6 +1320,9 @@ impl HarnessWindow {
             name.set_halign(gtk::Align::Start);
             name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
             name.add_css_class("heading");
+            let type_label = gtk::Label::new(Some(&typed_ordinal));
+            type_label.set_halign(gtk::Align::Start);
+            type_label.add_css_class("harness-muted");
             let source_text = match &item.source {
                 MediaSource::LocalFile { path } => path.to_string_lossy().into_owned(),
                 MediaSource::RemoteUrl { url } => url.clone(),
@@ -1132,21 +1332,40 @@ impl HarnessWindow {
             source.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
             source.add_css_class("harness-muted");
             labels.append(&name);
+            labels.append(&type_label);
             labels.append(&source);
+            if self.selected_provider() == ProviderId::openrouter()
+                && matches!(item.source, MediaSource::LocalFile { .. })
+            {
+                let blocked = gtk::Label::new(Some(
+                    "Blocked for OpenRouter — retained locally; switch provider or use a public HTTPS URL",
+                ));
+                blocked.set_halign(gtk::Align::Start);
+                blocked.set_wrap(true);
+                blocked.add_css_class("harness-warning");
+                labels.append(&blocked);
+            }
             body.append(&labels);
 
-            let role = dropdown(&["Reference", "Start frame", "End frame"]);
-            role.set_selected(index_for_role(item.role));
-            role.set_tooltip_text(Some("Role in the generated video"));
-            let weak = Self::weak(self);
-            role.connect_selected_notify(move |dropdown| {
-                let Some(this) = weak.upgrade() else { return };
-                if let Some(item) = this.media.borrow_mut().get_mut(index) {
-                    item.role = role_for_index(dropdown.selected());
-                }
-                this.draft_changed();
-            });
-            body.append(&role);
+            if kind == MediaKind::Image {
+                let role = dropdown(&["Reference", "Start frame", "End frame"]);
+                role.set_selected(index_for_role(item.role));
+                role.set_tooltip_text(Some("Image role in the generated video"));
+                let weak = Self::weak(self);
+                role.connect_selected_notify(move |dropdown| {
+                    let Some(this) = weak.upgrade() else { return };
+                    if let Some(item) = this.media.borrow_mut().get_mut(index) {
+                        item.role = role_for_index(dropdown.selected());
+                    }
+                    this.draft_changed();
+                });
+                body.append(&role);
+            } else {
+                let role = gtk::Label::new(Some(media_role_label(item.role)));
+                role.set_tooltip_text(Some("Video and audio references use a fixed input role"));
+                role.add_css_class("harness-muted");
+                body.append(&role);
+            }
 
             let up = gtk::Button::from_icon_name("go-up-symbolic");
             up.set_tooltip_text(Some("Move earlier"));
@@ -1175,7 +1394,7 @@ impl HarnessWindow {
             });
             body.append(&down);
             let remove = gtk::Button::from_icon_name("user-trash-symbolic");
-            remove.set_tooltip_text(Some("Remove reference"));
+            remove.set_tooltip_text(Some(&format!("Remove {typed_ordinal}")));
             remove.add_css_class("flat");
             let weak = Self::weak(self);
             remove.connect_clicked(move |_| {
@@ -1192,10 +1411,7 @@ impl HarnessWindow {
         }
     }
 
-    fn preview_file(&self, path: &Path) {
-        let preview = gtk::Picture::for_file(&gio::File::for_path(path));
-        preview.set_can_shrink(true);
-        preview.set_content_fit(gtk::ContentFit::Contain);
+    fn preview_file(&self, path: &Path, kind: MediaKind) {
         let close = gtk::Button::with_label("Close");
         close.add_css_class("pill");
         let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -1203,11 +1419,31 @@ impl HarnessWindow {
         body.set_margin_bottom(16);
         body.set_margin_start(16);
         body.set_margin_end(16);
-        body.append(&preview);
+        match kind {
+            MediaKind::Image => {
+                let preview = gtk::Picture::for_file(&gio::File::for_path(path));
+                preview.set_can_shrink(true);
+                preview.set_content_fit(gtk::ContentFit::Contain);
+                body.append(&preview);
+            }
+            MediaKind::Video | MediaKind::Audio => {
+                let preview = gtk::Video::new();
+                preview.set_file(Some(&gio::File::for_path(path)));
+                preview.set_autoplay(false);
+                preview.set_loop(false);
+                preview.set_hexpand(true);
+                preview.set_height_request(if kind == MediaKind::Video { 460 } else { 120 });
+                body.append(&preview);
+            }
+        }
         close.set_halign(gtk::Align::End);
         body.append(&close);
         let window = gtk::Window::builder()
-            .title(media_name(&MediaSource::local(path)))
+            .title(format!(
+                "{} reference — {}",
+                media_kind_label(kind),
+                media_name(&MediaSource::local(path))
+            ))
             .transient_for(&self.window)
             .modal(true)
             .default_width(820)
@@ -1293,6 +1529,48 @@ impl HarnessWindow {
         }
         if !model.pricing_skus.is_empty() {
             description.push_str(" • pricing available at Review");
+        }
+        if let Some(modalities) = &model.input_modalities {
+            let accepted = modalities
+                .iter()
+                .map(|kind| media_kind_plural(*kind))
+                .collect::<Vec<_>>()
+                .join(", ");
+            description.push_str(if accepted.is_empty() {
+                " • no reference-media inputs advertised"
+            } else {
+                " • accepts "
+            });
+            if !accepted.is_empty() {
+                description.push_str(&accepted);
+            }
+        } else {
+            description.push_str(" • media capabilities not advertised");
+        }
+        if !model.media_bindings.is_empty() {
+            let bindings = model
+                .media_bindings
+                .iter()
+                .map(|binding| {
+                    let purpose = binding
+                        .title
+                        .as_deref()
+                        .or(binding.description.as_deref())
+                        .unwrap_or(&binding.property_name);
+                    format!("{} — {purpose}", media_kind_label(binding.kind))
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            description.push_str(" • media fields: ");
+            description.push_str(&bindings);
+        }
+        if self
+            .catalogs
+            .borrow()
+            .get(&model.provider_id)
+            .is_some_and(|catalog| catalog.stale)
+        {
+            description.push_str(" • cached catalog");
         }
         self.model_description.set_text(&description);
 
@@ -1434,7 +1712,13 @@ impl HarnessWindow {
             self.options.schema_box.append(&label);
             return;
         };
-        let mapped_common = model.field_map.values().cloned().collect::<HashSet<_>>();
+        let mut mapped_common = model.field_map.values().cloned().collect::<HashSet<_>>();
+        mapped_common.extend(
+            model
+                .media_bindings
+                .iter()
+                .map(|binding| binding.property_name.clone()),
+        );
         let known = [
             "prompt",
             "duration",
@@ -1448,6 +1732,8 @@ impl HarnessWindow {
             "end_image_url",
             "input_references",
             "frame_images",
+            "video_url",
+            "audio_url",
         ];
         let mut rendered = 0usize;
         let mut unsupported = Vec::new();
@@ -1683,6 +1969,7 @@ impl HarnessWindow {
                 role: media.role,
             })
             .collect();
+        self.update_media_input_availability();
         self.rebuild_media();
         self.revision.set(revision);
         self.loading_draft.set(false);
@@ -1740,6 +2027,8 @@ impl HarnessWindow {
                 self.provider.set_selected(index);
                 self.default_provider.set_selected(index);
                 self.loading_draft.set(false);
+                self.update_media_input_availability();
+                self.rebuild_media();
                 self.send(ServiceCommand::LoadDraft {
                     op_id: self.op_id(),
                 });
@@ -1805,7 +2094,9 @@ impl HarnessWindow {
             }
             ServiceEvent::PreparationStarted { media_count, .. } => {
                 self.show_compatibility(
-                    &format!("Preparing review and checking {media_count} reference item(s)…"),
+                    &format!(
+                        "Preparing review and checking {media_count} reference-media item(s)…"
+                    ),
                     "harness-warning",
                 );
             }
@@ -1814,8 +2105,8 @@ impl HarnessWindow {
             } => {
                 self.show_compatibility(
                     &format!(
-                        "Uploading reference {}: {} (generation has not been submitted)",
-                        media_index + 1,
+                        "Uploading {}: {} (generation has not been submitted)",
+                        typed_media_ordinal(&self.media.borrow(), media_index),
                         path.file_name()
                             .and_then(|name| name.to_str())
                             .unwrap_or("media")
@@ -1831,7 +2122,10 @@ impl HarnessWindow {
             } => {
                 let percent = sent.saturating_mul(100).checked_div(total).unwrap_or(0);
                 self.show_compatibility(
-                    &format!("Uploading reference {}… {percent}%", media_index + 1),
+                    &format!(
+                        "Uploading {}… {percent}%",
+                        typed_media_ordinal(&self.media.borrow(), media_index)
+                    ),
                     "harness-warning",
                 );
             }
@@ -1851,8 +2145,8 @@ impl HarnessWindow {
                     .unwrap_or_default();
                 self.show_compatibility(
                     &format!(
-                        "Reference {}: {source}{expiry}. Fetching a fresh quote…",
-                        media_index + 1
+                        "{}: {source}{expiry}. Fetching a fresh quote…",
+                        typed_media_ordinal(&self.media.borrow(), media_index)
                     ),
                     "harness-warning",
                 );
@@ -2407,26 +2701,19 @@ impl HarnessWindow {
             &ellipsize_text(&request.prompt, 180),
         ));
         body.append(&summary_row(
-            "References",
-            &format!(
-                "{} frame(s), {} general reference(s)",
-                request.frame_images.len(),
-                request.input_references.len()
-            ),
+            "Reference media",
+            &typed_reference_counts(&request),
         ));
-        let reference_urls = request
-            .frame_images
-            .iter()
-            .map(|frame| format!("{}: {}", frame.frame_type.as_str(), frame.url))
-            .chain(
-                request
-                    .input_references
-                    .iter()
-                    .map(|reference| format!("reference: {}", reference.url)),
-            )
-            .collect::<Vec<_>>();
-        if !reference_urls.is_empty() {
-            body.append(&summary_row("Reference URLs", &reference_urls.join("\n")));
+        let reference_details = typed_reference_details(&request);
+        if !reference_details.is_empty() {
+            body.append(&summary_row(
+                "Typed references",
+                &reference_details.join("\n"),
+            ));
+            body.append(&summary_row(
+                "Media checks",
+                "Counts, URL safety, and supported local file signatures were checked. Duration, dimensions, and remote-media contents are not locally verified; provider validation and final usage remain authoritative.",
+            ));
         }
         let settings = format!(
             "Duration: {}\nResolution: {}\nAspect ratio: {}\nExact size: {}\nAudio: {}\nSeed: {}",
@@ -2987,12 +3274,15 @@ struct ComposeWidgets {
     media_list: gtk::ListBox,
     media_empty: gtk::Label,
     remote_url: gtk::Entry,
+    remote_kind: gtk::DropDown,
     remote_role: gtk::DropDown,
     compatibility: gtk::Label,
     review: gtk::Button,
     add_files: gtk::Button,
     add_url: gtk::Button,
     drop_zone: gtk::Box,
+    drop_title: gtk::Label,
+    drop_hint: gtk::Label,
 }
 
 impl ComposeWidgets {
@@ -3005,7 +3295,7 @@ impl ComposeWidgets {
         hero.add_css_class("harness-hero");
         content.append(&hero);
         let intro = gtk::Label::new(Some(
-            "Write a prompt, arrange reference frames, then review the exact request before anything is submitted.",
+            "Write a prompt, arrange reference media, then review the exact request before anything is submitted.",
         ));
         intro.set_halign(gtk::Align::Start);
         intro.set_wrap(true);
@@ -3058,16 +3348,16 @@ impl ComposeWidgets {
         let media_list = gtk::ListBox::new();
         media_list.set_selection_mode(gtk::SelectionMode::None);
         media_list.add_css_class("boxed-list");
-        let media_empty = gtk::Label::new(Some("No reference images yet"));
+        let media_empty = gtk::Label::new(Some("No reference media yet"));
         media_empty.add_css_class("harness-muted");
         media_empty.set_margin_top(10);
         media_empty.set_margin_bottom(10);
 
         let drop_zone = gtk::Box::new(gtk::Orientation::Vertical, 5);
         drop_zone.add_css_class("harness-drop-zone");
-        let drop_icon = gtk::Image::from_icon_name("image-x-generic-symbolic");
+        let drop_icon = gtk::Image::from_icon_name("mail-attachment-symbolic");
         drop_icon.set_pixel_size(36);
-        let drop_title = gtk::Label::new(Some("Drop reference images here"));
+        let drop_title = gtk::Label::new(Some("Drop reference media here"));
         drop_title.add_css_class("heading");
         let drop_hint = gtk::Label::new(Some("Files stay local until you press Review"));
         drop_hint.add_css_class("harness-muted");
@@ -3075,17 +3365,28 @@ impl ComposeWidgets {
         drop_zone.append(&drop_title);
         drop_zone.append(&drop_hint);
 
-        let add_files = gtk::Button::with_label("Choose images…");
+        let add_files = gtk::Button::with_label("Choose files…");
         add_files.add_css_class("suggested-action");
         let remote_url = gtk::Entry::builder()
             .hexpand(true)
-            .placeholder_text("https://… or file:///…")
+            .placeholder_text("Public https://… URL or file:///…")
             .build();
+        remote_url.set_tooltip_text(Some(
+            "Add one reference URL after explicitly choosing its media type",
+        ));
+        let remote_kind = dropdown(&["Choose type…", "Image", "Video", "Audio"]);
+        remote_kind.set_tooltip_text(Some("Media type for this URL"));
         let remote_role = dropdown(&["Reference", "Start frame", "End frame"]);
+        remote_role.set_sensitive(false);
+        remote_role.set_tooltip_text(Some(
+            "Image role; video and audio references use fixed input roles",
+        ));
         let add_url = gtk::Button::with_label("Add");
+        add_url.set_tooltip_text(Some("Add this typed reference URL"));
         let add_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         add_row.append(&add_files);
         add_row.append(&remote_url);
+        add_row.append(&remote_kind);
         add_row.append(&remote_role);
         add_row.append(&add_url);
 
@@ -3095,8 +3396,8 @@ impl ComposeWidgets {
         media_box.append(&media_empty);
         media_box.append(&media_list);
         content.append(&card(
-            "Reference storyboard",
-            "Set a start frame, end frame, or general reference. Reorder before Review.",
+            "Reference media",
+            "Add images, video, or audio. Images can be frames or general references; video and audio use fixed input roles.",
             &media_box,
         ));
 
@@ -3142,12 +3443,15 @@ impl ComposeWidgets {
             media_list,
             media_empty,
             remote_url,
+            remote_kind,
             remote_role,
             compatibility,
             review,
             add_files,
             add_url,
             drop_zone,
+            drop_title,
+            drop_hint,
         }
     }
 }
@@ -3427,6 +3731,30 @@ fn provider_name(provider_id: &ProviderId) -> &'static str {
     }
 }
 
+fn remote_kind_for_index(index: u32) -> Option<MediaKind> {
+    match index {
+        1 => Some(MediaKind::Image),
+        2 => Some(MediaKind::Video),
+        3 => Some(MediaKind::Audio),
+        _ => None,
+    }
+}
+
+fn default_role_for_kind(kind: MediaKind) -> MediaRole {
+    match kind {
+        MediaKind::Image => MediaRole::Reference,
+        MediaKind::Video => MediaRole::VideoInput,
+        MediaKind::Audio => MediaRole::AudioInput,
+    }
+}
+
+fn role_for_kind(kind: MediaKind, image_role_index: u32) -> MediaRole {
+    match kind {
+        MediaKind::Image => role_for_index(image_role_index),
+        MediaKind::Video | MediaKind::Audio => default_role_for_kind(kind),
+    }
+}
+
 fn role_for_index(index: u32) -> MediaRole {
     match index {
         1 => MediaRole::StartFrame,
@@ -3440,6 +3768,49 @@ fn index_for_role(role: MediaRole) -> u32 {
         MediaRole::Reference => 0,
         MediaRole::StartFrame => 1,
         MediaRole::EndFrame => 2,
+        MediaRole::VideoInput | MediaRole::AudioInput => 0,
+    }
+}
+
+fn media_role_label(role: MediaRole) -> &'static str {
+    match role {
+        MediaRole::Reference => "Reference",
+        MediaRole::StartFrame => "Start frame",
+        MediaRole::EndFrame => "End frame",
+        MediaRole::VideoInput => "Video input",
+        MediaRole::AudioInput => "Audio input",
+    }
+}
+
+fn media_kind_index(kind: MediaKind) -> usize {
+    match kind {
+        MediaKind::Image => 0,
+        MediaKind::Video => 1,
+        MediaKind::Audio => 2,
+    }
+}
+
+fn media_kind_label(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Image => "Image",
+        MediaKind::Video => "Video",
+        MediaKind::Audio => "Audio",
+    }
+}
+
+fn media_kind_plural(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Image => "images",
+        MediaKind::Video => "videos",
+        MediaKind::Audio => "audio clips",
+    }
+}
+
+fn media_kind_icon(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Image => "image-x-generic-symbolic",
+        MediaKind::Video => "video-x-generic-symbolic",
+        MediaKind::Audio => "audio-x-generic-symbolic",
     }
 }
 
@@ -3569,7 +3940,7 @@ fn media_name(source: &MediaSource) -> String {
         MediaSource::LocalFile { path } => path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("Reference image")
+            .unwrap_or("Reference media")
             .to_owned(),
         MediaSource::RemoteUrl { url } => url
             .split('?')
@@ -3581,16 +3952,90 @@ fn media_name(source: &MediaSource) -> String {
     }
 }
 
-fn is_supported_reference_image(path: &Path) -> bool {
-    path.extension()
+fn classify_local_reference(path: &Path) -> Option<MediaKind> {
+    let kind = media_kind_for_extension(path)?;
+    MediaSource::local(path).validate_for_kind(kind).ok()?;
+    Some(kind)
+}
+
+fn media_kind_for_extension(path: &Path) -> Option<MediaKind> {
+    let extension = path
+        .extension()
         .and_then(|extension| extension.to_str())
-        .map(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "webp" | "gif" | "avif" | "bmp" | "tif" | "tiff"
-            )
-        })
-        .unwrap_or(false)
+        .map(str::to_ascii_lowercase)?;
+    match extension.as_str() {
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "avif" | "bmp" | "tif" | "tiff" => {
+            Some(MediaKind::Image)
+        }
+        "mp4" | "mov" => Some(MediaKind::Video),
+        "mp3" | "wav" => Some(MediaKind::Audio),
+        _ => None,
+    }
+}
+
+fn typed_reference_counts(request: &crate::domain::VideoRequest) -> String {
+    let mut counts = [request.frame_images.len(), 0, 0];
+    for reference in &request.input_references {
+        counts[media_kind_index(MediaKind::from(reference.kind))] += 1;
+    }
+    format!(
+        "{}, {}, {}",
+        count_label(counts[0], "image", "images"),
+        count_label(counts[1], "video", "videos"),
+        count_label(counts[2], "audio clip", "audio clips")
+    )
+}
+
+fn typed_media_ordinal(items: &[MediaItem], target: usize) -> String {
+    let Some(target_item) = items.get(target) else {
+        return format!("media item {}", target.saturating_add(1));
+    };
+    let kind = target_item.role.kind();
+    let ordinal = items[..=target]
+        .iter()
+        .filter(|item| item.role.kind() == kind)
+        .count();
+    format!("{} {ordinal}", media_kind_label(kind))
+}
+
+fn typed_reference_details(request: &crate::domain::VideoRequest) -> Vec<String> {
+    let mut ordinals = [0usize; 3];
+    let mut details = Vec::with_capacity(
+        request
+            .frame_images
+            .len()
+            .saturating_add(request.input_references.len()),
+    );
+    for frame in &request.frame_images {
+        ordinals[media_kind_index(MediaKind::Image)] += 1;
+        details.push(format!(
+            "Image {} ({}): {}",
+            ordinals[media_kind_index(MediaKind::Image)],
+            frame.frame_type.as_str().replace('_', " "),
+            frame.url
+        ));
+    }
+    for reference in &request.input_references {
+        let kind = MediaKind::from(reference.kind);
+        let index = media_kind_index(kind);
+        ordinals[index] += 1;
+        let role = match kind {
+            MediaKind::Image => "general reference",
+            MediaKind::Video => "video input",
+            MediaKind::Audio => "audio input",
+        };
+        details.push(format!(
+            "{} {} ({role}): {}",
+            media_kind_label(kind),
+            ordinals[index],
+            reference.url
+        ));
+    }
+    details
+}
+
+fn count_label(count: usize, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
 }
 
 fn summary_row(label: &str, value: &str) -> gtk::Box {
@@ -3646,7 +4091,9 @@ fn byte_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{FrameImage, FrameType, InputReference, VideoRequest};
     use serde_json::json;
+    use tempfile::tempdir;
 
     #[test]
     fn navigation_indexes_use_stable_provider_ids() {
@@ -3657,7 +4104,7 @@ mod tests {
     }
 
     #[test]
-    fn storyboard_role_indexes_round_trip() {
+    fn image_role_indexes_round_trip_and_typed_roles_are_fixed() {
         for role in [
             MediaRole::Reference,
             MediaRole::StartFrame,
@@ -3665,15 +4112,105 @@ mod tests {
         ] {
             assert_eq!(role_for_index(index_for_role(role)), role);
         }
+        assert_eq!(
+            default_role_for_kind(MediaKind::Video),
+            MediaRole::VideoInput
+        );
+        assert_eq!(
+            default_role_for_kind(MediaKind::Audio),
+            MediaRole::AudioInput
+        );
+        assert_eq!(role_for_kind(MediaKind::Video, 2), MediaRole::VideoInput);
+        assert_eq!(role_for_kind(MediaKind::Audio, 1), MediaRole::AudioInput);
+        assert_eq!(remote_kind_for_index(0), None);
+        assert_eq!(remote_kind_for_index(1), Some(MediaKind::Image));
+        assert_eq!(remote_kind_for_index(2), Some(MediaKind::Video));
+        assert_eq!(remote_kind_for_index(3), Some(MediaKind::Audio));
     }
 
     #[test]
-    fn local_reference_filter_accepts_images_only() {
-        assert!(is_supported_reference_image(Path::new("frame.PNG")));
-        assert!(is_supported_reference_image(Path::new("reference.avif")));
-        assert!(!is_supported_reference_image(Path::new("clip.mp4")));
-        assert!(!is_supported_reference_image(Path::new("sound.wav")));
-        assert!(!is_supported_reference_image(Path::new("no-extension")));
+    fn local_reference_classification_is_extension_and_signature_safe() {
+        let directory = tempdir().expect("temp dir");
+        let fixtures: [(&str, &[u8], MediaKind); 5] = [
+            ("frame.PNG", b"\x89PNG\r\n\x1a\n", MediaKind::Image),
+            ("clip.mp4", b"\0\0\0\0ftypmp42", MediaKind::Video),
+            ("clip.mov", b"\0\0\0\0ftypqt  ", MediaKind::Video),
+            ("sound.mp3", b"ID3typed-audio", MediaKind::Audio),
+            ("sound.wav", b"RIFF\0\0\0\0WAVE", MediaKind::Audio),
+        ];
+        for (name, bytes, expected) in fixtures {
+            let path = directory.path().join(name);
+            std::fs::write(&path, bytes).expect("write media fixture");
+            assert_eq!(classify_local_reference(&path), Some(expected), "{name}");
+        }
+
+        let disguised_video = directory.path().join("disguised.mp4");
+        std::fs::write(&disguised_video, b"not really video").expect("write mismatch");
+        assert_eq!(classify_local_reference(&disguised_video), None);
+        assert_eq!(media_kind_for_extension(Path::new("unknown.mkv")), None);
+        assert_eq!(media_kind_for_extension(Path::new("no-extension")), None);
+    }
+
+    #[test]
+    fn typed_ordinals_count_each_media_kind_independently() {
+        let items = vec![
+            MediaItem {
+                source: MediaSource::remote("https://example.test/one.png").expect("image"),
+                role: MediaRole::Reference,
+            },
+            MediaItem {
+                source: MediaSource::remote("https://example.test/clip.mp4").expect("video"),
+                role: MediaRole::VideoInput,
+            },
+            MediaItem {
+                source: MediaSource::remote("https://example.test/two.png").expect("image"),
+                role: MediaRole::EndFrame,
+            },
+            MediaItem {
+                source: MediaSource::remote("https://example.test/sound.wav").expect("audio"),
+                role: MediaRole::AudioInput,
+            },
+        ];
+        assert_eq!(typed_media_ordinal(&items, 0), "Image 1");
+        assert_eq!(typed_media_ordinal(&items, 1), "Video 1");
+        assert_eq!(typed_media_ordinal(&items, 2), "Image 2");
+        assert_eq!(typed_media_ordinal(&items, 3), "Audio 1");
+    }
+
+    #[test]
+    fn review_summary_exposes_typed_counts_and_ordinals() {
+        let mut request =
+            VideoRequest::for_provider(ProviderId::fal(), "model", "prompt").expect("request");
+        request.frame_images.push(
+            FrameImage::new("https://example.test/start.png", FrameType::FirstFrame)
+                .expect("frame"),
+        );
+        request.input_references.push(
+            InputReference::with_kind("https://example.test/ref.png", MediaKind::Image)
+                .expect("image"),
+        );
+        request.input_references.push(
+            InputReference::with_kind("https://example.test/clip.mp4", MediaKind::Video)
+                .expect("video"),
+        );
+        request.input_references.push(
+            InputReference::with_kind("https://example.test/sound.wav", MediaKind::Audio)
+                .expect("audio"),
+        );
+
+        assert_eq!(
+            typed_reference_counts(&request),
+            "2 images, 1 video, 1 audio clip"
+        );
+        assert_eq!(
+            typed_reference_details(&request),
+            vec![
+                "Image 1 (first frame): https://example.test/start.png",
+                "Image 2 (general reference): https://example.test/ref.png",
+                "Video 1 (video input): https://example.test/clip.mp4",
+                "Audio 1 (audio input): https://example.test/sound.wav",
+            ]
+        );
     }
 
     #[test]

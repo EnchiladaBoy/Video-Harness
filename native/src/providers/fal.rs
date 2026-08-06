@@ -28,9 +28,9 @@ use crate::api::{
 };
 use crate::config::partial_path;
 use crate::domain::{
-    CostQuote, DraftMedia, JobLocator, JobStatus, MediaSource, ProviderDescriptor, ProviderId,
-    QuoteConfidence, StagedMedia, UploadReceipt, VideoArtifact, VideoCatalog, VideoJob, VideoModel,
-    VideoRequest,
+    CostQuote, DraftMedia, JobLocator, JobStatus, MediaBinding, MediaCardinality, MediaKind,
+    MediaSource, ProviderDescriptor, ProviderId, QuoteConfidence, StagedMedia, UploadReceipt,
+    VideoArtifact, VideoCatalog, VideoJob, VideoModel, VideoRequest, validate_public_https_url,
 };
 
 use super::{
@@ -46,6 +46,19 @@ const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
 const MULTIPART_THRESHOLD: u64 = 90 * 1024 * 1024;
 const MULTIPART_CHUNK_SIZE: usize = 10 * 1024 * 1024;
+const DISCOVERY_CATEGORIES: [&str; 4] = [
+    "text-to-video",
+    "image-to-video",
+    "video-to-video",
+    "audio-to-video",
+];
+const MAX_INPUT_MEDIA: usize = 12;
+const MAX_IMAGE_INPUTS: usize = 9;
+const MAX_VIDEO_INPUTS: usize = 3;
+const MAX_AUDIO_INPUTS: usize = 3;
+const SEEDANCE_MAX_IMAGE_BYTES: u64 = 30_000_000;
+const SEEDANCE_MAX_VIDEO_BYTES: u64 = 50_000_000;
+const SEEDANCE_MAX_AUDIO_BYTES: u64 = 15_000_000;
 
 #[derive(Debug, Clone)]
 pub struct FalOptions {
@@ -497,7 +510,7 @@ impl FalProvider {
 
     async fn load_catalog_pages(&self) -> Result<Vec<Value>, ProviderError> {
         let mut discovered = BTreeMap::<String, Value>::new();
-        for category in ["text-to-video", "image-to-video"] {
+        for category in DISCOVERY_CATEGORIES {
             let mut cursor = None::<String>;
             loop {
                 let mut url = self.platform_url(&["models"])?;
@@ -842,7 +855,13 @@ impl FalProvider {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
-        let reserved = model.field_map.values().cloned().collect::<BTreeSet<_>>();
+        let mut reserved = model.field_map.values().cloned().collect::<BTreeSet<_>>();
+        reserved.extend(
+            model
+                .media_bindings
+                .iter()
+                .map(|binding| binding.property_name.clone()),
+        );
         if let Some(name) = input.keys().find(|key| reserved.contains(*key)) {
             return Err(validation(format!(
                 "Advanced JSON cannot override the common field {name}"
@@ -899,20 +918,7 @@ impl FalProvider {
                 Some(Value::String(frame.url.clone())),
             )?;
         }
-        if !request.input_references.is_empty() {
-            insert_optional(
-                &mut input,
-                model,
-                "references",
-                Some(Value::Array(
-                    request
-                        .input_references
-                        .iter()
-                        .map(|reference| Value::String(reference.url.clone()))
-                        .collect(),
-                )),
-            )?;
-        }
+        bind_media_references(&mut input, model, request)?;
         let value = Value::Object(input);
         if let Some(schema) = &model.input_schema {
             validate_schema(schema, &value, "$input")?;
@@ -929,6 +935,9 @@ impl FalProvider {
         artifact
             .validate()
             .map_err(|error| unsafe_endpoint(error.to_string()))?;
+        let mut url =
+            Url::parse(&artifact.url).map_err(|_| unsafe_endpoint("Invalid artifact URL"))?;
+        validate_download_url(&url)?;
         if destination.exists() || partial_path(destination).exists() {
             return Err(download_error(format!(
                 "Refusing to overwrite an existing download: {}",
@@ -940,8 +949,6 @@ impl FalProvider {
                 download_error(format!("Could not create video directory: {error}"))
             })?;
         }
-        let mut url =
-            Url::parse(&artifact.url).map_err(|_| unsafe_endpoint("Invalid artifact URL"))?;
         let mut response = None;
         for redirect in 0..=MAX_REDIRECTS {
             let mut headers = HeaderMap::new();
@@ -1109,6 +1116,74 @@ impl VideoProvider for FalProvider {
         }
     }
 
+    fn validate_draft_media_constraints(
+        &self,
+        draft: &crate::domain::GenerationDraft,
+    ) -> Result<(), ProviderError> {
+        if !is_seedance_2_endpoint(&draft.model) {
+            return Ok(());
+        }
+        let mut local_video_bytes = 0u64;
+        for media in &draft.media {
+            let MediaSource::LocalFile { path } = &media.source else {
+                continue;
+            };
+            let size = std::fs::metadata(path)
+                .map_err(|error| {
+                    validation(format!(
+                        "Could not inspect local media {}: {error}",
+                        path.display()
+                    ))
+                })?
+                .len();
+            match media.role.kind() {
+                MediaKind::Image => {
+                    let extension = path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .map(str::to_ascii_lowercase)
+                        .unwrap_or_default();
+                    if !matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp") {
+                        return Err(validation(
+                            "Seedance 2.0 image inputs must use JPEG, PNG, or WebP",
+                        ));
+                    }
+                    if size > SEEDANCE_MAX_IMAGE_BYTES {
+                        return Err(validation(format!(
+                            "Seedance 2.0 image inputs must be at most {} MB each",
+                            SEEDANCE_MAX_IMAGE_BYTES / 1_000_000
+                        )));
+                    }
+                }
+                MediaKind::Video => {
+                    local_video_bytes = local_video_bytes.saturating_add(size);
+                }
+                MediaKind::Audio if size > SEEDANCE_MAX_AUDIO_BYTES => {
+                    return Err(validation(format!(
+                        "Seedance 2.0 audio inputs must be at most {} MB each",
+                        SEEDANCE_MAX_AUDIO_BYTES / 1_000_000
+                    )));
+                }
+                MediaKind::Audio => {}
+            }
+        }
+        if local_video_bytes >= SEEDANCE_MAX_VIDEO_BYTES {
+            return Err(validation(format!(
+                "Seedance 2.0 local video inputs must total less than {} MB",
+                SEEDANCE_MAX_VIDEO_BYTES / 1_000_000
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_staged_media_constraints(
+        &self,
+        draft: &crate::domain::GenerationDraft,
+        staged_media: &[StagedMedia],
+    ) -> Result<(), ProviderError> {
+        validate_seedance_staged_media_constraints(draft, staged_media)
+    }
+
     async fn validate_request(&self, request: &VideoRequest) -> Result<(), ProviderError> {
         if request.provider_id != ProviderId::fal() {
             return Err(validation("The request belongs to a different provider"));
@@ -1127,10 +1202,10 @@ impl VideoProvider for FalProvider {
         cached_receipt: Option<&UploadReceipt>,
         progress: Option<mpsc::UnboundedSender<UploadProgress>>,
     ) -> Result<StagedMedia, ProviderError> {
-        media
-            .validate()
-            .map_err(|error| validation(error.to_string()))?;
         let MediaSource::LocalFile { path } = &media.source else {
+            media
+                .validate()
+                .map_err(|error| validation(error.to_string()))?;
             let MediaSource::RemoteUrl { url } = &media.source else {
                 unreachable!()
             };
@@ -1138,12 +1213,21 @@ impl VideoProvider for FalProvider {
                 .map_err(|error| validation(error.to_string()));
         };
 
+        // Take the accepted file snapshot before signature validation. This
+        // closes the replacement window between validating the bytes and
+        // selecting the file identity whose hash will be uploaded.
+        let source_snapshot = local_file_snapshot(path).await?;
+        media
+            .validate()
+            .map_err(|error| validation(error.to_string()))?;
+        ensure_local_file_unchanged(path, &source_snapshot).await?;
         let (sha256, size_bytes) = media_sha256(path)
             .await
             .map_err(|error| validation(format!("Could not read local media: {error}")))?;
         if size_bytes == 0 {
             return Err(validation("Local media file is empty"));
         }
+        ensure_local_file_unchanged(path, &source_snapshot).await?;
         let now = Utc::now();
         if let Some(receipt) = cached_receipt.filter(|receipt| {
             receipt.reusable_for(&ProviderId::fal(), &sha256, now)
@@ -1219,6 +1303,7 @@ impl VideoProvider for FalProvider {
                 progress,
             )
             .await?;
+        ensure_local_file_unchanged(path, &source_snapshot).await?;
 
         // The provider may start the retention clock when the upload is
         // initiated, so never overstate the cache lifetime by upload time.
@@ -1299,7 +1384,7 @@ impl VideoProvider for FalProvider {
             raw_pricing.insert(unit.to_owned(), value);
         }
         let normalized = unit.to_ascii_lowercase().replace([' ', '-'], "_");
-        let (amount, basis, confidence) =
+        let (amount, mut basis, mut confidence) =
             if matches!(normalized.as_str(), "video" | "request" | "generation") {
                 (
                     unit_price,
@@ -1333,6 +1418,7 @@ impl VideoProvider for FalProvider {
                     QuoteConfidence::Unknown,
                 )
             };
+        apply_request_quote_uncertainty(request, &mut basis, &mut confidence);
         let currency = price
             .get("currency")
             .and_then(Value::as_str)
@@ -1435,7 +1521,7 @@ fn normalize_fal_model(raw: &Value) -> Result<Option<VideoModel>, ProviderError>
         .and_then(Value::as_str)
         .unwrap_or_default();
     if endpoint_id.is_empty()
-        || !matches!(category, "text-to-video" | "image-to-video")
+        || !DISCOVERY_CATEGORIES.contains(&category)
         || metadata
             .and_then(|value| value.get("status"))
             .and_then(Value::as_str)
@@ -1446,22 +1532,29 @@ fn normalize_fal_model(raw: &Value) -> Result<Option<VideoModel>, ProviderError>
     let Some(openapi) = raw.get("openapi") else {
         return Ok(None);
     };
-    let Some(input_schema) = openapi_input_schema(openapi) else {
-        return Ok(None);
-    };
-    let Some(output_schema) = openapi_output_schema(openapi) else {
+    let Some((input_schema, output_schema)) = openapi_inference_schemas(openapi, endpoint_id)?
+    else {
         return Ok(None);
     };
     let resolved_input = resolve_refs(&input_schema, openapi, 0)?;
     let resolved_output = resolve_refs(&output_schema, openapi, 0)?;
-    if !schema_has_video_url(&resolved_output) {
+    if !schema_has_unambiguous_video_output(&resolved_output) {
         return Ok(None);
     }
     let field_map = common_field_map(&resolved_input);
-    if !field_map.contains_key("prompt") {
+    let Some(prompt_name) = field_map.get("prompt") else {
+        return Ok(None);
+    };
+    let properties = schema_properties(&resolved_input);
+    if !properties
+        .get(prompt_name)
+        .is_some_and(schema_accepts_nullable_string)
+    {
         return Ok(None);
     }
-    let properties = schema_properties(&resolved_input);
+    let Some(media_bindings) = normalize_media_bindings(&resolved_input, &field_map) else {
+        return Ok(None);
+    };
     let enum_strings = |canonical: &str| {
         field_map
             .get(canonical)
@@ -1498,6 +1591,13 @@ fn normalize_fal_model(raw: &Value) -> Result<Option<VideoModel>, ProviderError>
         .into_iter()
         .filter(|field| field_map.contains_key(*field))
         .collect::<Vec<_>>();
+    let mut input_modalities = media_bindings
+        .iter()
+        .map(|binding| binding.kind)
+        .collect::<BTreeSet<_>>();
+    if !supported_frame_images.is_empty() {
+        input_modalities.insert(MediaKind::Image);
+    }
     let normalized = json!({
         "id": endpoint_id,
         "name": metadata.and_then(|value| value.get("display_name")).and_then(Value::as_str).unwrap_or(endpoint_id),
@@ -1507,6 +1607,8 @@ fn normalize_fal_model(raw: &Value) -> Result<Option<VideoModel>, ProviderError>
         "supported_sizes": enum_strings("size"),
         "supported_durations": durations,
         "supported_frame_images": supported_frame_images,
+        "input_modalities": input_modalities,
+        "media_bindings": media_bindings,
         "generate_audio": field_map.contains_key("generate_audio"),
         "seed": field_map.contains_key("seed"),
         "allowed_passthrough_parameters": properties.keys().cloned().collect::<Vec<_>>(),
@@ -1519,38 +1621,86 @@ fn normalize_fal_model(raw: &Value) -> Result<Option<VideoModel>, ProviderError>
         .map_err(|error| response_error(error.to_string()))
 }
 
-fn openapi_input_schema(openapi: &Value) -> Option<Value> {
-    openapi
-        .get("paths")?
-        .as_object()?
-        .values()
-        .find_map(|path| {
-            path.get("post")?
-                .get("requestBody")?
-                .get("content")?
-                .get("application/json")?
-                .get("schema")
-                .cloned()
-        })
-        .or_else(|| openapi.pointer("/components/schemas/Input").cloned())
+fn openapi_inference_schemas(
+    openapi: &Value,
+    endpoint_id: &str,
+) -> Result<Option<(Value, Value)>, ProviderError> {
+    let Some(paths) = openapi.get("paths").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let endpoint_path = format!("/{}", endpoint_id.trim_matches('/'));
+    let inference_path = if paths
+        .get(&endpoint_path)
+        .and_then(|path| path.get("post"))
+        .is_some()
+    {
+        endpoint_path.clone()
+    } else if paths.get("/").and_then(|path| path.get("post")).is_some() {
+        "/".to_owned()
+    } else {
+        let posts = paths
+            .iter()
+            .filter(|(_, path)| path.get("post").is_some())
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        if posts.len() != 1 {
+            return Ok(None);
+        }
+        posts[0].clone()
+    };
+    let Some(post) = paths.get(&inference_path).and_then(|path| path.get("post")) else {
+        return Ok(None);
+    };
+    let Some(input_schema) = post
+        .get("requestBody")
+        .and_then(|body| body.get("content"))
+        .and_then(|content| content.get("application/json"))
+        .and_then(|content| content.get("schema"))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    // A documented successful JSON response proves this is an invokable
+    // inference operation rather than an unrelated component schema.
+    let Some(post_response_schema) = success_json_schema(post) else {
+        return Ok(None);
+    };
+
+    let inference_base = inference_path.trim_end_matches('/');
+    let result_path = format!("{inference_base}/requests/{{request_id}}");
+    let output_schema = paths
+        .get(&result_path)
+        .and_then(|path| path.get("get"))
+        .and_then(success_json_schema)
+        .unwrap_or(post_response_schema);
+    // Resolve here only to ensure that a queue acknowledgement is never
+    // mistaken for the generated result when the paired result path is absent.
+    let resolved_output = resolve_refs(&output_schema, openapi, 0)?;
+    if !schema_has_unambiguous_video_output(&resolved_output) {
+        return Ok(None);
+    }
+    Ok(Some((input_schema, output_schema)))
 }
 
-fn openapi_output_schema(openapi: &Value) -> Option<Value> {
-    openapi
-        .get("paths")?
-        .as_object()?
-        .values()
-        .find_map(|path| {
-            let responses = path.get("post")?.get("responses")?.as_object()?;
-            ["200", "201"]
-                .into_iter()
-                .find_map(|code| responses.get(code))?
-                .get("content")?
-                .get("application/json")?
-                .get("schema")
-                .cloned()
+fn success_json_schema(operation: &Value) -> Option<Value> {
+    let responses = operation.get("responses")?.as_object()?;
+    let mut codes = responses
+        .keys()
+        .filter(|code| {
+            code.len() == 3
+                && code.starts_with('2')
+                && code.as_bytes().iter().all(u8::is_ascii_digit)
         })
-        .or_else(|| openapi.pointer("/components/schemas/Output").cloned())
+        .collect::<Vec<_>>();
+    codes.sort_unstable();
+    codes.into_iter().find_map(|code| {
+        responses
+            .get(code)?
+            .get("content")?
+            .get("application/json")?
+            .get("schema")
+            .cloned()
+    })
 }
 
 fn resolve_refs(value: &Value, root: &Value, depth: usize) -> Result<Value, ProviderError> {
@@ -1603,10 +1753,7 @@ fn common_field_map(schema: &Value) -> BTreeMap<String, String> {
         ("resolution", &["resolution", "video_resolution"]),
         ("aspect_ratio", &["aspect_ratio"]),
         ("size", &["size", "video_size"]),
-        (
-            "generate_audio",
-            &["generate_audio", "enable_audio", "audio"],
-        ),
+        ("generate_audio", &["generate_audio", "enable_audio"]),
         ("seed", &["seed"]),
         (
             "first_frame",
@@ -1642,29 +1789,384 @@ fn schema_properties(schema: &Value) -> Map<String, Value> {
     properties
 }
 
-fn schema_has_video_url(schema: &Value) -> bool {
-    fn walk(value: &Value, key: Option<&str>, seen_video: bool) -> bool {
-        match value {
-            Value::Object(object) => object.iter().any(|(child_key, value)| {
-                let video = seen_video
-                    || child_key.to_ascii_lowercase().contains("video")
-                    || object
-                        .get("contentMediaType")
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| value.starts_with("video/"));
-                let url = matches!(child_key.as_str(), "url" | "video_url" | "file_url")
-                    && value
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .is_some_and(|kind| kind == "string");
-                (url && (video || key.is_some_and(|key| key.contains("video"))))
-                    || walk(value, Some(child_key), video)
-            }),
-            Value::Array(values) => values.iter().any(|value| walk(value, key, seen_video)),
-            _ => false,
+fn schema_required(schema: &Value) -> BTreeSet<String> {
+    let mut required = BTreeSet::new();
+    if let Some(all_of) = schema.get("allOf").and_then(Value::as_array) {
+        for branch in all_of {
+            required.extend(schema_required(branch));
         }
     }
-    walk(schema, None, false)
+    required.extend(
+        schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned),
+    );
+    required
+}
+
+fn normalize_media_bindings(
+    schema: &Value,
+    field_map: &BTreeMap<String, String>,
+) -> Option<Vec<MediaBinding>> {
+    let properties = schema_properties(schema);
+    let required = schema_required(schema);
+
+    // A required media-shaped object or nested media structure cannot be
+    // represented by the first-release scalar/list URL editor.
+    for property_name in &required {
+        let Some(property_schema) = properties.get(property_name) else {
+            continue;
+        };
+        if media_kind_hint(property_name).is_some() {
+            let frame_field = ["first_frame", "last_frame"]
+                .into_iter()
+                .filter_map(|canonical| field_map.get(canonical))
+                .any(|name| name == property_name);
+            media_cardinality(property_schema)?;
+            if general_media_kind(property_name).is_none() && !frame_field {
+                return None;
+            }
+        } else if schema_contains_media_property(property_schema) {
+            return None;
+        }
+    }
+
+    let mut candidates = BTreeMap::<MediaKind, Vec<MediaBinding>>::new();
+    for property_name in ordered_property_names(schema, &properties) {
+        let Some(kind) = general_media_kind(&property_name) else {
+            continue;
+        };
+        let Some(property_schema) = properties.get(&property_name) else {
+            continue;
+        };
+        let Some(cardinality) = media_cardinality(property_schema) else {
+            if required.contains(&property_name) {
+                return None;
+            }
+            continue;
+        };
+        candidates.entry(kind).or_default().push(MediaBinding {
+            kind,
+            property_name: property_name.clone(),
+            cardinality,
+            required: required.contains(&property_name),
+            min_items: (cardinality == MediaCardinality::List)
+                .then(|| schema_array_keyword(property_schema, "minItems"))
+                .flatten(),
+            max_items: (cardinality == MediaCardinality::List)
+                .then(|| schema_array_keyword(property_schema, "maxItems"))
+                .flatten(),
+            title: normalized_schema_text(property_schema, "title"),
+            description: normalized_schema_text(property_schema, "description"),
+        });
+    }
+
+    // `image_url` and its start-frame aliases remain first-frame controls.
+    // When no separate image-reference field exists, they are also the one
+    // unambiguous scalar target for a general image reference.
+    if candidates.get(&MediaKind::Image).is_none_or(Vec::is_empty)
+        && let Some(property_name) = field_map.get("first_frame")
+        && let Some(property_schema) = properties.get(property_name)
+        && media_cardinality(property_schema) == Some(MediaCardinality::Scalar)
+    {
+        candidates
+            .entry(MediaKind::Image)
+            .or_default()
+            .push(MediaBinding {
+                kind: MediaKind::Image,
+                property_name: property_name.clone(),
+                cardinality: MediaCardinality::Scalar,
+                required: required.contains(property_name),
+                min_items: None,
+                max_items: None,
+                title: normalized_schema_text(property_schema, "title"),
+                description: normalized_schema_text(property_schema, "description"),
+            });
+    }
+
+    let mut bindings = Vec::new();
+    for kind in [MediaKind::Image, MediaKind::Video, MediaKind::Audio] {
+        let Some(mut same_kind) = candidates.remove(&kind) else {
+            continue;
+        };
+        if same_kind.len() == 1 {
+            bindings.push(same_kind.remove(0));
+        } else if same_kind.iter().any(|binding| binding.required) {
+            // Required same-kind fields cannot be populated without guessing
+            // which selected asset has which provider-specific purpose.
+            return None;
+        }
+        // Multiple optional same-kind targets are deliberately not advertised.
+    }
+    Some(bindings)
+}
+
+fn ordered_property_names(schema: &Value, properties: &Map<String, Value>) -> Vec<String> {
+    let mut names = schema
+        .get("x-fal-order-properties")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|name| properties.contains_key(*name))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let seen = names.iter().cloned().collect::<BTreeSet<_>>();
+    names.extend(
+        properties
+            .keys()
+            .filter(|name| !seen.contains(*name))
+            .cloned(),
+    );
+    names
+}
+
+fn general_media_kind(name: &str) -> Option<MediaKind> {
+    match name {
+        "image_urls" | "reference_image_url" | "reference_image_urls" | "reference_images" => {
+            Some(MediaKind::Image)
+        }
+        "video_url"
+        | "video_urls"
+        | "reference_video_url"
+        | "reference_video_urls"
+        | "control_video_url"
+        | "input_video_url"
+        | "source_video_url" => Some(MediaKind::Video),
+        "audio_url"
+        | "audio_urls"
+        | "reference_audio_url"
+        | "reference_audio_urls"
+        | "input_audio_url"
+        | "source_audio_url" => Some(MediaKind::Audio),
+        _ => None,
+    }
+}
+
+fn media_kind_hint(name: &str) -> Option<MediaKind> {
+    general_media_kind(name).or(match name {
+        "image" | "image_url" | "start_image_url" | "first_frame_url" | "end_image_url"
+        | "last_frame_url" => Some(MediaKind::Image),
+        "video" => Some(MediaKind::Video),
+        "audio" => Some(MediaKind::Audio),
+        _ => None,
+    })
+}
+
+fn schema_contains_media_property(schema: &Value) -> bool {
+    let properties = schema_properties(schema);
+    if properties.iter().any(|(name, child)| {
+        media_kind_hint(name).is_some() || schema_contains_media_property(child)
+    }) {
+        return true;
+    }
+    if let Some(items) = schema.get("items")
+        && schema_contains_media_property(items)
+    {
+        return true;
+    }
+    ["allOf", "anyOf", "oneOf"].into_iter().any(|keyword| {
+        schema
+            .get(keyword)
+            .and_then(Value::as_array)
+            .is_some_and(|branches| branches.iter().any(schema_contains_media_property))
+    })
+}
+
+fn normalized_schema_text(schema: &Value, key: &str) -> Option<String> {
+    let value = schema.get(key)?.as_str()?;
+    if value
+        .chars()
+        .any(|character| character.is_control() && !character.is_whitespace())
+    {
+        return None;
+    }
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn media_cardinality(schema: &Value) -> Option<MediaCardinality> {
+    if schema_accepts_nullable_string(schema) {
+        Some(MediaCardinality::Scalar)
+    } else if schema_accepts_nullable_array(schema)
+        && schema_array_items(schema).is_some_and(schema_accepts_nullable_string)
+    {
+        Some(MediaCardinality::List)
+    } else {
+        None
+    }
+}
+
+fn schema_explicit_types(schema: &Value) -> Option<BTreeSet<String>> {
+    if let Some(kind) = schema.get("type") {
+        let kinds = match kind {
+            Value::String(kind) => [kind.clone()].into_iter().collect(),
+            Value::Array(kinds) => kinds
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect(),
+            _ => return None,
+        };
+        return Some(kinds);
+    }
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
+            let mut kinds = BTreeSet::new();
+            for branch in branches {
+                kinds.extend(schema_explicit_types(branch)?);
+            }
+            return Some(kinds);
+        }
+    }
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        let mut typed = branches.iter().filter_map(schema_explicit_types);
+        let mut kinds = typed.next()?;
+        for branch_kinds in typed {
+            kinds = kinds.intersection(&branch_kinds).cloned().collect();
+        }
+        return Some(kinds);
+    }
+    None
+}
+
+fn schema_accepts_nullable_string(schema: &Value) -> bool {
+    schema_explicit_types(schema).is_some_and(|types| {
+        types.contains("string")
+            && types
+                .iter()
+                .all(|kind| matches!(kind.as_str(), "string" | "null"))
+    })
+}
+
+fn schema_accepts_nullable_array(schema: &Value) -> bool {
+    schema_explicit_types(schema).is_some_and(|types| {
+        types.contains("array")
+            && types
+                .iter()
+                .all(|kind| matches!(kind.as_str(), "array" | "null"))
+    })
+}
+
+fn schema_array_branch(schema: &Value) -> Option<&Value> {
+    if schema.get("type").is_some_and(|kind| match kind {
+        Value::String(kind) => kind == "array",
+        Value::Array(kinds) => kinds.iter().any(|kind| kind.as_str() == Some("array")),
+        _ => false,
+    }) {
+        return Some(schema);
+    }
+    ["anyOf", "oneOf", "allOf"].into_iter().find_map(|keyword| {
+        schema
+            .get(keyword)
+            .and_then(Value::as_array)?
+            .iter()
+            .find_map(schema_array_branch)
+    })
+}
+
+fn schema_array_items(schema: &Value) -> Option<&Value> {
+    schema_array_branch(schema)?.get("items")
+}
+
+fn schema_array_keyword(schema: &Value, keyword: &str) -> Option<usize> {
+    schema_array_branch(schema)?
+        .get(keyword)?
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+fn schema_has_unambiguous_video_output(schema: &Value) -> bool {
+    if schema_may_be_null(schema) || !schema_has_only_type(schema, "object") {
+        return false;
+    }
+    let required = schema_required(schema);
+    let properties = schema_properties(schema);
+    let mut video_fields = properties
+        .iter()
+        .filter(|(name, _)| output_name_is_video(name));
+    let Some((name, property_schema)) = video_fields.next() else {
+        return false;
+    };
+    video_fields.next().is_none()
+        && required.contains(name)
+        && schema_is_media_output(property_schema)
+}
+
+fn output_name_is_video(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "video" | "videos" | "video_url" | "video_urls"
+    ) || name.ends_with("_video")
+        || name.ends_with("_videos")
+        || name.ends_with("_video_url")
+        || name.ends_with("_video_urls")
+}
+
+fn schema_is_media_output(schema: &Value) -> bool {
+    if schema_may_be_null(schema) {
+        return false;
+    }
+    if schema_has_only_type(schema, "string") {
+        return true;
+    }
+    if !schema_has_only_type(schema, "object") {
+        return false;
+    }
+    let properties = schema_properties(schema);
+    let required = schema_required(schema);
+    let mut url_fields = properties.iter().filter(|(name, child)| {
+        matches!(name.as_str(), "url" | "file_url" | "video_url")
+            && !schema_may_be_null(child)
+            && schema_has_only_type(child, "string")
+    });
+    if let Some((name, _)) = url_fields.next() {
+        return required.contains(name) && url_fields.next().is_none();
+    }
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
+            let media_branches = branches
+                .iter()
+                .filter(|branch| !schema_is_null_only(branch))
+                .collect::<Vec<_>>();
+            return !media_branches.is_empty()
+                && media_branches
+                    .iter()
+                    .all(|branch| schema_is_media_output(branch));
+        }
+    }
+    schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|branches| branches.iter().any(schema_is_media_output))
+}
+
+fn schema_has_only_type(schema: &Value, expected: &str) -> bool {
+    schema_explicit_types(schema).is_some_and(|types| types.len() == 1 && types.contains(expected))
+}
+
+fn schema_may_be_null(schema: &Value) -> bool {
+    schema.get("nullable").and_then(Value::as_bool) == Some(true)
+        || schema.get("type").is_some_and(|kind| match kind {
+            Value::String(kind) => kind == "null",
+            Value::Array(kinds) => kinds.iter().any(|kind| kind.as_str() == Some("null")),
+            _ => false,
+        })
+        || ["anyOf", "oneOf", "allOf"].into_iter().any(|keyword| {
+            schema
+                .get(keyword)
+                .and_then(Value::as_array)
+                .is_some_and(|branches| branches.iter().any(schema_may_be_null))
+        })
+}
+
+fn schema_is_null_only(schema: &Value) -> bool {
+    schema_explicit_types(schema).is_some_and(|types| types.len() == 1 && types.contains("null"))
 }
 
 fn validate_schema(schema: &Value, value: &Value, path: &str) -> Result<(), ProviderError> {
@@ -1918,7 +2420,14 @@ fn fal_result_job(
     status_payload: &Value,
     result_payload: &Value,
 ) -> Result<VideoJob, ProviderError> {
-    let data = result_payload.get("data").unwrap_or(result_payload);
+    let has_outer_video_field = result_payload
+        .as_object()
+        .is_some_and(|object| object.keys().any(|name| output_name_is_video(name)));
+    let data = if has_outer_video_field {
+        result_payload
+    } else {
+        result_payload.get("data").unwrap_or(result_payload)
+    };
     let artifacts = extract_video_artifacts(data);
     if artifacts.len() != 1 {
         return Err(response_error(
@@ -1961,60 +2470,301 @@ fn fal_result_job(
 }
 
 fn extract_video_artifacts(value: &Value) -> Vec<VideoArtifact> {
-    fn collect(value: &Value, video_context: bool, output: &mut Vec<(String, Option<String>)>) {
-        match value {
-            Value::Object(object) => {
-                let content_type = object
-                    .get("content_type")
-                    .or_else(|| object.get("mime_type"))
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
-                let context = video_context
-                    || content_type
-                        .as_deref()
-                        .is_some_and(|value| value.starts_with("video/"));
-                if let Some(url) = object.get("url").and_then(Value::as_str) {
-                    let extension = url.split('?').next().is_some_and(|value| {
-                        [".mp4", ".webm", ".mov", ".mkv"]
-                            .iter()
-                            .any(|ext| value.ends_with(ext))
-                    });
-                    if context || extension {
-                        output.push((url.to_owned(), content_type));
-                    }
-                }
-                for (key, value) in object {
-                    collect(
-                        value,
-                        context || key.to_ascii_lowercase().contains("video"),
-                        output,
-                    );
-                }
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    let mut video_fields = object.iter().filter(|(name, _)| output_name_is_video(name));
+    let Some((_, output)) = video_fields.next() else {
+        return Vec::new();
+    };
+    if video_fields.next().is_some() {
+        return Vec::new();
+    }
+
+    let (url, content_type) = match output {
+        Value::String(url) => (url.clone(), None),
+        Value::Object(file) => {
+            let mut urls = ["url", "file_url", "video_url"]
+                .into_iter()
+                .filter_map(|name| file.get(name).and_then(Value::as_str));
+            let Some(url) = urls.next() else {
+                return Vec::new();
+            };
+            if urls.next().is_some() {
+                return Vec::new();
             }
-            Value::Array(values) => {
-                for value in values {
-                    collect(value, video_context, output);
-                }
-            }
-            Value::String(url) if video_context && url.starts_with("https://") => {
-                output.push((url.clone(), None));
-            }
-            _ => {}
+            let content_type = file
+                .get("content_type")
+                .or_else(|| file.get("mime_type"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            (url.to_owned(), content_type)
+        }
+        _ => return Vec::new(),
+    };
+    let Ok(mut artifact) = VideoArtifact::new(url, 0) else {
+        return Vec::new();
+    };
+    artifact.content_type = content_type;
+    vec![artifact]
+}
+
+fn bind_media_references(
+    input: &mut Map<String, Value>,
+    model: &VideoModel,
+    request: &VideoRequest,
+) -> Result<(), ProviderError> {
+    let seedance = is_seedance_2_endpoint(&model.id);
+    let total = request
+        .frame_images
+        .len()
+        .saturating_add(request.input_references.len());
+    let has_explicit_higher_maximum = !seedance
+        && model.media_bindings.iter().any(|binding| {
+            request
+                .input_references
+                .iter()
+                .any(|reference| MediaKind::from(reference.kind) == binding.kind)
+                && binding.cardinality == MediaCardinality::List
+                && binding
+                    .max_items
+                    .is_some_and(|maximum| maximum > media_input_limit(binding.kind))
+        });
+    if total > MAX_INPUT_MEDIA && !has_explicit_higher_maximum {
+        return Err(validation(format!(
+            "fal requests accept at most {MAX_INPUT_MEDIA} input media items"
+        )));
+    }
+    if seedance {
+        let has_audio = request
+            .input_references
+            .iter()
+            .any(|reference| MediaKind::from(reference.kind) == MediaKind::Audio);
+        let has_visual = !request.frame_images.is_empty()
+            || request.input_references.iter().any(|reference| {
+                matches!(
+                    MediaKind::from(reference.kind),
+                    MediaKind::Image | MediaKind::Video
+                )
+            });
+        if has_audio && !has_visual {
+            return Err(validation(
+                "Seedance 2.0 audio input requires at least one image or video input",
+            ));
         }
     }
-    let mut values = Vec::new();
-    collect(value, false, &mut values);
-    values.sort();
-    values.dedup_by(|left, right| left.0 == right.0);
-    values
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, (url, content_type))| {
-            let mut artifact = VideoArtifact::new(url, index).ok()?;
-            artifact.content_type = content_type;
-            Some(artifact)
-        })
-        .collect()
+
+    for kind in [MediaKind::Image, MediaKind::Video, MediaKind::Audio] {
+        let urls = request
+            .input_references
+            .iter()
+            .filter(|reference| MediaKind::from(reference.kind) == kind)
+            .map(|reference| reference.url.clone())
+            .collect::<Vec<_>>();
+        let count = urls.len()
+            + if kind == MediaKind::Image {
+                request.frame_images.len()
+            } else {
+                0
+            };
+        let application_maximum = media_input_limit(kind);
+        if seedance && count > application_maximum {
+            return Err(validation(format!(
+                "fal requests accept at most {application_maximum} {kind} input item(s)"
+            )));
+        }
+
+        let mut bindings = model
+            .media_bindings
+            .iter()
+            .filter(|binding| binding.kind == kind);
+        let binding = bindings.next();
+        let ambiguous = bindings.next().is_some();
+        if urls.is_empty() {
+            if !ambiguous
+                && let Some(binding) = binding
+                && binding.required
+                && binding.cardinality == MediaCardinality::List
+                && binding.min_items == Some(0)
+                && !input.contains_key(&binding.property_name)
+            {
+                input.insert(binding.property_name.clone(), Value::Array(Vec::new()));
+            }
+            continue;
+        }
+
+        let Some(binding) = binding else {
+            return Err(validation(format!(
+                "This fal model does not expose an unambiguous top-level {kind} input"
+            )));
+        };
+        if ambiguous {
+            return Err(validation(format!(
+                "This fal model has ambiguous top-level {kind} inputs"
+            )));
+        }
+        if input.contains_key(&binding.property_name) {
+            return Err(validation(format!(
+                "{} cannot be used by both frame media and {kind} references",
+                binding.property_name
+            )));
+        }
+
+        let value = match binding.cardinality {
+            MediaCardinality::Scalar => {
+                if urls.len() != 1 {
+                    return Err(validation(format!(
+                        "{} accepts exactly one {kind} input",
+                        binding.property_name
+                    )));
+                }
+                Value::String(urls.into_iter().next().unwrap_or_default())
+            }
+            MediaCardinality::List => {
+                if binding
+                    .min_items
+                    .is_some_and(|minimum| urls.len() < minimum)
+                {
+                    return Err(validation(format!(
+                        "{} requires at least {} {kind} input item(s)",
+                        binding.property_name,
+                        binding.min_items.unwrap_or_default()
+                    )));
+                }
+                if let Some(maximum) = binding.max_items
+                    && urls.len() > maximum
+                {
+                    return Err(validation(format!(
+                        "{} accepts at most {maximum} {kind} input item(s)",
+                        binding.property_name
+                    )));
+                }
+                if binding.max_items.is_none() && count > application_maximum {
+                    return Err(validation(format!(
+                        "fal requests accept at most {application_maximum} {kind} input item(s)"
+                    )));
+                }
+                Value::Array(urls.into_iter().map(Value::String).collect())
+            }
+        };
+        input.insert(binding.property_name.clone(), value);
+    }
+
+    for binding in model
+        .media_bindings
+        .iter()
+        .filter(|binding| binding.required)
+    {
+        if !input.contains_key(&binding.property_name) {
+            return Err(validation(format!(
+                "{} requires a {} input",
+                binding.property_name, binding.kind
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn apply_request_quote_uncertainty(
+    request: &VideoRequest,
+    basis: &mut String,
+    confidence: &mut QuoteConfidence,
+) {
+    if !request.frame_images.is_empty() || !request.input_references.is_empty() {
+        if *confidence == QuoteConfidence::Exact {
+            *confidence = QuoteConfidence::Estimated;
+        }
+        basis.push_str("; input media may affect final provider usage");
+    }
+    if request
+        .adapter_options
+        .as_ref()
+        .and_then(Value::as_object)
+        .is_some_and(|options| !options.is_empty())
+    {
+        if *confidence == QuoteConfidence::Exact {
+            *confidence = QuoteConfidence::Estimated;
+        }
+        basis.push_str("; advanced provider-specific options may affect final usage");
+    }
+}
+
+const fn media_input_limit(kind: MediaKind) -> usize {
+    match kind {
+        MediaKind::Image => MAX_IMAGE_INPUTS,
+        MediaKind::Video => MAX_VIDEO_INPUTS,
+        MediaKind::Audio => MAX_AUDIO_INPUTS,
+    }
+}
+
+fn is_seedance_2_endpoint(endpoint_id: &str) -> bool {
+    let endpoint_id = endpoint_id.to_ascii_lowercase();
+    endpoint_id.starts_with("bytedance/seedance-2.0") || endpoint_id.contains("/seedance-2.0/")
+}
+
+fn validate_seedance_staged_media_constraints(
+    draft: &crate::domain::GenerationDraft,
+    staged_media: &[StagedMedia],
+) -> Result<(), ProviderError> {
+    if draft.media.len() != staged_media.len() {
+        return Err(validation(
+            "Every fal draft media item must have a matching staged result",
+        ));
+    }
+
+    let seedance = is_seedance_2_endpoint(&draft.model);
+    let mut local_video_bytes = 0u64;
+    for (draft_media, staged) in draft.media.iter().zip(staged_media) {
+        staged
+            .validate()
+            .map_err(|error| validation(error.to_string()))?;
+        if draft_media.role != staged.role {
+            return Err(validation(
+                "fal staged media order or role does not match the draft",
+            ));
+        }
+        let MediaSource::LocalFile { .. } = &draft_media.source else {
+            // Remote URL sizes cannot be verified without fetching them.
+            continue;
+        };
+        let receipt = staged
+            .receipt
+            .as_ref()
+            .ok_or_else(|| validation("Local fal media is missing its matching upload receipt"))?;
+        if receipt.provider_id != ProviderId::fal() {
+            return Err(validation(
+                "Local fal media has a receipt from a different provider",
+            ));
+        }
+        if !seedance {
+            continue;
+        }
+        match draft_media.role.kind() {
+            MediaKind::Image if receipt.size_bytes > SEEDANCE_MAX_IMAGE_BYTES => {
+                return Err(validation(format!(
+                    "Seedance 2.0 image inputs must be at most {} MB each",
+                    SEEDANCE_MAX_IMAGE_BYTES / 1_000_000
+                )));
+            }
+            MediaKind::Video => {
+                local_video_bytes = local_video_bytes.saturating_add(receipt.size_bytes);
+            }
+            MediaKind::Audio if receipt.size_bytes > SEEDANCE_MAX_AUDIO_BYTES => {
+                return Err(validation(format!(
+                    "Seedance 2.0 audio inputs must be at most {} MB each",
+                    SEEDANCE_MAX_AUDIO_BYTES / 1_000_000
+                )));
+            }
+            MediaKind::Image | MediaKind::Audio => {}
+        }
+    }
+    if seedance && local_video_bytes >= SEEDANCE_MAX_VIDEO_BYTES {
+        return Err(validation(format!(
+            "Seedance 2.0 local video inputs must total less than {} MB",
+            SEEDANCE_MAX_VIDEO_BYTES / 1_000_000
+        )));
+    }
+    Ok(())
 }
 
 fn insert_common(
@@ -2111,58 +2861,19 @@ fn normalize_base(url: &mut Url) {
 }
 
 fn validate_download_url(url: &Url) -> Result<(), ProviderError> {
-    if url.scheme() != "https"
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        return Err(unsafe_endpoint(
-            "Video URL must be public HTTPS without credentials",
-        ));
-    }
-    Ok(())
+    validate_public_https_url(url.as_str(), "Video URL")
+        .map_err(|_| unsafe_endpoint("Video URL must use a public HTTPS host without credentials"))
 }
 
 fn validate_upload_url(url: &Url) -> Result<(), ProviderError> {
-    if url.scheme() != "https"
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
+    if url.fragment().is_some() {
         return Err(unsafe_endpoint(
-            "fal CDN upload URL must be public HTTPS without credentials",
+            "fal CDN upload URL must not contain a fragment",
         ));
     }
-    let host = url.host_str().unwrap_or_default();
-    if host.eq_ignore_ascii_case("localhost")
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-    {
-        return Err(unsafe_endpoint("fal CDN returned a local upload host"));
-    }
-    if let Ok(address) = host.parse::<std::net::IpAddr>() {
-        let unsafe_address = match address {
-            std::net::IpAddr::V4(address) => {
-                address.is_private()
-                    || address.is_loopback()
-                    || address.is_link_local()
-                    || address.is_unspecified()
-                    || address.is_broadcast()
-                    || address.is_documentation()
-            }
-            std::net::IpAddr::V6(address) => {
-                address.is_loopback()
-                    || address.is_unspecified()
-                    || address.is_unique_local()
-                    || address.is_unicast_link_local()
-            }
-        };
-        if unsafe_address {
-            return Err(unsafe_endpoint("fal CDN returned a non-public upload host"));
-        }
-    }
-    Ok(())
+    validate_public_https_url(url.as_str(), "fal CDN upload URL").map_err(|_| {
+        unsafe_endpoint("fal CDN upload URL must use a public HTTPS host without credentials")
+    })
 }
 
 fn upload_child_url(base: &Url, suffix: &str) -> Result<Url, ProviderError> {
@@ -2171,6 +2882,58 @@ fn upload_child_url(base: &Url, suffix: &str) -> Result<Url, ProviderError> {
     let path = format!("{}/{}", base.path().trim_end_matches('/'), suffix);
     url.set_path(&path);
     Ok(url)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalFileSnapshot {
+    size_bytes: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+async fn local_file_snapshot(path: &Path) -> Result<LocalFileSnapshot, ProviderError> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|error| validation(format!("Could not inspect local media: {error}")))?;
+    if !metadata.is_file() {
+        return Err(validation("Local media path is not a regular file"));
+    }
+    let modified = metadata
+        .modified()
+        .map_err(|error| validation(format!("Could not inspect local media mtime: {error}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(LocalFileSnapshot {
+            size_bytes: metadata.len(),
+            modified,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(LocalFileSnapshot {
+            size_bytes: metadata.len(),
+            modified,
+        })
+    }
+}
+
+async fn ensure_local_file_unchanged(
+    path: &Path,
+    expected: &LocalFileSnapshot,
+) -> Result<(), ProviderError> {
+    let current = local_file_snapshot(path).await?;
+    if &current != expected {
+        return Err(validation(
+            "Local media changed while fal was preparing its upload; Review again",
+        ));
+    }
+    Ok(())
 }
 
 fn media_content_type(path: &Path) -> String {
@@ -2187,10 +2950,10 @@ fn media_content_type(path: &Path) -> String {
         Some("avif") => "image/avif",
         Some("bmp") => "image/bmp",
         Some("tif" | "tiff") => "image/tiff",
-        Some("mp4" | "m4v") => "video/mp4",
-        Some("webm") => "video/webm",
+        Some("mp4") => "video/mp4",
         Some("mov") => "video/quicktime",
-        Some("mkv") => "video/x-matroska",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
         _ => "application/octet-stream",
     }
     .into()
@@ -2361,6 +3124,1031 @@ fn submission_uncertain_from_http(mut error: ProviderError) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{GenerationDraft, InputReference, InputReferenceKind, MediaRole};
+    use tempfile::tempdir;
+
+    fn schema_model(endpoint_id: &str, category: &str, input: Value, output: Value) -> Value {
+        let endpoint_path = format!("/{endpoint_id}");
+        let result_path = format!("/{endpoint_id}/requests/{{request_id}}");
+        let mut paths = Map::new();
+        paths.insert(
+            endpoint_path,
+            json!({
+                "post": {
+                    "requestBody": {
+                        "content": {"application/json": {"schema": input}}
+                    },
+                    "responses": {
+                        "200": {
+                            "content": {"application/json": {"schema": {
+                                "type": "object",
+                                "properties": {"request_id": {"type": "string"}}
+                            }}}
+                        }
+                    }
+                }
+            }),
+        );
+        paths.insert(
+            result_path,
+            json!({
+                "get": {
+                    "responses": {
+                        "201": {"content": {"application/json": {"schema": output}}}
+                    }
+                }
+            }),
+        );
+        paths.insert(
+            "/unrelated/utility".into(),
+            json!({
+                "post": {
+                    "requestBody": {"content": {"application/json": {"schema": {
+                        "type": "object",
+                        "properties": {"text": {"type": "object"}}
+                    }}}},
+                    "responses": {"200": {"content": {"application/json": {"schema": {
+                        "type": "object",
+                        "properties": {"not_video": {"type": "string"}}
+                    }}}}}
+                }
+            }),
+        );
+        json!({
+            "endpoint_id": endpoint_id,
+            "metadata": {
+                "display_name": "Schema fixture",
+                "description": "Offline fixture",
+                "category": category,
+                "status": "active"
+            },
+            "openapi": {"openapi": "3.0.4", "paths": paths}
+        })
+    }
+
+    fn video_output_schema() -> Value {
+        json!({
+            "type": "object",
+            "required": ["video"],
+            "properties": {
+                "video": {
+                    "type": "object",
+                    "required": ["url"],
+                    "properties": {"url": {"type": "string"}}
+                }
+            }
+        })
+    }
+
+    fn typed_binding_model(id: &str) -> VideoModel {
+        VideoModel::from_provider_api(
+            ProviderId::fal(),
+            &json!({
+                "id": id,
+                "name": "Typed binding fixture",
+                "input_modalities": ["image", "video", "audio"],
+                "media_bindings": [
+                    {
+                        "kind": "image",
+                        "property_name": "image_urls",
+                        "cardinality": "list",
+                        "max_items": 9
+                    },
+                    {
+                        "kind": "video",
+                        "property_name": "video_urls",
+                        "cardinality": "list",
+                        "max_items": 3
+                    },
+                    {
+                        "kind": "audio",
+                        "property_name": "audio_urls",
+                        "cardinality": "list",
+                        "max_items": 3
+                    }
+                ],
+                "field_map": {"prompt": "prompt"}
+            }),
+        )
+        .expect("typed binding fixture")
+    }
+
+    fn single_list_binding_model(
+        id: &str,
+        kind: MediaKind,
+        property_name: &str,
+        required: bool,
+        min_items: Option<usize>,
+        max_items: Option<usize>,
+    ) -> VideoModel {
+        let mut binding = json!({
+            "kind": kind.as_str(),
+            "property_name": property_name,
+            "cardinality": "list",
+            "required": required
+        });
+        if let Some(minimum) = min_items {
+            binding["min_items"] = json!(minimum);
+        }
+        if let Some(maximum) = max_items {
+            binding["max_items"] = json!(maximum);
+        }
+        VideoModel::from_provider_api(
+            ProviderId::fal(),
+            &json!({
+                "id": id,
+                "name": "List binding fixture",
+                "input_modalities": [kind.as_str()],
+                "media_bindings": [binding],
+                "field_map": {"prompt": "prompt"}
+            }),
+        )
+        .expect("list binding fixture")
+    }
+
+    #[test]
+    fn discovery_includes_all_prompt_driven_video_categories() {
+        assert_eq!(
+            DISCOVERY_CATEGORIES,
+            [
+                "text-to-video",
+                "image-to-video",
+                "video-to-video",
+                "audio-to-video"
+            ]
+        );
+    }
+
+    #[test]
+    fn actual_inference_schema_normalizes_typed_top_level_media() {
+        let raw = schema_model(
+            "fal-ai/fixture/video-to-video",
+            "video-to-video",
+            json!({
+                "type": "object",
+                "required": ["video_url"],
+                "x-fal-order-properties": ["prompt", "video_url", "image_urls", "audio_urls"],
+                "properties": {
+                    // The app always supplies a creative prompt; fal schemas
+                    // may describe it as optional or conditionally required.
+                    "prompt": {"type": "string"},
+                    "video_url": {
+                        "type": "string",
+                        "title": "Source video",
+                        "description": "Video to transform"
+                    },
+                    "image_urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 9
+                    },
+                    "audio_urls": {
+                        "anyOf": [
+                            {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3},
+                            {"type": "null"}
+                        ]
+                    }
+                }
+            }),
+            video_output_schema(),
+        );
+        let model = normalize_fal_model(&raw)
+            .expect("valid schema")
+            .expect("generative video model");
+        assert_eq!(
+            model.input_modalities,
+            Some(vec![MediaKind::Image, MediaKind::Video, MediaKind::Audio])
+        );
+        assert_eq!(model.media_bindings.len(), 3);
+        assert_eq!(model.media_bindings[0].property_name, "image_urls");
+        assert_eq!(model.media_bindings[1].property_name, "video_url");
+        assert_eq!(
+            model.media_bindings[1].cardinality,
+            MediaCardinality::Scalar
+        );
+        assert!(model.media_bindings[1].required);
+        assert_eq!(
+            model.media_bindings[1].title.as_deref(),
+            Some("Source video")
+        );
+        assert_eq!(model.media_bindings[2].property_name, "audio_urls");
+        assert_eq!(model.media_bindings[2].min_items, Some(1));
+        assert_eq!(model.media_bindings[2].max_items, Some(3));
+    }
+
+    #[test]
+    fn endpoint_alias_uses_the_selected_post_path_for_its_result_schema() {
+        let endpoint_id = "bytedance/seedance-2.0/reference-to-video";
+        let mut raw = schema_model(
+            endpoint_id,
+            "image-to-video",
+            json!({
+                "type": "object",
+                "required": ["prompt"],
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "image_urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 9
+                    },
+                    "video_urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 3
+                    },
+                    "audio_urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 3
+                    }
+                }
+            }),
+            video_output_schema(),
+        );
+        let paths = raw["openapi"]["paths"]
+            .as_object_mut()
+            .expect("fixture paths");
+        let advertised_post = format!("/{endpoint_id}");
+        let advertised_result = format!("/{endpoint_id}/requests/{{request_id}}");
+        let post = paths.remove(&advertised_post).expect("advertised POST");
+        let result = paths
+            .remove(&advertised_result)
+            .expect("advertised result GET");
+        paths.remove("/unrelated/utility");
+        paths.insert("/fal-ai/seedance-2/reference-to-video".into(), post);
+        paths.insert(
+            "/fal-ai/seedance-2/reference-to-video/requests/{request_id}".into(),
+            result,
+        );
+
+        let model = normalize_fal_model(&raw)
+            .expect("valid alias schema")
+            .expect("alias model included");
+        assert_eq!(model.id, endpoint_id);
+        assert_eq!(
+            model
+                .media_bindings
+                .iter()
+                .map(|binding| binding.property_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["image_urls", "video_urls", "audio_urls"]
+        );
+    }
+
+    #[test]
+    fn only_required_scalar_video_outputs_enter_the_catalog() {
+        let input = json!({
+            "type": "object",
+            "required": ["prompt"],
+            "properties": {"prompt": {"type": "string"}}
+        });
+        let required_scalar = schema_model(
+            "fal-ai/fixture/required-scalar",
+            "text-to-video",
+            input.clone(),
+            video_output_schema(),
+        );
+        assert!(
+            normalize_fal_model(&required_scalar)
+                .expect("schema")
+                .is_some()
+        );
+
+        let optional_scalar = schema_model(
+            "fal-ai/fixture/optional-scalar",
+            "text-to-video",
+            input.clone(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "video": {
+                        "type": "object",
+                        "required": ["url"],
+                        "properties": {"url": {"type": "string"}}
+                    }
+                }
+            }),
+        );
+        assert!(
+            normalize_fal_model(&optional_scalar)
+                .expect("schema")
+                .is_none()
+        );
+
+        let optional_nested_url = schema_model(
+            "fal-ai/fixture/optional-nested-url",
+            "text-to-video",
+            input.clone(),
+            json!({
+                "type": "object",
+                "required": ["video"],
+                "properties": {
+                    "video": {
+                        "type": "object",
+                        "properties": {"url": {"type": "string"}}
+                    }
+                }
+            }),
+        );
+        assert!(
+            normalize_fal_model(&optional_nested_url)
+                .expect("schema")
+                .is_none()
+        );
+
+        let optional_second_file_url = schema_model(
+            "fal-ai/fixture/optional-second-file-url",
+            "text-to-video",
+            input.clone(),
+            json!({
+                "type": "object",
+                "required": ["video"],
+                "properties": {
+                    "video": {
+                        "type": "object",
+                        "required": ["url"],
+                        "properties": {
+                            "url": {"type": "string"},
+                            "file_url": {"type": "string"}
+                        }
+                    }
+                }
+            }),
+        );
+        assert!(
+            normalize_fal_model(&optional_second_file_url)
+                .expect("schema")
+                .is_none()
+        );
+
+        let all_of_required_nested_url = schema_model(
+            "fal-ai/fixture/all-of-required-nested-url",
+            "text-to-video",
+            input.clone(),
+            json!({
+                "type": "object",
+                "required": ["video"],
+                "properties": {
+                    "video": {
+                        "allOf": [
+                            {
+                                "type": "object",
+                                "properties": {"url": {"type": "string"}}
+                            },
+                            {"required": ["url"]}
+                        ]
+                    }
+                }
+            }),
+        );
+        assert!(
+            normalize_fal_model(&all_of_required_nested_url)
+                .expect("schema")
+                .is_some()
+        );
+
+        let generic_mime_output = schema_model(
+            "fal-ai/fixture/generic-mime-output",
+            "text-to-video",
+            input.clone(),
+            json!({
+                "type": "object",
+                "required": ["output"],
+                "properties": {
+                    "output": {
+                        "type": "string",
+                        "contentMediaType": "video/mp4"
+                    }
+                }
+            }),
+        );
+        assert!(
+            normalize_fal_model(&generic_mime_output)
+                .expect("schema")
+                .is_none()
+        );
+
+        let optional_second_video = schema_model(
+            "fal-ai/fixture/optional-second-video",
+            "text-to-video",
+            input.clone(),
+            json!({
+                "type": "object",
+                "required": ["video"],
+                "properties": {
+                    "video": {"type": "string"},
+                    "preview_videos": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                }
+            }),
+        );
+        assert!(
+            normalize_fal_model(&optional_second_video)
+                .expect("schema")
+                .is_none()
+        );
+
+        let array_output = schema_model(
+            "fal-ai/fixture/video-array",
+            "text-to-video",
+            input,
+            json!({
+                "type": "object",
+                "required": ["videos"],
+                "properties": {
+                    "videos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["url"],
+                            "properties": {"url": {"type": "string"}}
+                        }
+                    }
+                }
+            }),
+        );
+        assert!(
+            normalize_fal_model(&array_output)
+                .expect("schema")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn nullable_or_untyped_result_shapes_are_excluded() {
+        let input = json!({
+            "type": "object",
+            "required": ["prompt"],
+            "properties": {"prompt": {"type": "string"}}
+        });
+        let fixtures = [
+            (
+                "top-nullable",
+                json!({
+                    "type": "object",
+                    "nullable": true,
+                    "required": ["video"],
+                    "properties": {"video": {"type": "string"}}
+                }),
+            ),
+            (
+                "top-object-null-union",
+                json!({
+                    "type": ["object", "null"],
+                    "required": ["video"],
+                    "properties": {"video": {"type": "string"}}
+                }),
+            ),
+            (
+                "top-any-of-null",
+                json!({
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "required": ["video"],
+                            "properties": {"video": {"type": "string"}}
+                        },
+                        {"type": "null"}
+                    ]
+                }),
+            ),
+            (
+                "top-untyped",
+                json!({
+                    "required": ["video"],
+                    "properties": {"video": {"type": "string"}}
+                }),
+            ),
+            (
+                "scalar-nullable",
+                json!({
+                    "type": "object",
+                    "required": ["video"],
+                    "properties": {"video": {"type": "string", "nullable": true}}
+                }),
+            ),
+            (
+                "file-nullable",
+                json!({
+                    "type": "object",
+                    "required": ["video"],
+                    "properties": {
+                        "video": {
+                            "type": "object",
+                            "nullable": true,
+                            "required": ["url"],
+                            "properties": {"url": {"type": "string"}}
+                        }
+                    }
+                }),
+            ),
+            (
+                "file-url-nullable",
+                json!({
+                    "type": "object",
+                    "required": ["video"],
+                    "properties": {
+                        "video": {
+                            "type": "object",
+                            "required": ["url"],
+                            "properties": {
+                                "url": {"type": "string", "nullable": true}
+                            }
+                        }
+                    }
+                }),
+            ),
+            (
+                "file-untyped",
+                json!({
+                    "type": "object",
+                    "required": ["video"],
+                    "properties": {
+                        "video": {
+                            "required": ["url"],
+                            "properties": {"url": {"type": "string"}}
+                        }
+                    }
+                }),
+            ),
+        ];
+
+        for (name, output) in fixtures {
+            let raw = schema_model(
+                &format!("fal-ai/fixture/{name}"),
+                "text-to-video",
+                input.clone(),
+                output,
+            );
+            assert!(
+                normalize_fal_model(&raw).expect("schema").is_none(),
+                "admitted nullable or untyped output fixture {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn result_extraction_uses_only_the_one_top_level_video_output() {
+        let status = json!({"status": "COMPLETED"});
+        let generic = fal_result_job(
+            "fal-ai/fixture/generic-output",
+            "request-generic",
+            &status,
+            &json!({"output": "https://cdn.fal.media/signed?id=generic"}),
+        )
+        .expect_err("generic scalar output must not be inferred as video");
+        assert_eq!(generic.kind, ProviderErrorKind::Response);
+
+        let main_url = "https://cdn.fal.media/signed?id=main";
+        let job = fal_result_job(
+            "fal-ai/fixture/video-output",
+            "request-video",
+            &status,
+            &json!({
+                "video": {
+                    "url": main_url,
+                    "preview_url": "https://cdn.fal.media/signed?id=preview"
+                },
+                "metadata": {
+                    "input_video_url": "https://cdn.fal.media/signed?id=input"
+                },
+                "data": {
+                    "metadata": {
+                        "input_video_url": "https://cdn.fal.media/signed?id=wrapped-input"
+                    }
+                }
+            }),
+        )
+        .expect("one authoritative video output");
+        assert_eq!(job.artifacts.len(), 1);
+        assert_eq!(job.artifacts[0].url, main_url);
+    }
+
+    #[test]
+    fn promptless_and_required_nested_media_utilities_are_excluded() {
+        let promptless = schema_model(
+            "fal-ai/fixture/lipsync",
+            "audio-to-video",
+            json!({
+                "type": "object",
+                "required": ["video_url", "audio_url"],
+                "properties": {
+                    "video_url": {"type": "string"},
+                    "audio_url": {"type": "string"}
+                }
+            }),
+            video_output_schema(),
+        );
+        assert!(normalize_fal_model(&promptless).expect("schema").is_none());
+
+        let nested = schema_model(
+            "fal-ai/fixture/nested",
+            "video-to-video",
+            json!({
+                "type": "object",
+                "required": ["prompt", "elements"],
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "elements": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["video_url"],
+                            "properties": {"video_url": {"type": "string"}}
+                        }
+                    }
+                }
+            }),
+            video_output_schema(),
+        );
+        assert!(normalize_fal_model(&nested).expect("schema").is_none());
+    }
+
+    #[test]
+    fn optional_nested_and_ambiguous_optional_media_are_not_advertised() {
+        let raw = schema_model(
+            "fal-ai/fixture/optional-nested",
+            "text-to-video",
+            json!({
+                "type": "object",
+                "required": ["prompt"],
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "elements": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"video_url": {"type": "string"}}
+                        }
+                    },
+                    "video_url": {"type": "string"},
+                    "control_video_url": {"type": "string"}
+                }
+            }),
+            video_output_schema(),
+        );
+        let model = normalize_fal_model(&raw)
+            .expect("schema")
+            .expect("optional settings do not exclude generator");
+        assert!(model.media_bindings.is_empty());
+        assert_eq!(model.input_modalities, Some(Vec::new()));
+    }
+
+    #[test]
+    fn required_ambiguous_same_kind_media_excludes_model() {
+        let raw = schema_model(
+            "fal-ai/fixture/ambiguous",
+            "video-to-video",
+            json!({
+                "type": "object",
+                "required": ["prompt", "video_url"],
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "video_url": {"type": "string"},
+                    "control_video_url": {"type": "string"}
+                }
+            }),
+            video_output_schema(),
+        );
+        assert!(normalize_fal_model(&raw).expect("schema").is_none());
+    }
+
+    #[test]
+    fn typed_reference_lists_preserve_order_within_each_kind() {
+        let model = typed_binding_model("fal-ai/fixture/mixed");
+        let mut request =
+            VideoRequest::for_provider(ProviderId::fal(), &model.id, "A mixed-media fixture")
+                .expect("request");
+        for (url, kind) in [
+            (
+                "https://media.example/video-2.mp4",
+                InputReferenceKind::Video,
+            ),
+            (
+                "https://media.example/audio-1.mp3",
+                InputReferenceKind::Audio,
+            ),
+            (
+                "https://media.example/video-1.mp4",
+                InputReferenceKind::Video,
+            ),
+            (
+                "https://media.example/image-1.png",
+                InputReferenceKind::Image,
+            ),
+        ] {
+            request
+                .input_references
+                .push(InputReference::with_kind(url, kind).expect("reference"));
+        }
+        let mut input = Map::new();
+        bind_media_references(&mut input, &model, &request).expect("typed bindings");
+        assert_eq!(
+            input["video_urls"],
+            json!([
+                "https://media.example/video-2.mp4",
+                "https://media.example/video-1.mp4"
+            ])
+        );
+        assert_eq!(
+            input["audio_urls"],
+            json!(["https://media.example/audio-1.mp3"])
+        );
+        assert_eq!(
+            input["image_urls"],
+            json!(["https://media.example/image-1.png"])
+        );
+    }
+
+    #[test]
+    fn explicit_schema_maximum_overrides_the_non_seedance_kind_fallback() {
+        let explicit = single_list_binding_model(
+            "fal-ai/fixture/four-videos",
+            MediaKind::Video,
+            "video_urls",
+            false,
+            None,
+            Some(4),
+        );
+        let absent = single_list_binding_model(
+            "fal-ai/fixture/default-videos",
+            MediaKind::Video,
+            "video_urls",
+            false,
+            None,
+            None,
+        );
+        let mut request = VideoRequest::for_provider(
+            ProviderId::fal(),
+            &explicit.id,
+            "A four-video schema fixture",
+        )
+        .expect("request");
+        for index in 0..4 {
+            request.input_references.push(
+                InputReference::with_kind(
+                    format!("https://media.example/video-{index}.mp4"),
+                    InputReferenceKind::Video,
+                )
+                .expect("video reference"),
+            );
+        }
+
+        let mut input = Map::new();
+        bind_media_references(&mut input, &explicit, &request)
+            .expect("explicit maxItems must be authoritative");
+        assert_eq!(input["video_urls"].as_array().map(Vec::len), Some(4));
+
+        let error = bind_media_references(&mut Map::new(), &absent, &request)
+            .expect_err("missing maxItems must use the three-video fallback");
+        assert!(error.message.contains("at most 3 video"));
+    }
+
+    #[test]
+    fn explicit_higher_schema_maximum_is_not_overridden_by_total_fallback() {
+        let model = single_list_binding_model(
+            "fal-ai/fixture/thirteen-images",
+            MediaKind::Image,
+            "image_urls",
+            false,
+            None,
+            Some(20),
+        );
+        let mut request = VideoRequest::for_provider(
+            ProviderId::fal(),
+            &model.id,
+            "A thirteen-image schema fixture",
+        )
+        .expect("request");
+        for index in 0..13 {
+            request.input_references.push(
+                InputReference::with_kind(
+                    format!("https://media.example/image-{index}.png"),
+                    InputReferenceKind::Image,
+                )
+                .expect("image reference"),
+            );
+        }
+
+        let mut input = Map::new();
+        bind_media_references(&mut input, &model, &request)
+            .expect("explicit maxItems must supersede the total fallback");
+        assert_eq!(input["image_urls"].as_array().map(Vec::len), Some(13));
+    }
+
+    #[test]
+    fn required_zero_minimum_list_is_bound_empty_without_weakening_nonempty_lists() {
+        let empty_allowed = single_list_binding_model(
+            "fal-ai/fixture/empty-audio-list",
+            MediaKind::Audio,
+            "audio_urls",
+            true,
+            Some(0),
+            Some(3),
+        );
+        let request = VideoRequest::for_provider(
+            ProviderId::fal(),
+            &empty_allowed.id,
+            "An empty-list schema fixture",
+        )
+        .expect("request");
+        let mut input = Map::new();
+        bind_media_references(&mut input, &empty_allowed, &request)
+            .expect("required minItems zero list");
+        assert_eq!(input["audio_urls"], json!([]));
+
+        let nonempty_required = single_list_binding_model(
+            "fal-ai/fixture/nonempty-audio-list",
+            MediaKind::Audio,
+            "audio_urls",
+            true,
+            Some(1),
+            Some(3),
+        );
+        let error = bind_media_references(&mut Map::new(), &nonempty_required, &request)
+            .expect_err("required minItems one list must remain required");
+        assert!(error.message.contains("requires a audio input"));
+    }
+
+    #[test]
+    fn nonempty_adapter_options_downgrade_an_exact_quote() {
+        let mut request = VideoRequest::for_provider(
+            ProviderId::fal(),
+            "fal-ai/fixture/options",
+            "An advanced-options quote fixture",
+        )
+        .expect("request");
+        request.adapter_options = Some(json!({"provider_knob": 0.75}));
+        let mut basis = "Advertised fal price per generation".to_owned();
+        let mut confidence = QuoteConfidence::Exact;
+
+        apply_request_quote_uncertainty(&request, &mut basis, &mut confidence);
+
+        assert_eq!(confidence, QuoteConfidence::Estimated);
+        assert!(basis.contains("advanced provider-specific options"));
+    }
+
+    #[test]
+    fn seedance_audio_requires_visual_companion() {
+        let model = typed_binding_model("bytedance/seedance-2.0/reference-to-video");
+        let mut request =
+            VideoRequest::for_provider(ProviderId::fal(), &model.id, "A Seedance fixture")
+                .expect("request");
+        request.input_references.push(
+            InputReference::with_kind("https://media.example/audio.mp3", InputReferenceKind::Audio)
+                .expect("audio"),
+        );
+        assert!(bind_media_references(&mut Map::new(), &model, &request).is_err());
+        request.input_references.push(
+            InputReference::with_kind("https://media.example/video.mp4", InputReferenceKind::Video)
+                .expect("video"),
+        );
+        bind_media_references(&mut Map::new(), &model, &request)
+            .expect("audio with visual companion");
+    }
+
+    #[test]
+    fn staged_seedance_sizes_recheck_files_grown_after_early_validation() {
+        let directory = tempdir().expect("temporary media");
+        let path = directory.path().join("reference.mp3");
+        std::fs::write(&path, b"ID3small fixture").expect("small MP3 fixture");
+        let mut draft = GenerationDraft::new(
+            ProviderId::fal(),
+            "bytedance/seedance-2.0/reference-to-video",
+            "A Seedance size fixture",
+        )
+        .expect("draft");
+        draft
+            .media
+            .push(DraftMedia::local(&path, MediaRole::AudioInput));
+        draft.validate().expect("initial small draft");
+        let provider = FalProvider::from_key("fal-test-placeholder").expect("provider");
+        provider
+            .validate_draft_media_constraints(&draft)
+            .expect("initial size check");
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("grow fixture");
+        file.set_len(SEEDANCE_MAX_AUDIO_BYTES + 1)
+            .expect("grow sparse fixture");
+        drop(file);
+        let size = std::fs::metadata(&path).expect("grown metadata").len();
+        let uploaded_at = Utc::now();
+        let receipt = UploadReceipt::new(
+            ProviderId::fal(),
+            "a".repeat(64),
+            "https://v3.fal.media/files/fixture/reference.mp3",
+            uploaded_at,
+            uploaded_at + chrono::Duration::hours(1),
+            Some("audio/mpeg".into()),
+            size,
+        )
+        .expect("actual staged receipt");
+        let staged = StagedMedia::uploaded(MediaRole::AudioInput, receipt).expect("staged media");
+
+        let error = provider
+            .validate_staged_media_constraints(&draft, &[staged])
+            .expect_err("grown media must fail after staging");
+        assert_eq!(error.kind, ProviderErrorKind::Validation);
+        assert!(error.message.contains("at most 15 MB"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepted_snapshot_detects_same_size_atomic_file_replacement() {
+        let directory = tempdir().expect("temporary media");
+        let path = directory.path().join("reference.png");
+        let replacement = directory.path().join("replacement.png");
+        let bytes = b"\x89PNG\r\n\x1a\nfixture image bytes";
+        std::fs::write(&path, bytes).expect("initial PNG fixture");
+        std::fs::write(&replacement, bytes).expect("replacement PNG fixture");
+        let snapshot = local_file_snapshot(&path).await.expect("accepted snapshot");
+
+        std::fs::rename(&replacement, &path).expect("atomic replacement");
+
+        let error = ensure_local_file_unchanged(&path, &snapshot)
+            .await
+            .expect_err("replacement inode must invalidate the accepted snapshot");
+        assert!(error.message.contains("changed while fal was preparing"));
+    }
+
+    #[test]
+    fn local_media_mime_set_is_deliberately_conservative() {
+        assert_eq!(media_content_type(Path::new("fixture.mp4")), "video/mp4");
+        assert_eq!(
+            media_content_type(Path::new("fixture.mov")),
+            "video/quicktime"
+        );
+        assert_eq!(media_content_type(Path::new("fixture.mp3")), "audio/mpeg");
+        assert_eq!(media_content_type(Path::new("fixture.wav")), "audio/wav");
+        for unsupported in ["m4v", "webm", "mkv", "m4a", "flac", "ogg"] {
+            assert_eq!(
+                media_content_type(Path::new(&format!("fixture.{unsupported}"))),
+                "application/octet-stream"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_urls_reject_non_global_literal_hosts() {
+        for value in [
+            "https://0.1.2.3/upload",
+            "https://100.64.0.1/upload",
+            "https://198.18.0.1/upload",
+            "https://192.0.2.1/upload",
+            "https://224.0.0.1/upload",
+            "https://240.0.0.1/upload",
+            "https://[100::1]/upload",
+            "https://[2001:2::1]/upload",
+            "https://[2001:db8::1]/upload",
+            "https://[3fff::1]/upload",
+            "https://[fec0::1]/upload",
+            "https://[::ffff:c0a8:101]/upload",
+            "https://[4000::1]/upload",
+            "https://[5f00::1]/upload",
+            "https://[2001:10::1]/upload",
+            "https://[64:ff9b::c0a8:101]/upload",
+        ] {
+            let url = Url::parse(value).expect("upload URL fixture");
+            assert!(
+                validate_upload_url(&url).is_err(),
+                "accepted non-global upload URL {value}"
+            );
+            assert!(
+                validate_download_url(&url).is_err(),
+                "accepted non-global download URL {value}"
+            );
+        }
+
+        for value in [
+            "https://uploads.example/signed/object",
+            "https://8.8.8.8/upload",
+            "https://[2606:4700:4700::1111]/upload",
+        ] {
+            let url = Url::parse(value).expect("public upload URL fixture");
+            validate_upload_url(&url)
+                .unwrap_or_else(|error| panic!("rejected public upload URL {value}: {error}"));
+            validate_download_url(&url)
+                .unwrap_or_else(|error| panic!("rejected public download URL {value}: {error}"));
+        }
+    }
+
+    #[test]
+    fn generic_audio_property_is_not_the_output_audio_switch() {
+        let field_map = common_field_map(&json!({
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "audio": {"type": "string"}
+            }
+        }));
+        assert!(!field_map.contains_key("generate_audio"));
+    }
 
     #[test]
     fn schema_combinators_do_not_skip_sibling_constraints() {
