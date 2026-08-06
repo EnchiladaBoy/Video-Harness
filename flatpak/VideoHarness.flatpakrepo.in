@@ -1,0 +1,9 @@
+[Flatpak Repo]
+Title=Video Harness
+Comment=Signed stable releases of Video Harness
+Description=The official Video Harness Flatpak update repository
+Url=@REPO_URL@
+Homepage=https://github.com/EnchiladaBoy/VideoHarness
+Icon=https://raw.githubusercontent.com/EnchiladaBoy/VideoHarness/main/native/data/icons/io.github.EnchiladaBoy.VideoHarness.svg
+DefaultBranch=stable
+GPGKey=@GPG_KEY_BASE64@

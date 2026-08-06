@@ -1636,6 +1636,78 @@ fn media_bindings(object: &Map<String, Value>) -> Result<Vec<MediaBinding>, Doma
     Ok(bindings)
 }
 
+/// Whether a model can generate a soundtrack and what an omitted request means.
+///
+/// Capability support and provider defaults are deliberately separate.  A
+/// request-level `None` means "let the provider decide"; it must never be
+/// silently rewritten to `false` merely because a UI control was rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratedAudioCapability {
+    pub supported: bool,
+    #[serde(default)]
+    pub provider_default: Option<bool>,
+}
+
+impl GeneratedAudioCapability {
+    pub const fn unsupported() -> Self {
+        Self {
+            supported: false,
+            provider_default: Some(false),
+        }
+    }
+
+    pub const fn supported(provider_default: Option<bool>) -> Self {
+        Self {
+            supported: true,
+            provider_default,
+        }
+    }
+}
+
+fn generated_audio_capability(
+    provider_id: &ProviderId,
+    object: &Map<String, Value>,
+) -> GeneratedAudioCapability {
+    if let Some(capability) = object
+        .get("generated_audio_capability")
+        .and_then(Value::as_object)
+    {
+        let supported = capability
+            .get("supported")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return if supported {
+            GeneratedAudioCapability::supported(
+                capability.get("provider_default").and_then(Value::as_bool),
+            )
+        } else {
+            GeneratedAudioCapability::unsupported()
+        };
+    }
+
+    let advertised = object.get("generate_audio").and_then(Value::as_bool);
+    if provider_id == &ProviderId::openrouter() {
+        // OpenRouter's endpoint capability flag also defines what omission
+        // does. Missing, null, and false all fail closed.
+        return match advertised {
+            Some(true) => GeneratedAudioCapability::supported(Some(true)),
+            Some(false) | None => GeneratedAudioCapability::unsupported(),
+        };
+    }
+
+    // Compatibility with existing fal caches: field presence was persisted as
+    // a boolean, but no default was recorded. Preserve support without
+    // inventing an omitted-request outcome.
+    match advertised {
+        Some(true) => GeneratedAudioCapability::supported(
+            object
+                .get("generate_audio_default")
+                .and_then(Value::as_bool),
+        ),
+        Some(false) | None => GeneratedAudioCapability::unsupported(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VideoModel {
     pub provider_id: ProviderId,
@@ -1656,7 +1728,7 @@ pub struct VideoModel {
     /// Provider-schema property bindings. An empty list means the provider
     /// uses its native typed reference union or did not advertise bindings.
     pub media_bindings: Vec<MediaBinding>,
-    pub generate_audio: Option<bool>,
+    pub generated_audio: GeneratedAudioCapability,
     pub seed: Option<bool>,
     pub allowed_passthrough_parameters: Vec<String>,
     pub pricing_skus: BTreeMap<String, Decimal>,
@@ -1695,6 +1767,7 @@ impl VideoModel {
                 }
             }
         }
+        let generated_audio = generated_audio_capability(&provider_id, object);
         Ok(Self {
             provider_id,
             id,
@@ -1713,7 +1786,7 @@ impl VideoModel {
             supported_frame_images: strings(object.get("supported_frame_images")),
             input_modalities: input_modalities(object),
             media_bindings: media_bindings(object)?,
-            generate_audio: object.get("generate_audio").and_then(Value::as_bool),
+            generated_audio,
             seed: object.get("seed").and_then(Value::as_bool),
             allowed_passthrough_parameters: strings(object.get("allowed_passthrough_parameters")),
             pricing_skus,
@@ -1766,7 +1839,7 @@ impl VideoModel {
         {
             problems.push(format!("duration {value}s is not supported"));
         }
-        if request.generate_audio == Some(true) && self.generate_audio == Some(false) {
+        if request.generate_audio == Some(true) && !self.generated_audio.supported {
             problems.push("audio generation is not supported".into());
         }
         if request.seed.is_some() && self.seed == Some(false) {
@@ -2171,7 +2244,19 @@ pub fn estimate_cost(model: &VideoModel, request: &VideoRequest) -> CostEstimate
         .resolution
         .as_ref()
         .map(|value| value.to_ascii_lowercase());
-    let audio = request.generate_audio.or(model.generate_audio);
+    let audio = request
+        .generate_audio
+        .or(model.generated_audio.provider_default);
+    if audio.is_none()
+        && pricing
+            .keys()
+            .any(|key| key.contains("with_audio") || key.contains("without_audio"))
+    {
+        return unavailable(
+            "Audio-dependent pricing is advertised, but the provider default is unknown",
+            pricing,
+        );
+    }
 
     let variants = |stem: &str| {
         let mut values = Vec::new();

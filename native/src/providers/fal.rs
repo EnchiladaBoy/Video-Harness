@@ -1598,6 +1598,12 @@ fn normalize_fal_model(raw: &Value) -> Result<Option<VideoModel>, ProviderError>
     if !supported_frame_images.is_empty() {
         input_modalities.insert(MediaKind::Image);
     }
+    let generated_audio_supported = field_map.contains_key("generate_audio");
+    let generated_audio_default = field_map
+        .get("generate_audio")
+        .and_then(|name| properties.get(name))
+        .and_then(|schema| schema.get("default"))
+        .and_then(Value::as_bool);
     let normalized = json!({
         "id": endpoint_id,
         "name": metadata.and_then(|value| value.get("display_name")).and_then(Value::as_str).unwrap_or(endpoint_id),
@@ -1609,7 +1615,13 @@ fn normalize_fal_model(raw: &Value) -> Result<Option<VideoModel>, ProviderError>
         "supported_frame_images": supported_frame_images,
         "input_modalities": input_modalities,
         "media_bindings": media_bindings,
-        "generate_audio": field_map.contains_key("generate_audio"),
+        "generated_audio_capability": {
+            "supported": generated_audio_supported,
+            "provider_default": generated_audio_default,
+        },
+        // Keep this compatibility flag in cached raw catalogs written by
+        // pre-v0.6 releases. New readers prefer the structured capability.
+        "generate_audio": generated_audio_supported,
         "seed": field_map.contains_key("seed"),
         "allowed_passthrough_parameters": properties.keys().cloned().collect::<Vec<_>>(),
         "input_schema": resolved_input,
@@ -3334,6 +3346,37 @@ mod tests {
         assert_eq!(model.media_bindings[2].property_name, "audio_urls");
         assert_eq!(model.media_bindings[2].min_items, Some(1));
         assert_eq!(model.media_bindings[2].max_items, Some(3));
+    }
+
+    #[test]
+    fn generated_audio_default_comes_from_the_boolean_schema() {
+        for (schema_default, expected) in [
+            (Some(true), Some(true)),
+            (Some(false), Some(false)),
+            (None, None),
+        ] {
+            let mut audio_schema = json!({"type": "boolean"});
+            if let Some(value) = schema_default {
+                audio_schema["default"] = json!(value);
+            }
+            let raw = schema_model(
+                "fal-ai/fixture/audio-output",
+                "text-to-video",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string"},
+                        "enable_audio": audio_schema
+                    }
+                }),
+                video_output_schema(),
+            );
+            let model = normalize_fal_model(&raw)
+                .expect("valid schema")
+                .expect("video model");
+            assert!(model.generated_audio.supported);
+            assert_eq!(model.generated_audio.provider_default, expected);
+        }
     }
 
     #[test]

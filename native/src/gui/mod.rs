@@ -1,5 +1,7 @@
 //! Native GTK/libadwaita frontend for Video Harness.
 
+pub mod cloud_cinema;
+pub mod composer_state;
 mod window;
 
 use std::fmt;

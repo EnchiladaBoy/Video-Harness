@@ -1,0 +1,42 @@
+app-id: io.github.EnchiladaBoy.VideoHarness
+runtime: org.gnome.Platform
+runtime-version: "50"
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: video-harness
+
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --socket=pulseaudio
+  - --filesystem=xdg-videos:create
+  - --filesystem=~/.local/share/openrouter-video-studio:ro
+  - --filesystem=~/.config/openrouter-video-studio:ro
+  - --filesystem=~/.cache/openrouter-video-studio:ro
+  - --talk-name=org.freedesktop.secrets
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/video-harness/cargo
+    CARGO_NET_OFFLINE: "true"
+
+modules:
+  - name: video-harness
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --locked --offline --bin video-harness
+      - install -Dm0755 target/release/video-harness /app/bin/video-harness
+      - install -Dm0644 data/io.github.EnchiladaBoy.VideoHarness.desktop /app/share/applications/io.github.EnchiladaBoy.VideoHarness.desktop
+      - install -Dm0644 data/io.github.EnchiladaBoy.VideoHarness.metainfo.xml /app/share/metainfo/io.github.EnchiladaBoy.VideoHarness.metainfo.xml
+      - install -Dm0644 data/icons/io.github.EnchiladaBoy.VideoHarness.svg /app/share/icons/hicolor/scalable/apps/io.github.EnchiladaBoy.VideoHarness.svg
+    sources:
+      - type: dir
+        path: ../native
+        skip:
+          - target
+      - cargo-sources.json

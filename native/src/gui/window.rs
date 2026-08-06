@@ -3,13 +3,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use secrecy::SecretString;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
+
+use super::cloud_cinema::{CloudCinema, CloudCinemaActivity};
+use super::composer_state::{AudioChoice, COMPACT_MAX_WIDTH, CatalogReducer, ModelKey};
 
 use crate::config::AppPaths;
 use crate::domain::{
@@ -20,13 +23,16 @@ use crate::gui_state::{
     DraftEditorState, UncertainSubmissionRecord, generation_draft_fingerprint_candidates,
 };
 use crate::history::JobRecord;
+use crate::migration::{
+    LegacyMigration, LegacyMigrationConsent, LegacyMigrationEligibility, LegacyMigrationError,
+    LegacyMigrationInventory, LegacyMigrationOutcome, LegacyMigrationSkipReason, RelinkRequired,
+};
 use crate::workflow::{
     PreparedGenerationId, ProviderConnection, RecoveryStore, ServiceCommand, ServiceConfig,
     ServiceEvent, ServiceHandle, spawn_service,
 };
 
 const PROVIDERS: [(&str, &str); 2] = [("openrouter", "OpenRouter"), ("fal", "fal.ai")];
-const ANIMATION_FRAMES: [&str; 8] = ["·", "✦", "· ✧", "✦ ·", "✧", "· ✦", "✧ ·", "✦"];
 
 pub fn install_style() {
     let provider = gtk::CssProvider::new();
@@ -44,12 +50,39 @@ pub fn present(
     application: &adw::Application,
     runtime: Arc<Runtime>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let paths = AppPaths::discover()?.ensure()?;
+    let paths = AppPaths::discover()?;
+    let migration = LegacyMigration::discover(paths.clone())?;
+    match migration.assess() {
+        Ok(LegacyMigrationEligibility::NeedsConsent(inventory)) => {
+            present_migration_consent(application, runtime, paths, migration, inventory);
+            return Ok(());
+        }
+        Err(error) => {
+            present_migration_failure(application, runtime, paths, migration, error.to_string());
+            return Ok(());
+        }
+        Ok(_) => {}
+    }
+    present_main(application, runtime, paths, Some(migration))
+}
+
+fn present_main(
+    application: &adw::Application,
+    runtime: Arc<Runtime>,
+    paths: AppPaths,
+    migration: Option<LegacyMigration>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let paths = paths.ensure()?;
     let handle = {
         let _guard = runtime.enter();
-        spawn_service(paths, ServiceConfig::default())?
+        spawn_service(paths.clone(), ServiceConfig::default())?
     };
-    let window = HarnessWindow::new(application, runtime, handle);
+    let relinks = migration
+        .as_ref()
+        .map(LegacyMigration::pending_relinks)
+        .transpose()?
+        .unwrap_or_default();
+    let window = HarnessWindow::new(application, runtime, handle, migration, relinks);
     // GTK owns the visible widgets, but signal handlers intentionally keep
     // only weak controller references. Retain the controller until the
     // service confirms its local state is safe, then break this cycle in the
@@ -57,6 +90,154 @@ pub fn present(
     window.keep_alive.replace(Some(Rc::clone(&window)));
     window.present();
     Ok(())
+}
+
+fn migration_window(application: &adw::Application, description: &str) -> adw::ApplicationWindow {
+    let window = adw::ApplicationWindow::builder()
+        .application(application)
+        .title("Video Harness")
+        .default_width(620)
+        .default_height(420)
+        .build();
+    let page = adw::StatusPage::builder()
+        .icon_name("folder-videos-symbolic")
+        .title("Bring your Video Harness workspace with you")
+        .description(description)
+        .build();
+    window.set_content(Some(&page));
+    window.present();
+    window
+}
+
+fn finish_migration_attempt(
+    application: &adw::Application,
+    runtime: Arc<Runtime>,
+    paths: AppPaths,
+    migration: LegacyMigration,
+    result: Result<LegacyMigrationOutcome, LegacyMigrationError>,
+) {
+    match result {
+        Ok(
+            LegacyMigrationOutcome::Imported(_)
+            | LegacyMigrationOutcome::Declined(_)
+            | LegacyMigrationOutcome::AlreadyDecided(_),
+        ) => {
+            if let Err(error) = present_main(application, runtime, paths, Some(migration)) {
+                present_startup_error(application, &error.to_string());
+            }
+        }
+        Ok(LegacyMigrationOutcome::Skipped(reason)) => {
+            let message = match reason {
+                LegacyMigrationSkipReason::NotFlatpak => {
+                    "The migration was interrupted because this process is no longer running inside the Video Harness Flatpak.".to_owned()
+                }
+                LegacyMigrationSkipReason::TargetContainsData(path) => format!(
+                    "The Flatpak workspace changed before migration completed at {}. It was not opened automatically.",
+                    path.display()
+                ),
+                LegacyMigrationSkipReason::NoLegacyData => {
+                    "The legacy workspace disappeared before migration completed. It was not treated as an imported or declined workspace.".to_owned()
+                }
+            };
+            present_migration_failure(application, runtime, paths, migration, message);
+        }
+        Err(error) => {
+            present_migration_failure(application, runtime, paths, migration, error.to_string());
+        }
+    }
+}
+
+fn present_migration_consent(
+    application: &adw::Application,
+    runtime: Arc<Runtime>,
+    paths: AppPaths,
+    migration: LegacyMigration,
+    inventory: LegacyMigrationInventory,
+) {
+    let description = format!(
+        "A pre-Flatpak workspace was found: {} history database, {} draft database, {} settings file(s), and {} cached catalog file(s). The originals stay untouched and API keys are never copied.",
+        usize::from(inventory.history_database),
+        usize::from(inventory.gui_state_database),
+        inventory.config_file_count,
+        inventory.cache_file_count,
+    );
+    let startup = migration_window(application, &description);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Import existing workspace?")
+        .body("Import copies compatible databases with SQLite's backup API. Local media outside the sandbox will be marked for relinking.")
+        .build();
+    dialog.add_response("cancel", "Not now");
+    dialog.add_response("clean", "Start clean");
+    dialog.add_response("import", "Import workspace");
+    dialog.set_close_response("cancel");
+    dialog.set_default_response(Some("clean"));
+    dialog.set_response_appearance("import", adw::ResponseAppearance::Suggested);
+    let app = application.clone();
+    let response_window = startup.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "cancel" {
+            response_window.close();
+            return;
+        }
+        let consent = if response == "import" {
+            LegacyMigrationConsent::Import
+        } else {
+            LegacyMigrationConsent::StartClean
+        };
+        let result = migration.run(consent);
+        response_window.close();
+        finish_migration_attempt(
+            &app,
+            Arc::clone(&runtime),
+            paths.clone(),
+            migration.clone(),
+            result,
+        );
+    });
+    dialog.present(Some(&startup));
+}
+
+fn present_migration_failure(
+    application: &adw::Application,
+    runtime: Arc<Runtime>,
+    paths: AppPaths,
+    migration: LegacyMigration,
+    message: String,
+) {
+    let startup = migration_window(
+        application,
+        "The old workspace was not changed and no partial Flatpak workspace was kept.",
+    );
+    let dialog = adw::AlertDialog::builder()
+        .heading("Workspace import needs attention")
+        .body(&message)
+        .build();
+    dialog.add_response("cancel", "Not now");
+    dialog.add_response("retry", "Retry import");
+    dialog.add_response("clean", "Start clean");
+    dialog.set_close_response("cancel");
+    dialog.set_default_response(Some("retry"));
+    let app = application.clone();
+    let response_window = startup.clone();
+    dialog.connect_response(None, move |_, response| {
+        response_window.close();
+        let consent = match response {
+            "clean" => Some(LegacyMigrationConsent::StartClean),
+            "retry" => Some(LegacyMigrationConsent::Import),
+            _ => None,
+        };
+        if let Some(consent) = consent {
+            let result = migration.run(consent);
+            finish_migration_attempt(
+                &app,
+                Arc::clone(&runtime),
+                paths.clone(),
+                migration.clone(),
+                result,
+            );
+        }
+    });
+    dialog.present(Some(&startup));
 }
 
 pub fn present_startup_error(application: &adw::Application, message: &str) {
@@ -90,7 +271,8 @@ struct OptionWidgets {
     aspects: RefCell<Vec<Option<String>>>,
     size: gtk::DropDown,
     sizes: RefCell<Vec<Option<String>>>,
-    audio: gtk::Switch,
+    audio: gtk::DropDown,
+    audio_hint: gtk::Label,
     seed: gtk::Entry,
     schema_box: gtk::Box,
     schema_controls: RefCell<BTreeMap<String, SchemaControl>>,
@@ -108,17 +290,19 @@ enum SchemaControl {
     },
 }
 
+#[derive(Clone)]
 enum SchemaUiValue {
     Choice(Option<serde_json::Value>),
     Text(String),
 }
 
+#[derive(Clone)]
 struct ModelOptionsSnapshot {
     duration: Option<u32>,
     resolution: Option<String>,
     aspect_ratio: Option<String>,
     size: Option<String>,
-    audio: bool,
+    audio: AudioChoice,
     seed: String,
     schema: BTreeMap<String, SchemaUiValue>,
 }
@@ -147,12 +331,18 @@ struct JobWidgets {
     detail: gtk::Label,
     animation: gtk::Label,
     progress: gtk::ProgressBar,
-    video: gtk::Video,
     pause: gtk::Button,
     resume: gtk::Button,
     open: gtk::Button,
     local_path: RefCell<Option<PathBuf>>,
     active: Cell<bool>,
+    observed_since: Instant,
+    next_poll_at: RefCell<Option<Instant>>,
+}
+
+struct RelinkCandidate {
+    path: PathBuf,
+    revision: u64,
 }
 
 struct PreparedReview {
@@ -184,6 +374,10 @@ struct HarnessWindow {
     service_disconnected: Cell<bool>,
     allow_close: Cell<bool>,
     keep_alive: RefCell<Option<Rc<HarnessWindow>>>,
+    legacy_migration: Option<LegacyMigration>,
+    pending_relinks: RefCell<Vec<RelinkRequired>>,
+    relink_candidates: RefCell<Vec<RelinkCandidate>>,
+    relink_removals: RefCell<BTreeMap<(String, String), u64>>,
 
     view_stack: adw::ViewStack,
     prompt: gtk::TextView,
@@ -193,7 +387,13 @@ struct HarnessWindow {
     model_provider: RefCell<Option<ProviderId>>,
     model_description: gtk::Label,
     catalogs: RefCell<BTreeMap<ProviderId, VideoCatalog>>,
+    catalog_reducer: RefCell<CatalogReducer>,
+    remembered_model_settings: RefCell<BTreeMap<(ProviderId, String), serde_json::Value>>,
+    model_snapshots: RefCell<BTreeMap<(ProviderId, String), ModelOptionsSnapshot>>,
+    active_model: RefCell<Option<(ProviderId, String)>>,
+    missing_model: RefCell<Option<(ProviderId, String)>>,
     pending_draft: RefCell<Option<(GenerationDraft, DraftEditorState, u64)>>,
+    unavailable_draft: RefCell<Option<GenerationDraft>>,
     options: OptionWidgets,
     media: RefCell<Vec<MediaItem>>,
     media_list: gtk::ListBox,
@@ -211,10 +411,17 @@ struct HarnessWindow {
 
     jobs_list: gtk::ListBox,
     jobs_stack: gtk::Stack,
+    jobs_split: adw::NavigationSplitView,
+    jobs_search: gtk::SearchEntry,
+    jobs_filter: gtk::DropDown,
+    jobs_detail_stack: gtk::Stack,
+    cloud_cinema: CloudCinema,
+    job_video: gtk::Video,
+    selected_job: RefCell<Option<ProviderJobKey>>,
     jobs: RefCell<HashMap<ProviderJobKey, Rc<JobWidgets>>>,
     active_jobs: RefCell<HashSet<ProviderJobKey>>,
     latest_video: RefCell<Option<PathBuf>>,
-    animation_frame: Cell<usize>,
+    job_detail_timer: RefCell<Option<glib::SourceId>>,
 
     provider_widgets: BTreeMap<ProviderId, ProviderWidgets>,
     default_provider: gtk::DropDown,
@@ -225,6 +432,8 @@ impl HarnessWindow {
         application: &adw::Application,
         runtime: Arc<Runtime>,
         handle: ServiceHandle,
+        legacy_migration: Option<LegacyMigration>,
+        pending_relinks: Vec<RelinkRequired>,
     ) -> Rc<Self> {
         let window = adw::ApplicationWindow::builder()
             .application(application)
@@ -247,15 +456,20 @@ impl HarnessWindow {
             view_stack.add_titled(&providers.page, Some("providers"), "Providers & Settings");
         providers_page.set_icon_name(Some("preferences-system-symbolic"));
 
-        let title = adw::ViewSwitcher::new();
-        title.set_stack(Some(&view_stack));
-        title.set_policy(adw::ViewSwitcherPolicy::Wide);
+        let wide_switcher = adw::ViewSwitcher::new();
+        wide_switcher.set_stack(Some(&view_stack));
+        wide_switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
+        let narrow_title = adw::WindowTitle::new("New Generation", "Video Harness");
+        let title_stack = gtk::Stack::new();
+        title_stack.add_named(&wide_switcher, Some("wide"));
+        title_stack.add_named(&narrow_title, Some("narrow"));
+        title_stack.set_visible_child_name("wide");
         let header = adw::HeaderBar::new();
-        header.set_title_widget(Some(&title));
+        header.set_title_widget(Some(&title_stack));
 
         let switcher = adw::ViewSwitcherBar::new();
         switcher.set_stack(Some(&view_stack));
-        switcher.set_reveal(true);
+        switcher.set_reveal(false);
 
         toast_overlay.set_child(Some(&view_stack));
         let toolbar = adw::ToolbarView::new();
@@ -263,6 +477,43 @@ impl HarnessWindow {
         toolbar.set_content(Some(&toast_overlay));
         toolbar.add_bottom_bar(&switcher);
         window.set_content(Some(&toolbar));
+
+        let compact_condition = format!("max-width: {COMPACT_MAX_WIDTH}px");
+        let compact = adw::Breakpoint::new(
+            adw::BreakpointCondition::parse(&compact_condition).expect("static compact breakpoint"),
+        );
+        let compact_titles = title_stack.clone();
+        let compact_switcher = switcher.clone();
+        let compact_composer = compose.page.clone();
+        let compact_jobs = jobs.page.clone();
+        compact.connect_apply(move |_| {
+            compact_titles.set_visible_child_name("narrow");
+            compact_switcher.set_reveal(true);
+            compact_composer.set_collapsed(true);
+            compact_composer.set_show_sidebar(false);
+            compact_jobs.set_collapsed(true);
+        });
+        let wide_titles = title_stack.clone();
+        let wide_bottom_switcher = switcher.clone();
+        let wide_composer = compose.page.clone();
+        let wide_jobs = jobs.page.clone();
+        compact.connect_unapply(move |_| {
+            wide_titles.set_visible_child_name("wide");
+            wide_bottom_switcher.set_reveal(false);
+            wide_composer.set_collapsed(false);
+            wide_composer.set_show_sidebar(true);
+            wide_jobs.set_collapsed(false);
+        });
+        window.add_breakpoint(compact);
+
+        let page_title = narrow_title.clone();
+        view_stack.connect_visible_child_name_notify(move |stack| {
+            page_title.set_title(match stack.visible_child_name().as_deref() {
+                Some("jobs") => "Jobs",
+                Some("providers") => "Providers & Settings",
+                _ => "New Generation",
+            });
+        });
 
         let this = Rc::new(Self {
             window,
@@ -287,6 +538,10 @@ impl HarnessWindow {
             service_disconnected: Cell::new(false),
             allow_close: Cell::new(false),
             keep_alive: RefCell::new(None),
+            legacy_migration,
+            pending_relinks: RefCell::new(pending_relinks),
+            relink_candidates: RefCell::new(Vec::new()),
+            relink_removals: RefCell::new(BTreeMap::new()),
             view_stack,
             prompt: compose.prompt,
             provider: compose.provider,
@@ -295,7 +550,13 @@ impl HarnessWindow {
             model_provider: RefCell::new(None),
             model_description: compose.model_description,
             catalogs: RefCell::new(BTreeMap::new()),
+            catalog_reducer: RefCell::new(CatalogReducer::default()),
+            remembered_model_settings: RefCell::new(BTreeMap::new()),
+            model_snapshots: RefCell::new(BTreeMap::new()),
+            active_model: RefCell::new(None),
+            missing_model: RefCell::new(None),
             pending_draft: RefCell::new(None),
+            unavailable_draft: RefCell::new(None),
             options: compose.options,
             media: RefCell::new(Vec::new()),
             media_list: compose.media_list,
@@ -312,17 +573,25 @@ impl HarnessWindow {
             review: compose.review,
             jobs_list: jobs.list,
             jobs_stack: jobs.stack,
+            jobs_split: jobs.page,
+            jobs_search: jobs.search,
+            jobs_filter: jobs.filter,
+            jobs_detail_stack: jobs.detail_stack,
+            cloud_cinema: jobs.cloud_cinema,
+            job_video: jobs.video,
+            selected_job: RefCell::new(None),
             jobs: RefCell::new(HashMap::new()),
             active_jobs: RefCell::new(HashSet::new()),
             latest_video: RefCell::new(None),
-            animation_frame: Cell::new(0),
+            job_detail_timer: RefCell::new(None),
             provider_widgets: providers.providers,
             default_provider: providers.default_provider,
         });
         this.connect(jobs.resume_all, jobs.pause_all);
+        this.connect_job_workspace();
         this.update_media_input_availability();
         this.start_event_pump();
-        this.start_animation();
+        this.start_job_detail_sync();
         this
     }
 
@@ -370,6 +639,30 @@ impl HarnessWindow {
         self.toast_overlay.add_toast(toast);
     }
 
+    fn launch_video(self: &Rc<Self>, path: &Path) {
+        if !path.is_file() {
+            self.toast(
+                &format!("Video file no longer exists: {}", path.display()),
+                "dialog-warning-symbolic",
+            );
+            return;
+        }
+        let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
+        let weak = Self::weak(self);
+        launcher.launch(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                if let (Err(error), Some(this)) = (result, weak.upgrade()) {
+                    this.toast(
+                        &format!("Could not open the default video player: {error}"),
+                        "dialog-error-symbolic",
+                    );
+                }
+            },
+        );
+    }
+
     fn connect(self: &Rc<Self>, resume_all: gtk::Button, pause_all: gtk::Button) {
         let weak = Self::weak(self);
         self.prompt.buffer().connect_changed(move |_| {
@@ -384,6 +677,7 @@ impl HarnessWindow {
                 if this.loading_draft.get() {
                     return;
                 }
+                this.capture_active_model_snapshot();
                 this.refresh_models();
                 this.update_media_input_availability();
                 this.rebuild_media();
@@ -396,6 +690,7 @@ impl HarnessWindow {
                 if this.loading_draft.get() {
                     return;
                 }
+                this.capture_active_model_snapshot();
                 this.refresh_model_controls();
                 this.draft_changed();
             }
@@ -415,7 +710,7 @@ impl HarnessWindow {
             });
         }
         let weak = Self::weak(self);
-        self.options.audio.connect_active_notify(move |_| {
+        self.options.audio.connect_selected_notify(move |_| {
             if let Some(this) = weak.upgrade() {
                 this.draft_changed();
             }
@@ -442,7 +737,7 @@ impl HarnessWindow {
         let weak = Self::weak(self);
         self.add_url.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
-                this.add_from_entry();
+                this.show_add_url_dialog();
             }
         });
         let weak = Self::weak(self);
@@ -474,7 +769,7 @@ impl HarnessWindow {
                 );
                 return false;
             }
-            let mut added = 0usize;
+            let mut added_paths = Vec::new();
             let mut rejected = 0usize;
             for file in files.files() {
                 if let Some(path) = file.path() {
@@ -482,16 +777,17 @@ impl HarnessWindow {
                         rejected += 1;
                         continue;
                     };
+                    added_paths.push(path.clone());
                     this.media.borrow_mut().push(MediaItem {
                         source: MediaSource::local(path),
                         role: default_role_for_kind(kind),
                     });
-                    added += 1;
                 }
             }
-            if added > 0 {
+            if !added_paths.is_empty() {
                 this.rebuild_media();
                 this.draft_changed();
+                this.record_relink_candidates(added_paths);
                 if rejected > 0 {
                     this.toast(
                         &format!("Skipped {rejected} unsupported file(s)."),
@@ -523,6 +819,7 @@ impl HarnessWindow {
             if let Some(this) = weak.upgrade() {
                 for (key, widgets) in this.jobs.borrow().iter() {
                     if widgets.resume.is_sensitive() {
+                        widgets.next_poll_at.replace(None);
                         widgets.active.set(true);
                         widgets.pause.set_sensitive(true);
                         widgets.resume.set_sensitive(false);
@@ -533,6 +830,8 @@ impl HarnessWindow {
                 this.send(ServiceCommand::ResumeAll {
                     op_id: this.op_id(),
                 });
+                this.apply_job_filters();
+                this.sync_selected_job_detail();
                 this.toast(
                     "Resuming saved remote jobs…",
                     "media-playback-start-symbolic",
@@ -597,7 +896,7 @@ impl HarnessWindow {
         let weak = Self::weak(self);
         open_action.connect_activate(move |_, _| {
             if let Some(this) = weak.upgrade() {
-                this.open_latest_video();
+                this.open_selected_or_latest_video();
             }
         });
         self.window.add_action(&open_action);
@@ -661,6 +960,104 @@ impl HarnessWindow {
             .cloned()
     }
 
+    fn capture_active_model_snapshot(&self) {
+        let Some(key) = self.active_model.borrow().clone() else {
+            return;
+        };
+        self.model_snapshots
+            .borrow_mut()
+            .insert(key, self.snapshot_model_options());
+    }
+
+    fn apply_remembered_model_settings(&self, value: &serde_json::Value) {
+        let Some(settings) = value.as_object() else {
+            return;
+        };
+        set_selected_copy(
+            &self.options.duration,
+            &self.options.durations,
+            settings
+                .get("duration")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok()),
+        );
+        set_selected_clone(
+            &self.options.resolution,
+            &self.options.resolutions,
+            settings
+                .get("resolution")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+        );
+        set_selected_clone(
+            &self.options.aspect,
+            &self.options.aspects,
+            settings
+                .get("aspect_ratio")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+        );
+        set_selected_clone(
+            &self.options.size,
+            &self.options.sizes,
+            settings
+                .get("size")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+        );
+        self.options.audio.set_selected(
+            AudioChoice::from_request(
+                settings
+                    .get("generate_audio")
+                    .and_then(serde_json::Value::as_bool),
+            )
+            .selected(),
+        );
+        if self.options.seed.is_sensitive() {
+            let seed = settings
+                .get("seed")
+                .and_then(|value| {
+                    value
+                        .as_i64()
+                        .map(|value| value.to_string())
+                        .or_else(|| value.as_str().map(ToOwned::to_owned))
+                })
+                .unwrap_or_default();
+            self.options.seed.set_text(&seed);
+        }
+    }
+
+    fn save_current_model_settings(&self) {
+        let Some((provider_id, model_id)) = self.active_model.borrow().clone() else {
+            return;
+        };
+        if self.selected_model().is_none() {
+            return;
+        }
+        let snapshot = self.snapshot_model_options();
+        self.model_snapshots
+            .borrow_mut()
+            .insert((provider_id.clone(), model_id.clone()), snapshot.clone());
+        let settings_json = serde_json::json!({
+            "duration": snapshot.duration,
+            "resolution": snapshot.resolution,
+            "aspect_ratio": snapshot.aspect_ratio,
+            "size": snapshot.size,
+            "generate_audio": snapshot.audio.request_value(),
+            "seed": snapshot.seed.trim().parse::<i64>().ok(),
+        });
+        self.remembered_model_settings.borrow_mut().insert(
+            (provider_id.clone(), model_id.clone()),
+            settings_json.clone(),
+        );
+        self.send(ServiceCommand::SaveModelSettings {
+            op_id: self.op_id(),
+            provider_id,
+            model_id,
+            settings_json,
+        });
+    }
+
     fn current_uncertain_submission(&self) -> Option<UncertainSubmissionRecord> {
         let draft = self.build_draft(true).ok()?;
         let fingerprints = generation_draft_fingerprint_candidates(&draft).ok()?;
@@ -710,7 +1107,34 @@ impl HarnessWindow {
             None if !strict => String::new(),
             None => return Err("Choose a model".to_owned()),
         };
-        let mut draft = GenerationDraft::new(self.selected_provider(), model, text(&self.prompt))
+        let provider = self.selected_provider();
+        if self.selected_model().is_none() {
+            if strict {
+                return Err(format!(
+                    "The saved model {model} is unavailable in the current catalog. Choose another model explicitly."
+                ));
+            }
+            if let Some(mut preserved) = self
+                .unavailable_draft
+                .borrow()
+                .as_ref()
+                .filter(|draft| draft.provider_id == provider && draft.model == model)
+                .cloned()
+            {
+                preserved.prompt = text(&self.prompt);
+                preserved.media = self
+                    .media
+                    .borrow()
+                    .iter()
+                    .map(|item| DraftMedia {
+                        source: item.source.clone(),
+                        role: item.role,
+                    })
+                    .collect();
+                return Ok(preserved);
+            }
+        }
+        let mut draft = GenerationDraft::new(provider, model, text(&self.prompt))
             .map_err(|error| error.to_string())?;
         draft.duration = selected_copy(&self.options.durations, self.options.duration.selected());
         draft.resolution = selected_clone(
@@ -719,11 +1143,8 @@ impl HarnessWindow {
         );
         draft.aspect_ratio = selected_clone(&self.options.aspects, self.options.aspect.selected());
         draft.size = selected_clone(&self.options.sizes, self.options.size.selected());
-        draft.generate_audio = self
-            .options
-            .audio
-            .is_sensitive()
-            .then_some(self.options.audio.is_active());
+        draft.generate_audio =
+            AudioChoice::from_selected(self.options.audio.selected()).request_value();
         let seed = self.options.seed.text();
         draft.seed = if !self.options.seed.is_sensitive() || seed.trim().is_empty() {
             None
@@ -927,7 +1348,84 @@ impl HarnessWindow {
     }
 
     fn save_draft(&self) {
+        self.save_current_model_settings();
         let _ = self.queue_draft_save();
+    }
+
+    fn record_relink_candidates(&self, paths: Vec<PathBuf>) {
+        if paths.is_empty() || self.pending_relinks.borrow().is_empty() {
+            return;
+        }
+        let revision = self.revision.get();
+        self.relink_candidates.borrow_mut().extend(
+            paths
+                .into_iter()
+                .map(|path| RelinkCandidate { path, revision }),
+        );
+    }
+
+    fn record_relink_removal(&self, path: &Path) {
+        let revision = self.revision.get();
+        let pending = self.pending_relinks.borrow();
+        let mut removals = self.relink_removals.borrow_mut();
+        if let Some(item) = pending.iter().find(|item| {
+            item.path == path
+                && !removals.contains_key(&(item.draft_id.clone(), item.media_id.clone()))
+        }) {
+            removals.insert((item.draft_id.clone(), item.media_id.clone()), revision);
+        }
+    }
+
+    fn acknowledge_resolved_relinks(&self, saved_revision: u64) {
+        let Some(migration) = &self.legacy_migration else {
+            return;
+        };
+        let current_paths = self
+            .media
+            .borrow()
+            .iter()
+            .filter_map(|item| match &item.source {
+                MediaSource::LocalFile { path } => Some(path.clone()),
+                MediaSource::RemoteUrl { .. } => None,
+            })
+            .collect::<HashSet<_>>();
+
+        let mut candidates = std::mem::take(&mut *self.relink_candidates.borrow_mut());
+        let mut removals = std::mem::take(&mut *self.relink_removals.borrow_mut());
+        let pending = std::mem::take(&mut *self.pending_relinks.borrow_mut());
+        let mut remaining = Vec::with_capacity(pending.len());
+        for item in pending {
+            let key = (item.draft_id.clone(), item.media_id.clone());
+            let candidate = ready_relink_candidate(
+                removals.get(&key).copied(),
+                &candidates,
+                &current_paths,
+                saved_revision,
+            );
+            let Some(candidate) = candidate else {
+                remaining.push(item);
+                continue;
+            };
+            if migration
+                .acknowledge_relink(&item.draft_id, &item.media_id)
+                .unwrap_or(false)
+            {
+                candidates.remove(candidate);
+                removals.remove(&key);
+            } else {
+                remaining.push(item);
+            }
+        }
+        candidates.retain(|candidate| {
+            candidate.revision > saved_revision || current_paths.contains(&candidate.path)
+        });
+        if remaining.is_empty() {
+            candidates.clear();
+            removals.clear();
+        }
+        self.pending_relinks.replace(remaining);
+        self.relink_candidates.replace(candidates);
+        self.relink_removals.replace(removals);
     }
 
     fn prepare_review(&self) {
@@ -991,6 +1489,18 @@ impl HarnessWindow {
             self.review.set_label("Submitting…");
             self.show_compatibility(
                 "Submitting one paid request. Keep Video Harness open until its remote job ID is safely stored.",
+                "harness-warning",
+            );
+            return;
+        }
+        let relink_count = self.pending_relinks.borrow().len();
+        if relink_count > 0 {
+            self.review.set_sensitive(false);
+            self.review.set_label("Relink imported media");
+            self.show_compatibility(
+                &format!(
+                    "{relink_count} imported local media item(s) are outside the Flatpak sandbox. Remove each unavailable row and choose the file again before Review."
+                ),
                 "harness-warning",
             );
             return;
@@ -1161,6 +1671,7 @@ impl HarnessWindow {
                 let Ok(files) = result else { return };
                 let Some(this) = weak.upgrade() else { return };
                 let mut media = this.media.borrow_mut();
+                let mut added_paths = Vec::new();
                 for index in 0..files.n_items() {
                     let Some(file) = files.item(index).and_downcast::<gio::File>() else {
                         continue;
@@ -1169,6 +1680,7 @@ impl HarnessWindow {
                         let Some(kind) = classify_local_reference(&path) else {
                             continue;
                         };
+                        added_paths.push(path.clone());
                         media.push(MediaItem {
                             source: MediaSource::local(path),
                             role: default_role_for_kind(kind),
@@ -1178,8 +1690,63 @@ impl HarnessWindow {
                 drop(media);
                 this.rebuild_media();
                 this.draft_changed();
+                this.record_relink_candidates(added_paths);
             },
         );
+    }
+
+    fn show_add_url_dialog(self: &Rc<Self>) {
+        let dialog = adw::AlertDialog::builder()
+            .heading("Add reference URL")
+            .body("Choose the media type explicitly. Only public HTTPS URLs are sent to providers.")
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("add", "Add reference");
+        dialog.set_close_response("cancel");
+        dialog.set_default_response(Some("add"));
+        dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
+
+        let form = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        form.set_margin_top(12);
+        form.set_margin_bottom(12);
+        let url = gtk::Entry::builder()
+            .placeholder_text("https://media.example/reference.mp4")
+            .hexpand(true)
+            .build();
+        let kind = dropdown(&["Choose type…", "Image", "Video", "Audio"]);
+        let role = dropdown(&["Reference", "Start frame", "End frame"]);
+        role.set_sensitive(false);
+        form.append(&field_label("Public HTTPS URL"));
+        form.append(&url);
+        form.append(&field_label("Media type"));
+        form.append(&kind);
+        form.append(&field_label("Image role"));
+        form.append(&role);
+        let role_for_kind = role.clone();
+        kind.connect_selected_notify(move |kind| {
+            let labels: &[&str] = match remote_kind_for_index(kind.selected()) {
+                Some(MediaKind::Image) => &["Reference", "Start frame", "End frame"],
+                Some(MediaKind::Video) => &["Video input"],
+                Some(MediaKind::Audio) => &["Audio input"],
+                None => &["Image role"],
+            };
+            role_for_kind.set_model(Some(&gtk::StringList::new(labels)));
+            role_for_kind.set_selected(0);
+            role_for_kind.set_sensitive(kind.selected() == 1);
+        });
+        dialog.set_extra_child(Some(&form));
+
+        let weak = Self::weak(self);
+        let focus_url = url.clone();
+        dialog.connect_response(Some("add"), move |_, _| {
+            let Some(this) = weak.upgrade() else { return };
+            this.remote_url.set_text(&url.text());
+            this.remote_kind.set_selected(kind.selected());
+            this.remote_role.set_selected(role.selected());
+            this.add_from_entry();
+        });
+        dialog.present(Some(&self.window));
+        focus_url.grab_focus();
     }
 
     fn add_from_entry(self: &Rc<Self>) {
@@ -1369,6 +1936,7 @@ impl HarnessWindow {
 
             let up = gtk::Button::from_icon_name("go-up-symbolic");
             up.set_tooltip_text(Some("Move earlier"));
+            up.update_property(&[gtk::accessible::Property::Label("Move media earlier")]);
             up.set_sensitive(index > 0);
             let weak = Self::weak(self);
             up.connect_clicked(move |_| {
@@ -1382,6 +1950,7 @@ impl HarnessWindow {
             body.append(&up);
             let down = gtk::Button::from_icon_name("go-down-symbolic");
             down.set_tooltip_text(Some("Move later"));
+            down.update_property(&[gtk::accessible::Property::Label("Move media later")]);
             down.set_sensitive(index + 1 < self.media.borrow().len());
             let weak = Self::weak(self);
             down.connect_clicked(move |_| {
@@ -1394,8 +1963,14 @@ impl HarnessWindow {
             });
             body.append(&down);
             let remove = gtk::Button::from_icon_name("user-trash-symbolic");
-            remove.set_tooltip_text(Some(&format!("Remove {typed_ordinal}")));
+            let remove_label = format!("Remove {typed_ordinal}");
+            remove.set_tooltip_text(Some(&remove_label));
+            remove.update_property(&[gtk::accessible::Property::Label(&remove_label)]);
             remove.add_css_class("flat");
+            let removed_path = match &item.source {
+                MediaSource::LocalFile { path } => Some(path.clone()),
+                MediaSource::RemoteUrl { .. } => None,
+            };
             let weak = Self::weak(self);
             remove.connect_clicked(move |_| {
                 let Some(this) = weak.upgrade() else { return };
@@ -1403,6 +1978,9 @@ impl HarnessWindow {
                     this.media.borrow_mut().remove(index);
                     this.rebuild_media();
                     this.draft_changed();
+                    if let Some(path) = &removed_path {
+                        this.record_relink_removal(path);
+                    }
                 }
             });
             body.append(&remove);
@@ -1460,12 +2038,14 @@ impl HarnessWindow {
     }
 
     fn refresh_models(self: &Rc<Self>) {
+        self.capture_active_model_snapshot();
         let provider = self.selected_provider();
-        let same_provider = self.model_provider.borrow().as_ref() == Some(&provider);
-        let previous_model = same_provider.then(|| self.selected_model_id()).flatten();
-        let previous_options = previous_model
+        let previous_model = self
+            .active_model
+            .borrow()
             .as_ref()
-            .map(|_| self.snapshot_model_options());
+            .filter(|(active_provider, _)| active_provider == &provider)
+            .map(|(_, model_id)| model_id.clone());
         let was_loading = self.loading_draft.replace(true);
         let catalogs = self.catalogs.borrow();
         let Some(catalog) = catalogs.get(&provider) else {
@@ -1476,28 +2056,45 @@ impl HarnessWindow {
             self.model.set_sensitive(false);
             self.model_description
                 .set_text("Loading the current provider catalog…");
+            self.options.audio.set_sensitive(false);
+            self.active_model.replace(None);
             self.loading_draft.set(was_loading);
             return;
         };
-        let labels = catalog
+        let mut labels = catalog
             .models
             .iter()
             .map(|model| model.name.clone())
             .collect::<Vec<_>>();
-        let refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
-        let model_ids = catalog
+        let mut model_ids = catalog
             .models
             .iter()
             .map(|model| model.id.clone())
             .collect::<Vec<_>>();
+        let missing = self
+            .missing_model
+            .borrow()
+            .as_ref()
+            .filter(|(missing_provider, _)| missing_provider == &provider)
+            .map(|(_, model_id)| model_id.clone());
+        if let Some(model_id) = missing.as_ref() {
+            if catalog.find(model_id).is_some() {
+                self.missing_model.replace(None);
+            } else {
+                labels.insert(0, format!("Unavailable — {model_id}"));
+                model_ids.insert(0, model_id.clone());
+            }
+        }
+        let refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
         let retained = previous_model
             .as_ref()
+            .or(missing.as_ref())
             .and_then(|previous| model_ids.iter().position(|model| model == previous));
         let selected = retained
             .or_else(|| {
                 catalog
                     .preferred()
-                    .and_then(|model| catalog.models.iter().position(|item| item.id == model.id))
+                    .and_then(|model| model_ids.iter().position(|item| item == &model.id))
             })
             .unwrap_or(0);
         *self.model_ids.borrow_mut() = model_ids;
@@ -1507,29 +2104,69 @@ impl HarnessWindow {
         self.model.set_selected(selected as u32);
         drop(catalogs);
         self.refresh_model_controls();
-        if retained.is_some()
-            && let Some(options) = previous_options
-        {
-            self.restore_model_options(options);
-        }
         self.loading_draft.set(was_loading);
     }
 
     fn refresh_model_controls(self: &Rc<Self>) {
         let was_loading = self.loading_draft.replace(true);
         let Some(model) = self.selected_model() else {
-            self.model_description
-                .set_text("No compatible video models were returned.");
+            let selected = self.selected_model_id();
+            self.model_description.set_text(if selected.is_some() {
+                "This draft's saved model is not present in the current catalog. Choose an available model explicitly to continue."
+            } else {
+                "No compatible video models were returned."
+            });
+            for control in [
+                &self.options.duration,
+                &self.options.resolution,
+                &self.options.aspect,
+                &self.options.size,
+                &self.options.audio,
+            ] {
+                control.set_sensitive(false);
+            }
+            self.options.seed.set_sensitive(false);
+            self.options
+                .audio_hint
+                .set_text("Unavailable for this model.");
+            self.active_model
+                .replace(selected.map(|model_id| (self.selected_provider(), model_id)));
             self.loading_draft.set(was_loading);
             return;
         };
+        if self
+            .unavailable_draft
+            .borrow()
+            .as_ref()
+            .is_some_and(|draft| draft.provider_id != model.provider_id || draft.model != model.id)
+        {
+            self.unavailable_draft.replace(None);
+            self.missing_model.replace(None);
+        }
         let mut description = model.description.trim().to_owned();
+        for control in [
+            &self.options.duration,
+            &self.options.resolution,
+            &self.options.aspect,
+            &self.options.size,
+        ] {
+            control.set_sensitive(true);
+        }
         if description.is_empty() {
             description = model.id.clone();
         }
         if !model.pricing_skus.is_empty() {
             description.push_str(" • pricing available at Review");
         }
+        description.push_str(if model.generated_audio.supported {
+            match model.generated_audio.provider_default {
+                Some(true) => " • soundtrack default: on",
+                Some(false) => " • soundtrack default: off",
+                None => " • soundtrack supported; default not advertised",
+            }
+        } else {
+            " • generated soundtrack unavailable"
+        });
         if let Some(modalities) = &model.input_modalities {
             let accepted = modalities
                 .iter()
@@ -1604,17 +2241,38 @@ impl HarnessWindow {
             &self.options.sizes,
             &model.supported_sizes,
         );
+        let default_label = match model.generated_audio.provider_default {
+            Some(true) => "Provider default — On",
+            Some(false) => "Provider default — Off",
+            None => "Provider default — not advertised",
+        };
+        set_dropdown_strings(
+            &self.options.audio,
+            &[default_label.to_owned(), "On".into(), "Off".into()],
+        );
         self.options
             .audio
-            .set_sensitive(model.generate_audio == Some(true));
-        if model.generate_audio != Some(true) {
-            self.options.audio.set_active(false);
+            .set_sensitive(model.generated_audio.supported);
+        self.options.audio_hint.set_text(if model.generated_audio.supported {
+            "Controls generated soundtrack output. Audio reference files are separate inputs."
+        } else {
+            "Unavailable for this model. Audio reference files, when supported, remain separate inputs."
+        });
+        if !model.generated_audio.supported {
+            self.options.audio.set_selected(0);
         }
         self.options.seed.set_sensitive(model.seed == Some(true));
         if model.seed != Some(true) {
             self.options.seed.set_text("");
         }
         self.refresh_schema_controls(&model);
+        let key = (model.provider_id.clone(), model.id.clone());
+        if let Some(snapshot) = self.model_snapshots.borrow().get(&key).cloned() {
+            self.restore_model_options(snapshot);
+        } else if let Some(settings) = self.remembered_model_settings.borrow().get(&key).cloned() {
+            self.apply_remembered_model_settings(&settings);
+        }
+        self.active_model.replace(Some(key));
         self.loading_draft.set(was_loading);
     }
 
@@ -1644,7 +2302,7 @@ impl HarnessWindow {
             ),
             aspect_ratio: selected_clone(&self.options.aspects, self.options.aspect.selected()),
             size: selected_clone(&self.options.sizes, self.options.size.selected()),
-            audio: self.options.audio.is_active(),
+            audio: AudioChoice::from_selected(self.options.audio.selected()),
             seed: self.options.seed.text().to_string(),
             schema,
         }
@@ -1667,9 +2325,7 @@ impl HarnessWindow {
             snapshot.aspect_ratio,
         );
         set_selected_clone(&self.options.size, &self.options.sizes, snapshot.size);
-        if self.options.audio.is_sensitive() {
-            self.options.audio.set_active(snapshot.audio);
-        }
+        self.options.audio.set_selected(snapshot.audio.selected());
         if self.options.seed.is_sensitive() {
             self.options.seed.set_text(&snapshot.seed);
         }
@@ -1893,6 +2549,23 @@ impl HarnessWindow {
                 .replace(Some((draft, editor_state, revision)));
             return;
         }
+        let model_available = self
+            .catalogs
+            .borrow()
+            .get(&draft.provider_id)
+            .is_some_and(|catalog| catalog.find(&draft.model).is_some());
+        if model_available {
+            self.unavailable_draft.replace(None);
+            if self.missing_model.borrow().as_ref()
+                == Some(&(draft.provider_id.clone(), draft.model.clone()))
+            {
+                self.missing_model.replace(None);
+            }
+        } else {
+            self.unavailable_draft.replace(Some(draft.clone()));
+            self.missing_model
+                .replace(Some((draft.provider_id.clone(), draft.model.clone())));
+        }
         self.loading_draft.set(true);
         self.provider
             .set_selected(index_for_provider(&draft.provider_id));
@@ -1925,7 +2598,7 @@ impl HarnessWindow {
         set_selected_clone(&self.options.size, &self.options.sizes, draft.size);
         self.options
             .audio
-            .set_active(self.options.audio.is_sensitive() && draft.generate_audio.unwrap_or(false));
+            .set_selected(AudioChoice::from_request(draft.generate_audio).selected());
         self.options.seed.set_text(
             &draft
                 .seed
@@ -1997,21 +2670,152 @@ impl HarnessWindow {
         });
     }
 
-    fn start_animation(self: &Rc<Self>) {
+    fn connect_job_workspace(self: &Rc<Self>) {
         let weak = Self::weak(self);
-        glib::timeout_add_local(Duration::from_millis(420), move || {
-            let Some(this) = weak.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            let index = (this.animation_frame.get() + 1) % ANIMATION_FRAMES.len();
-            this.animation_frame.set(index);
-            for widgets in this.jobs.borrow().values() {
-                if widgets.active.get() {
-                    widgets.animation.set_text(ANIMATION_FRAMES[index]);
-                    widgets.progress.pulse();
-                }
+        self.jobs_list.connect_row_selected(move |_, row| {
+            let Some(this) = weak.upgrade() else { return };
+            let selected = row.and_then(|row| {
+                this.jobs
+                    .borrow()
+                    .iter()
+                    .find(|(_, widgets)| widgets._root == *row)
+                    .map(|(key, _)| key.clone())
+            });
+            this.selected_job.replace(selected);
+            let has_selection = this.selected_job.borrow().is_some();
+            this.jobs_split.set_show_content(has_selection);
+            this.jobs_detail_stack
+                .set_visible_child_name(if has_selection { "detail" } else { "empty" });
+            this.sync_selected_job_detail();
+        });
+
+        let weak = Self::weak(self);
+        self.jobs_search.connect_search_changed(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.apply_job_filters();
             }
-            glib::ControlFlow::Continue
+        });
+        let weak = Self::weak(self);
+        self.jobs_filter.connect_selected_notify(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.apply_job_filters();
+            }
+        });
+    }
+
+    fn apply_job_filters(&self) {
+        let query = self.jobs_search.text().trim().to_ascii_lowercase();
+        let filter = self.jobs_filter.selected();
+        for widgets in self.jobs.borrow().values() {
+            let status = widgets.status.text().to_ascii_lowercase();
+            let searchable = format!(
+                "{} {} {} {}",
+                widgets.title.text(),
+                widgets._key.remote_job_id,
+                status,
+                widgets.detail.text()
+            )
+            .to_ascii_lowercase();
+            let matches_query = query.is_empty() || searchable.contains(&query);
+            let needs_attention = ["failed", "error", "attention", "paused", "uncertain"]
+                .iter()
+                .any(|needle| status.contains(needle));
+            let matches_filter = match filter {
+                1 => widgets.active.get(),
+                2 => needs_attention,
+                3 => !widgets.active.get() && widgets.local_path.borrow().is_some(),
+                _ => true,
+            };
+            widgets._root.set_visible(matches_query && matches_filter);
+        }
+    }
+
+    fn sync_selected_job_detail(&self) {
+        let Some(key) = self.selected_job.borrow().clone() else {
+            self.cloud_cinema
+                .set_activity(CloudCinemaActivity::Inactive);
+            self.cloud_cinema.widget().set_visible(false);
+            self.job_video.set_visible(false);
+            return;
+        };
+        let jobs = self.jobs.borrow();
+        let Some(widgets) = jobs.get(&key) else {
+            return;
+        };
+        let status = widgets.status.text();
+        let detail = widgets.detail.text();
+        self.cloud_cinema
+            .set_provider(Some(provider_name(&key.provider_id)));
+        self.cloud_cinema.set_job_id(Some(&key.remote_job_id));
+        self.cloud_cinema.set_status(&status, Some(&detail));
+        let next_poll =
+            remaining_poll_time(&status, *widgets.next_poll_at.borrow(), Instant::now());
+        self.cloud_cinema
+            .set_timing(widgets.observed_since.elapsed(), next_poll);
+        let lowered = status.to_ascii_lowercase();
+        let activity = if widgets.active.get() {
+            CloudCinemaActivity::Active
+        } else if lowered.contains("paused") {
+            CloudCinemaActivity::Paused
+        } else if ["failed", "error", "attention", "uncertain"]
+            .iter()
+            .any(|needle| lowered.contains(needle))
+        {
+            CloudCinemaActivity::Error
+        } else {
+            CloudCinemaActivity::Inactive
+        };
+        self.cloud_cinema.set_activity(activity);
+
+        let local_path = widgets.local_path.borrow().clone();
+        if let Some(path) = local_path.filter(|path| path.is_file()) {
+            let already_loaded =
+                self.job_video.file().and_then(|file| file.path()).as_ref() == Some(&path);
+            if !already_loaded {
+                self.job_video.set_file(Some(&gio::File::for_path(&path)));
+            }
+            self.cloud_cinema.widget().set_visible(false);
+            self.job_video.set_visible(true);
+        } else {
+            self.cloud_cinema.widget().set_visible(true);
+            self.job_video.set_visible(false);
+            self.job_video.set_file(None::<&gio::File>);
+        }
+    }
+
+    fn start_job_detail_sync(self: &Rc<Self>) {
+        let weak = Self::weak(self);
+        self.jobs_detail_stack.connect_map(move |_| {
+            let Some(this) = weak.upgrade() else {
+                return;
+            };
+            if this.job_detail_timer.borrow().is_some() {
+                return;
+            }
+            this.sync_selected_job_detail();
+            let tick = Self::weak(&this);
+            let source = glib::timeout_add_local(Duration::from_secs(1), move || {
+                let Some(this) = tick.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                if !this.jobs_detail_stack.is_mapped() {
+                    this.job_detail_timer.borrow_mut().take();
+                    return glib::ControlFlow::Break;
+                }
+                this.sync_selected_job_detail();
+                glib::ControlFlow::Continue
+            });
+            this.job_detail_timer.replace(Some(source));
+        });
+
+        let weak = Self::weak(self);
+        self.jobs_detail_stack.connect_unmap(move |_| {
+            let Some(this) = weak.upgrade() else {
+                return;
+            };
+            if let Some(source) = this.job_detail_timer.borrow_mut().take() {
+                source.remove();
+            }
         });
     }
 
@@ -2073,14 +2877,37 @@ impl HarnessWindow {
             ServiceEvent::CatalogLoaded {
                 provider_id,
                 catalog,
+                remembered_settings,
                 ..
             } => {
+                for (model_id, settings) in remembered_settings {
+                    self.remembered_model_settings
+                        .borrow_mut()
+                        .entry((provider_id.clone(), model_id))
+                        .or_insert(settings);
+                }
+                let selected_id = (provider_id == self.selected_provider())
+                    .then(|| self.selected_model_id())
+                    .flatten();
+                let selected_key = selected_id
+                    .as_ref()
+                    .map(|model_id| ModelKey::new(provider_id.clone(), model_id));
+                let capabilities_changed = self
+                    .catalog_reducer
+                    .borrow_mut()
+                    .apply(&catalog, selected_key.as_ref());
                 self.catalogs
                     .borrow_mut()
                     .insert(provider_id.clone(), catalog);
                 if provider_id == self.selected_provider() {
                     self.refresh_models();
                     self.update_compatibility();
+                }
+                if capabilities_changed {
+                    // A cached/live capability transition can change request
+                    // validity or price. Treat the transition as one logical
+                    // edit; identical repeated catalog events are idempotent.
+                    self.draft_changed();
                 }
                 let pending = self.pending_draft.borrow().as_ref().cloned();
                 if pending
@@ -2275,6 +3102,7 @@ impl HarnessWindow {
                     .and_then(job_title)
                     .unwrap_or_else(|| format!("{} job", provider_name(&provider_id)));
                 let widgets = self.ensure_job(key.clone(), &title);
+                widgets.next_poll_at.replace(None);
                 widgets.status.set_text(job.status.as_str());
                 widgets
                     .detail
@@ -2328,6 +3156,7 @@ impl HarnessWindow {
             } => {
                 self.clear_pending_submission(op_id);
                 if let Some(widgets) = self.jobs.borrow().get(&key) {
+                    widgets.next_poll_at.replace(None);
                     widgets.status.set_text("recovery failed");
                     widgets.detail.set_text(
                         "The provider accepted this job, but its recovery record could not be saved. Copy the remote ID now.",
@@ -2371,6 +3200,7 @@ impl HarnessWindow {
                     job.key(),
                     &job_title(&record).unwrap_or_else(|| "Video generation".into()),
                 );
+                widgets.next_poll_at.replace(None);
                 widgets.status.set_text(job.status.as_str());
                 widgets.detail.set_text(match job.status.as_str() {
                     "pending" => "Queued by the provider",
@@ -2392,9 +3222,7 @@ impl HarnessWindow {
                     widgets
                         .animation
                         .set_text(if job.successful() { "✓" } else { "!" });
-                    widgets
-                        .progress
-                        .set_fraction(if job.successful() { 1.0 } else { 0.0 });
+                    widgets.progress.set_visible(false);
                 }
             }
             ServiceEvent::PollWaiting {
@@ -2415,6 +3243,7 @@ impl HarnessWindow {
                     next_in.as_secs()
                 ));
                 widgets.active.set(true);
+                widgets.next_poll_at.replace(Some(Instant::now() + next_in));
                 self.active_jobs.borrow_mut().insert(key);
             }
             ServiceEvent::DownloadProgress {
@@ -2429,6 +3258,7 @@ impl HarnessWindow {
                     remote_job_id: job_id,
                 };
                 let widgets = self.ensure_job(key.clone(), "Video generation");
+                widgets.next_poll_at.replace(None);
                 widgets.status.set_text("downloading");
                 widgets.detail.set_text(&match total {
                     Some(total) => format!(
@@ -2439,7 +3269,10 @@ impl HarnessWindow {
                     None => format!("Saving video… {}", byte_size(written)),
                 });
                 if let Some(total) = total.filter(|value| *value > 0) {
+                    widgets.progress.set_visible(true);
                     widgets.progress.set_fraction(written as f64 / total as f64);
+                } else {
+                    widgets.progress.set_visible(false);
                 }
                 widgets.active.set(true);
                 self.active_jobs.borrow_mut().insert(key);
@@ -2451,18 +3284,18 @@ impl HarnessWindow {
                     job.key(),
                     &job_title(&record).unwrap_or_else(|| "Completed video".into()),
                 );
+                widgets.next_poll_at.replace(None);
                 widgets.status.set_text("saved");
                 widgets
                     .detail
                     .set_text(&format!("Saved to {}", path.display()));
                 widgets.progress.set_fraction(1.0);
+                widgets.progress.set_visible(true);
                 widgets.animation.set_text("✓");
                 widgets.active.set(false);
                 widgets.pause.set_sensitive(false);
                 widgets.resume.set_sensitive(false);
                 widgets.open.set_sensitive(true);
-                widgets.video.set_file(Some(&gio::File::for_path(&path)));
-                widgets.video.set_visible(true);
                 widgets.local_path.replace(Some(path));
                 self.latest_video
                     .replace(widgets.local_path.borrow().clone());
@@ -2483,6 +3316,7 @@ impl HarnessWindow {
                 ..
             } => {
                 if let Some(widgets) = self.jobs.borrow().get(&key) {
+                    widgets.next_poll_at.replace(None);
                     widgets.active.set(false);
                     widgets.pause.set_sensitive(false);
                     widgets.resume.set_sensitive(true);
@@ -2502,6 +3336,7 @@ impl HarnessWindow {
                 ..
             } => {
                 for widgets in self.jobs.borrow().values() {
+                    widgets.next_poll_at.replace(None);
                     if widgets.active.replace(false) {
                         widgets.pause.set_sensitive(false);
                         widgets.resume.set_sensitive(true);
@@ -2531,6 +3366,7 @@ impl HarnessWindow {
             ServiceEvent::ResumableJobsLoaded { jobs, .. } => {
                 for job in jobs {
                     let widgets = self.ensure_job(job.key.clone(), "Saved remote job");
+                    widgets.next_poll_at.replace(None);
                     widgets.status.set_text(if job.monitoring_paused {
                         "monitoring paused"
                     } else {
@@ -2554,6 +3390,7 @@ impl HarnessWindow {
                         remote_job_id: job_id,
                     };
                     if let Some(widgets) = self.jobs.borrow().get(&key) {
+                        widgets.next_poll_at.replace(None);
                         widgets.active.set(false);
                         widgets.status.set_text("monitoring stopped");
                         widgets.detail.set_text(if remote_continues {
@@ -2568,6 +3405,8 @@ impl HarnessWindow {
             ServiceEvent::DraftSaved {
                 op_id, revision, ..
             } => {
+                self.acknowledge_resolved_relinks(revision);
+                self.update_compatibility();
                 if self.pending_close_draft_op.get() == Some(op_id) {
                     self.pending_close_draft_op.set(None);
                     if revision == self.revision.get() {
@@ -2603,6 +3442,7 @@ impl HarnessWindow {
                                 .as_ref()
                                 .is_none_or(|provider| provider == &key.provider_id)
                         {
+                            widgets.next_poll_at.replace(None);
                             widgets.status.set_text("needs attention");
                             widgets.detail.set_text(&message);
                             widgets.active.set(false);
@@ -2632,12 +3472,13 @@ impl HarnessWindow {
                 self.window.close();
                 self.keep_alive.borrow_mut().take();
             }
-            ServiceEvent::VideoOpened { .. }
-            | ServiceEvent::QuoteReady { .. }
+            ServiceEvent::QuoteReady { .. }
             | ServiceEvent::SettingsSaved { .. }
             | ServiceEvent::DefaultProviderSaved { .. }
             | ServiceEvent::Imported { .. } => {}
         }
+        self.apply_job_filters();
+        self.sync_selected_job_detail();
     }
 
     fn update_connections(&self, connections: &[ProviderConnection]) {
@@ -2687,30 +3528,31 @@ impl HarnessWindow {
         body.set_margin_bottom(18);
         body.set_margin_start(18);
         body.set_margin_end(18);
+        let summary = gtk::Box::new(gtk::Orientation::Vertical, 14);
         let title = gtk::Label::new(Some(
             "Everything below is ready. Nothing has been submitted yet.",
         ));
         title.set_halign(gtk::Align::Start);
         title.set_wrap(true);
         title.add_css_class("title-3");
-        body.append(&title);
-        body.append(&summary_row("Provider", provider_name(&provider_id)));
-        body.append(&summary_row("Model", &request.model));
-        body.append(&summary_row(
+        summary.append(&title);
+        summary.append(&summary_row("Provider", provider_name(&provider_id)));
+        summary.append(&summary_row("Model", &request.model));
+        summary.append(&summary_row(
             "Prompt",
             &ellipsize_text(&request.prompt, 180),
         ));
-        body.append(&summary_row(
+        summary.append(&summary_row(
             "Reference media",
             &typed_reference_counts(&request),
         ));
         let reference_details = typed_reference_details(&request);
         if !reference_details.is_empty() {
-            body.append(&summary_row(
+            summary.append(&summary_row(
                 "Typed references",
                 &reference_details.join("\n"),
             ));
-            body.append(&summary_row(
+            summary.append(&summary_row(
                 "Media checks",
                 "Counts, URL safety, and supported local file signatures were checked. Duration, dimensions, and remote-media contents are not locally verified; provider validation and final usage remain authoritative.",
             ));
@@ -2737,12 +3579,19 @@ impl HarnessWindow {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "provider default".into()),
         );
-        body.append(&summary_row("Settings", &settings));
+        summary.append(&summary_row("Settings", &settings));
         if let Some(options) = &request.adapter_options {
             let options =
                 serde_json::to_string_pretty(options).unwrap_or_else(|_| options.to_string());
-            body.append(&summary_row("Provider options", &options));
+            summary.append(&summary_row("Provider options", &options));
         }
+        let summary_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .max_content_height(460)
+            .propagate_natural_height(true)
+            .child(&summary)
+            .build();
+        body.append(&summary_scroll);
         let price = quote
             .amount
             .map(|amount| {
@@ -2831,8 +3680,8 @@ impl HarnessWindow {
             return Rc::clone(widgets);
         }
         let row = gtk::ListBoxRow::new();
-        row.set_selectable(false);
-        row.set_activatable(false);
+        row.set_selectable(true);
+        row.set_activatable(true);
         let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
         body.add_css_class("harness-job-card");
 
@@ -2842,7 +3691,10 @@ impl HarnessWindow {
         title.set_halign(gtk::Align::Start);
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
         title.add_css_class("title-3");
-        let status = gtk::Label::new(Some("saved"));
+        let status = gtk::Label::builder()
+            .label("saved")
+            .accessible_role(gtk::AccessibleRole::Status)
+            .build();
         status.add_css_class("caption-heading");
         header.append(&title);
         header.append(&status);
@@ -2860,11 +3712,15 @@ impl HarnessWindow {
         body.append(&id);
 
         let progress_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let animation = gtk::Label::new(Some("·"));
+        let animation = gtk::Label::builder()
+            .label("▣")
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build();
         animation.add_css_class("harness-animation");
         let progress = gtk::ProgressBar::new();
         progress.set_hexpand(true);
-        progress.set_pulse_step(0.06);
+        progress.set_visible(false);
+        progress.update_property(&[gtk::accessible::Property::Label("Video download progress")]);
         progress_row.append(&animation);
         progress_row.append(&progress);
         body.append(&progress_row);
@@ -2874,23 +3730,22 @@ impl HarnessWindow {
         detail.add_css_class("harness-muted");
         body.append(&detail);
 
-        let video = gtk::Video::new();
-        video.set_height_request(270);
-        video.set_hexpand(true);
-        video.set_autoplay(false);
-        video.set_loop(false);
-        video.set_visible(false);
-        body.append(&video);
-
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         actions.set_halign(gtk::Align::End);
-        let pause = gtk::Button::with_label("Pause monitoring");
+        let pause = gtk::Button::from_icon_name("media-playback-pause-symbolic");
+        pause.set_tooltip_text(Some("Pause monitoring"));
+        pause.update_property(&[gtk::accessible::Property::Label("Pause monitoring")]);
         pause.set_sensitive(false);
-        let resume = gtk::Button::with_label("Resume");
+        let resume = gtk::Button::from_icon_name("media-playback-start-symbolic");
+        resume.set_tooltip_text(Some("Resume monitoring"));
+        resume.update_property(&[gtk::accessible::Property::Label("Resume monitoring")]);
         resume.add_css_class("suggested-action");
-        let open = gtk::Button::with_label("Open externally");
+        let open = gtk::Button::from_icon_name("video-display-symbolic");
         open.set_sensitive(false);
-        open.set_tooltip_text(Some("Open the saved video (Ctrl+O)"));
+        open.set_tooltip_text(Some("Open this saved video externally"));
+        open.update_property(&[gtk::accessible::Property::Label(
+            "Open this saved video externally",
+        )]);
         actions.append(&pause);
         actions.append(&resume);
         actions.append(&open);
@@ -2907,12 +3762,13 @@ impl HarnessWindow {
             detail,
             animation,
             progress,
-            video,
             pause,
             resume,
             open,
             local_path: RefCell::new(None),
             active: Cell::new(false),
+            observed_since: Instant::now(),
+            next_poll_at: RefCell::new(None),
         });
         let weak = Self::weak(self);
         let key_for_pause = key.clone();
@@ -2933,6 +3789,7 @@ impl HarnessWindow {
                     key: key_for_resume.clone(),
                 });
                 if let Some(widgets) = this.jobs.borrow().get(&key_for_resume) {
+                    widgets.next_poll_at.replace(None);
                     widgets.active.set(true);
                     widgets.pause.set_sensitive(true);
                     widgets.resume.set_sensitive(false);
@@ -2940,6 +3797,8 @@ impl HarnessWindow {
                     widgets.detail.set_text("Connecting to the provider…");
                 }
                 this.active_jobs.borrow_mut().insert(key_for_resume.clone());
+                this.apply_job_filters();
+                this.sync_selected_job_detail();
             }
         });
         let weak = Self::weak(self);
@@ -2949,13 +3808,13 @@ impl HarnessWindow {
                 return;
             };
             if let Some(path) = widgets.local_path.borrow().clone() {
-                this.send(ServiceCommand::OpenVideo {
-                    op_id: this.op_id(),
-                    path,
-                });
+                this.launch_video(&path);
             }
         });
         self.jobs.borrow_mut().insert(key, Rc::clone(&widgets));
+        if self.jobs_list.selected_row().is_none() {
+            self.jobs_list.select_row(Some(&widgets._root));
+        }
         widgets
     }
 
@@ -2982,9 +3841,8 @@ impl HarnessWindow {
         if let Some(path) = record.output_path.as_ref().filter(|path| path.exists()) {
             widgets.local_path.replace(Some(path.clone()));
             widgets.open.set_sensitive(true);
-            widgets.video.set_file(Some(&gio::File::for_path(path)));
-            widgets.video.set_visible(true);
             widgets.progress.set_fraction(1.0);
+            widgets.progress.set_visible(true);
             widgets.animation.set_text("✓");
             if self.latest_video.borrow().is_none() {
                 self.latest_video.replace(Some(path.clone()));
@@ -2995,14 +3853,23 @@ impl HarnessWindow {
         }
     }
 
-    fn open_latest_video(&self) {
-        let path = self.latest_video.borrow().clone();
+    fn open_selected_or_latest_video(self: &Rc<Self>) {
+        let selected = self
+            .selected_job
+            .borrow()
+            .as_ref()
+            .and_then(|key| self.jobs.borrow().get(key).cloned())
+            .and_then(|widgets| widgets.local_path.borrow().clone())
+            .filter(|path| path.is_file());
+        let path = selected.or_else(|| {
+            self.latest_video
+                .borrow()
+                .clone()
+                .filter(|path| path.is_file())
+        });
         match path {
             Some(path) => {
-                self.send(ServiceCommand::OpenVideo {
-                    op_id: self.op_id(),
-                    path,
-                });
+                self.launch_video(&path);
             }
             None => self.toast(
                 "No downloaded video is available yet.",
@@ -3265,7 +4132,7 @@ impl HarnessWindow {
 }
 
 struct ComposeWidgets {
-    page: gtk::ScrolledWindow,
+    page: adw::OverlaySplitView,
     prompt: gtk::TextView,
     provider: gtk::DropDown,
     model: gtk::DropDown,
@@ -3287,7 +4154,7 @@ struct ComposeWidgets {
 
 impl ComposeWidgets {
     fn build() -> Self {
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 20);
         content.add_css_class("harness-page");
 
         let hero = gtk::Label::new(Some("Create something worth watching"));
@@ -3322,28 +4189,31 @@ impl ComposeWidgets {
 
         let provider = dropdown(&["OpenRouter", "fal.ai"]);
         let model = dropdown(&["Loading models…"]);
+        model.set_enable_search(true);
         model.set_sensitive(false);
-        let provider_grid = gtk::Grid::builder()
-            .column_spacing(16)
-            .row_spacing(10)
-            .hexpand(true)
-            .build();
-        provider_grid.attach(&field_label("Provider"), 0, 0, 1, 1);
-        provider_grid.attach(&provider, 1, 0, 1, 1);
-        provider_grid.attach(&field_label("Model"), 0, 1, 1, 1);
-        provider_grid.attach(&model, 1, 1, 1, 1);
         provider.set_hexpand(true);
         model.set_hexpand(true);
         let model_description = gtk::Label::new(Some("Loading the current provider catalog…"));
         model_description.set_halign(gtk::Align::Start);
         model_description.set_wrap(true);
         model_description.add_css_class("harness-muted");
-        provider_grid.attach(&model_description, 1, 2, 1, 1);
-        content.append(&card(
-            "Provider & model",
-            "Capabilities and price data come from the provider catalog.",
-            &provider_grid,
-        ));
+        let provider_group = adw::PreferencesGroup::builder()
+            .title("Provider & model")
+            .description(
+                "Search the live catalog; capability and pricing badges update with the selection.",
+            )
+            .build();
+        let provider_row = adw::ActionRow::builder().title("Provider").build();
+        provider_row.add_suffix(&provider);
+        provider_row.set_activatable_widget(Some(&provider));
+        provider_group.add(&provider_row);
+        let model_row = adw::ActionRow::builder()
+            .title("Model")
+            .subtitle("Type in the picker to search")
+            .build();
+        model_row.add_suffix(&model);
+        model_row.set_activatable_widget(Some(&model));
+        provider_group.add(&model_row);
 
         let media_list = gtk::ListBox::new();
         media_list.set_selection_mode(gtk::SelectionMode::None);
@@ -3369,7 +4239,7 @@ impl ComposeWidgets {
         add_files.add_css_class("suggested-action");
         let remote_url = gtk::Entry::builder()
             .hexpand(true)
-            .placeholder_text("Public https://… URL or file:///…")
+            .placeholder_text("Public https://… URL")
             .build();
         remote_url.set_tooltip_text(Some(
             "Add one reference URL after explicitly choosing its media type",
@@ -3381,13 +4251,10 @@ impl ComposeWidgets {
         remote_role.set_tooltip_text(Some(
             "Image role; video and audio references use fixed input roles",
         ));
-        let add_url = gtk::Button::with_label("Add");
-        add_url.set_tooltip_text(Some("Add this typed reference URL"));
+        let add_url = gtk::Button::with_label("Add reference URL…");
+        add_url.set_tooltip_text(Some("Open the typed reference URL dialog"));
         let add_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         add_row.append(&add_files);
-        add_row.append(&remote_url);
-        add_row.append(&remote_kind);
-        add_row.append(&remote_role);
         add_row.append(&add_url);
 
         let media_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -3403,11 +4270,6 @@ impl ComposeWidgets {
 
         let options = build_options();
         let options_grid = options_grid(&options);
-        content.append(&card(
-            "Generation controls",
-            "Controls update to match the selected model; advanced JSON is validated at Review.",
-            &options_grid,
-        ));
 
         let compatibility = gtk::Label::new(Some("Choose a model and write a prompt to continue."));
         compatibility.set_halign(gtk::Align::Start);
@@ -3417,22 +4279,62 @@ impl ComposeWidgets {
         review.add_css_class("suggested-action");
         review.add_css_class("pill");
         review.set_sensitive(false);
+        let settings = gtk::Button::from_icon_name("sidebar-show-symbolic");
+        settings.set_tooltip_text(Some("Show generation settings"));
+        settings.update_property(&[gtk::accessible::Property::Label("Show generation settings")]);
         let action = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        action.add_css_class("harness-action-bar");
+        action.set_margin_top(10);
+        action.set_margin_bottom(10);
+        action.set_margin_start(16);
+        action.set_margin_end(16);
+        action.append(&settings);
         compatibility.set_hexpand(true);
         action.append(&compatibility);
         action.append(&review);
-        content.append(&action);
 
         let clamp = adw::Clamp::builder()
-            .maximum_size(960)
-            .tightening_threshold(720)
+            .maximum_size(760)
+            .tightening_threshold(560)
             .child(&content)
             .build();
-        let page = gtk::ScrolledWindow::builder()
+        let main_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .child(&clamp)
             .build();
-        page.add_css_class("harness-canvas");
+        main_scroll.set_vexpand(true);
+        let main = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        main.append(&main_scroll);
+        main.append(&action);
+        main.add_css_class("harness-canvas");
+
+        let inspector_content = gtk::Box::new(gtk::Orientation::Vertical, 18);
+        inspector_content.add_css_class("harness-inspector");
+        inspector_content.set_margin_top(20);
+        inspector_content.set_margin_bottom(20);
+        inspector_content.set_margin_start(16);
+        inspector_content.set_margin_end(16);
+        inspector_content.append(&provider_group);
+        inspector_content.append(&model_description);
+        inspector_content.append(&options_grid);
+        let inspector = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .child(&inspector_content)
+            .build();
+
+        let page = adw::OverlaySplitView::new();
+        page.set_content(Some(&main));
+        page.set_sidebar(Some(&inspector));
+        page.set_sidebar_position(gtk::PackType::End);
+        page.set_sidebar_width_unit(adw::LengthUnit::Px);
+        page.set_min_sidebar_width(360.0);
+        page.set_max_sidebar_width(360.0);
+        page.set_pin_sidebar(true);
+        page.set_show_sidebar(true);
+        let settings_split = page.clone();
+        settings.connect_clicked(move |_| {
+            settings_split.set_show_sidebar(!settings_split.shows_sidebar());
+        });
         Self {
             page,
             prompt,
@@ -3457,41 +4359,64 @@ impl ComposeWidgets {
 }
 
 struct JobsWidgets {
-    page: gtk::Box,
+    page: adw::NavigationSplitView,
     list: gtk::ListBox,
     stack: gtk::Stack,
+    search: gtk::SearchEntry,
+    filter: gtk::DropDown,
+    detail_stack: gtk::Stack,
+    cloud_cinema: CloudCinema,
+    video: gtk::Video,
     resume_all: gtk::Button,
     pause_all: gtk::Button,
 }
 
 impl JobsWidgets {
     fn build() -> Self {
-        let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        page.add_css_class("harness-canvas");
+        let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        sidebar.add_css_class("harness-canvas");
         let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        bar.set_margin_start(24);
-        bar.set_margin_end(24);
+        bar.set_margin_start(16);
+        bar.set_margin_end(16);
         bar.set_margin_top(18);
         bar.set_margin_bottom(12);
         let title = gtk::Label::new(Some("Generation jobs"));
         title.set_halign(gtk::Align::Start);
         title.set_hexpand(true);
         title.add_css_class("title-2");
-        let pause_all = gtk::Button::with_label("Pause all");
-        let resume_all = gtk::Button::with_label("Resume all");
+        let pause_all = gtk::Button::from_icon_name("media-playback-pause-symbolic");
+        pause_all.set_tooltip_text(Some("Pause all monitoring"));
+        pause_all.update_property(&[gtk::accessible::Property::Label("Pause all monitoring")]);
+        let resume_all = gtk::Button::from_icon_name("media-playback-start-symbolic");
+        resume_all.set_tooltip_text(Some("Resume all monitoring"));
+        resume_all.update_property(&[gtk::accessible::Property::Label("Resume all monitoring")]);
         resume_all.add_css_class("suggested-action");
         bar.append(&title);
         bar.append(&pause_all);
         bar.append(&resume_all);
-        page.append(&bar);
+        sidebar.append(&bar);
+
+        let search = gtk::SearchEntry::builder()
+            .placeholder_text("Search jobs")
+            .hexpand(true)
+            .build();
+        let filter = dropdown(&["All", "Active", "Needs attention", "Completed"]);
+        let filters = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        filters.set_margin_start(16);
+        filters.set_margin_end(16);
+        filters.set_margin_bottom(12);
+        filters.append(&search);
+        filters.append(&filter);
+        sidebar.append(&filters);
 
         let list = gtk::ListBox::new();
-        list.set_selection_mode(gtk::SelectionMode::None);
+        list.set_selection_mode(gtk::SelectionMode::Single);
+        list.set_activate_on_single_click(true);
         list.add_css_class("boxed-list");
         let list_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        list_box.set_margin_start(24);
-        list_box.set_margin_end(24);
-        list_box.set_margin_bottom(24);
+        list_box.set_margin_start(16);
+        list_box.set_margin_end(16);
+        list_box.set_margin_bottom(16);
         list_box.append(&list);
         let list_scroll = gtk::ScrolledWindow::builder().child(&list_box).build();
 
@@ -3505,11 +4430,54 @@ impl JobsWidgets {
         stack.add_named(&list_scroll, Some("list"));
         stack.set_visible_child_name("empty");
         stack.set_vexpand(true);
-        page.append(&stack);
+        sidebar.append(&stack);
+
+        let cloud_cinema = CloudCinema::new();
+        let video = gtk::Video::new();
+        video.set_autoplay(false);
+        video.set_loop(false);
+        video.set_visible(false);
+        video.set_hexpand(true);
+        video.set_vexpand(true);
+        video.update_property(&[gtk::accessible::Property::Label("Selected generated video")]);
+        let detail = gtk::Box::new(gtk::Orientation::Vertical, 16);
+        detail.add_css_class("harness-page");
+        detail.append(cloud_cinema.widget());
+        detail.append(&video);
+        let detail_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .child(&detail)
+            .build();
+        let detail_empty = adw::StatusPage::builder()
+            .icon_name("video-display-symbolic")
+            .title("Select a generation")
+            .description(
+                "Provider status, the Tiny Cloud Cinema, and completed playback appear here.",
+            )
+            .build();
+        let detail_stack = gtk::Stack::new();
+        detail_stack.add_named(&detail_empty, Some("empty"));
+        detail_stack.add_named(&detail_scroll, Some("detail"));
+        detail_stack.set_visible_child_name("empty");
+
+        let sidebar_page = adw::NavigationPage::new(&sidebar, "Generation jobs");
+        let detail_page = adw::NavigationPage::new(&detail_stack, "Job details");
+        let page = adw::NavigationSplitView::new();
+        page.set_sidebar(Some(&sidebar_page));
+        page.set_content(Some(&detail_page));
+        page.set_sidebar_width_unit(adw::LengthUnit::Px);
+        page.set_min_sidebar_width(340.0);
+        page.set_max_sidebar_width(420.0);
+        page.set_show_content(false);
         Self {
             page,
             list,
             stack,
+            search,
+            filter,
+            detail_stack,
+            cloud_cinema,
+            video,
             resume_all,
             pause_all,
         }
@@ -3517,7 +4485,7 @@ impl JobsWidgets {
 }
 
 struct ProvidersWidgets {
-    page: gtk::ScrolledWindow,
+    page: adw::PreferencesPage,
     providers: BTreeMap<ProviderId, ProviderWidgets>,
     default_provider: gtk::DropDown,
 }
@@ -3599,14 +4567,10 @@ impl ProvidersWidgets {
             &default_body,
         ));
 
-        let clamp = adw::Clamp::builder()
-            .maximum_size(880)
-            .child(&content)
-            .build();
-        let page = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .child(&clamp)
-            .build();
+        let page = adw::PreferencesPage::new();
+        let workspace = adw::PreferencesGroup::new();
+        workspace.add(&content);
+        page.add(&workspace);
         Self {
             page,
             providers,
@@ -3616,6 +4580,14 @@ impl ProvidersWidgets {
 }
 
 fn build_options() -> OptionWidgets {
+    let audio = dropdown(&["Provider default — not advertised", "On", "Off"]);
+    audio.set_sensitive(false);
+    let audio_hint = gtk::Label::new(Some(
+        "Generated soundtrack output is separate from audio reference inputs.",
+    ));
+    audio_hint.set_halign(gtk::Align::Start);
+    audio_hint.set_wrap(true);
+    audio_hint.add_css_class("harness-muted");
     OptionWidgets {
         duration: dropdown(&["Provider default"]),
         durations: RefCell::new(vec![None]),
@@ -3625,7 +4597,8 @@ fn build_options() -> OptionWidgets {
         aspects: RefCell::new(vec![None]),
         size: dropdown(&["Provider default"]),
         sizes: RefCell::new(vec![None]),
-        audio: gtk::Switch::new(),
+        audio,
+        audio_hint,
         seed: gtk::Entry::builder()
             .placeholder_text("Provider default")
             .build(),
@@ -3636,23 +4609,31 @@ fn build_options() -> OptionWidgets {
 }
 
 fn options_grid(options: &OptionWidgets) -> gtk::Box {
-    let grid = gtk::Grid::builder()
-        .column_spacing(16)
-        .row_spacing(12)
-        .hexpand(true)
+    let group = adw::PreferencesGroup::builder()
+        .title("Generation controls")
+        .description("Exact choices are remembered separately for each provider and model.")
         .build();
-    let rows: [(&str, &gtk::Widget); 6] = [
-        ("Duration", options.duration.upcast_ref()),
-        ("Resolution", options.resolution.upcast_ref()),
-        ("Aspect ratio", options.aspect.upcast_ref()),
-        ("Exact size", options.size.upcast_ref()),
-        ("Generate audio", options.audio.upcast_ref()),
-        ("Seed", options.seed.upcast_ref()),
+    let rows: [(&str, Option<&str>, &gtk::Widget); 6] = [
+        ("Duration", None, options.duration.upcast_ref()),
+        ("Resolution", None, options.resolution.upcast_ref()),
+        ("Aspect ratio", None, options.aspect.upcast_ref()),
+        ("Exact size", None, options.size.upcast_ref()),
+        (
+            "Generated soundtrack",
+            Some("Separate from audio reference input"),
+            options.audio.upcast_ref(),
+        ),
+        ("Seed", None, options.seed.upcast_ref()),
     ];
-    for (index, (label, widget)) in rows.into_iter().enumerate() {
-        grid.attach(&field_label(label), 0, index as i32, 1, 1);
-        widget.set_hexpand(true);
-        grid.attach(widget, 1, index as i32, 1, 1);
+    for (title, subtitle, widget) in rows {
+        let row = adw::ActionRow::builder().title(title).build();
+        if let Some(subtitle) = subtitle {
+            row.set_subtitle(subtitle);
+        }
+        widget.set_width_request(150);
+        row.add_suffix(widget);
+        row.set_activatable_widget(Some(widget));
+        group.add(&row);
     }
     options.advanced.set_monospace(true);
     options.advanced.set_wrap_mode(gtk::WrapMode::WordChar);
@@ -3667,7 +4648,8 @@ fn options_grid(options: &OptionWidgets) -> gtk::Box {
         .child(&advanced_scroll)
         .build();
     let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    body.append(&grid);
+    body.append(&group);
+    body.append(&options.audio_hint);
     let schema_title = gtk::Label::new(Some("Model-specific controls"));
     schema_title.set_halign(gtk::Align::Start);
     schema_title.add_css_class("heading");
@@ -4088,6 +5070,29 @@ fn byte_size(bytes: u64) -> String {
     }
 }
 
+fn remaining_poll_time(status: &str, deadline: Option<Instant>, now: Instant) -> Option<Duration> {
+    if status != "monitoring" {
+        return None;
+    }
+    deadline?
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+}
+
+fn ready_relink_candidate(
+    removed_at: Option<u64>,
+    candidates: &[RelinkCandidate],
+    current_paths: &HashSet<PathBuf>,
+    saved_revision: u64,
+) -> Option<usize> {
+    if removed_at.is_none_or(|revision| revision > saved_revision) {
+        return None;
+    }
+    candidates.iter().position(|candidate| {
+        candidate.revision <= saved_revision && current_paths.contains(&candidate.path)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4227,5 +5232,77 @@ mod tests {
     fn prompt_summary_truncates_on_character_boundaries() {
         assert_eq!(ellipsize_text("hello", 10), "hello");
         assert_eq!(ellipsize_text("🦀🦀🦀", 2), "🦀🦀…");
+    }
+
+    #[test]
+    fn poll_countdown_is_visible_only_for_a_live_monitoring_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(8);
+        assert_eq!(
+            remaining_poll_time("monitoring", Some(deadline), now),
+            Some(Duration::from_secs(8))
+        );
+        assert_eq!(
+            remaining_poll_time("downloading", Some(deadline), now),
+            None
+        );
+        assert_eq!(remaining_poll_time("monitoring", Some(now), now), None);
+        assert_eq!(
+            remaining_poll_time("monitoring", Some(now - Duration::from_secs(1)), now),
+            None
+        );
+    }
+
+    #[test]
+    fn relink_requires_a_saved_selected_replacement() {
+        let replacement = PathBuf::from("/run/user/1000/doc/portal/replacement.png");
+        let mut current = HashSet::new();
+
+        assert_eq!(ready_relink_candidate(Some(7), &[], &current, 7), None);
+
+        current.insert(replacement.clone());
+        let candidates = vec![RelinkCandidate {
+            path: replacement,
+            revision: 8,
+        }];
+        assert_eq!(ready_relink_candidate(None, &candidates, &current, 8), None);
+        assert_eq!(
+            ready_relink_candidate(Some(8), &candidates, &current, 7),
+            None
+        );
+        assert_eq!(
+            ready_relink_candidate(Some(8), &candidates, &current, 8),
+            Some(0)
+        );
+
+        current.clear();
+        assert_eq!(
+            ready_relink_candidate(Some(8), &candidates, &current, 8),
+            None
+        );
+    }
+
+    #[test]
+    fn gtk_workspaces_construct_when_a_display_is_available() {
+        if gtk::init().is_err() {
+            return;
+        }
+        adw::init().expect("initialize libadwaita for the GTK smoke test");
+
+        let compose = ComposeWidgets::build();
+        assert!(compose.model.enables_search());
+        assert_eq!(compose.page.min_sidebar_width(), 360.0);
+        assert_eq!(compose.page.max_sidebar_width(), 360.0);
+
+        let jobs = JobsWidgets::build();
+        assert_eq!(jobs.page.min_sidebar_width(), 340.0);
+        assert_eq!(jobs.page.max_sidebar_width(), 420.0);
+        assert_eq!(
+            jobs.cloud_cinema.widget().accessible_role(),
+            gtk::AccessibleRole::Group
+        );
+
+        let providers = ProvidersWidgets::build();
+        assert_eq!(providers.providers.len(), PROVIDERS.len());
     }
 }

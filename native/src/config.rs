@@ -38,6 +38,8 @@ pub enum ConfigError {
     SettingsJson(#[from] serde_json::Error),
     #[error("model settings must be a JSON object")]
     InvalidSettings,
+    #[error("model settings may not contain credential fields")]
+    CredentialInSettings,
     #[error("invalid provider id: {0}")]
     InvalidProvider(String),
     #[error(
@@ -82,6 +84,9 @@ pub fn load_model_settings(path: &Path) -> Result<ModelSettingsMap, ConfigError>
         Err(error) => return Err(ConfigError::SettingsIo(error)),
     };
     let value: Value = serde_json::from_slice(&contents)?;
+    if contains_credential_field(&value) {
+        return Err(ConfigError::CredentialInSettings);
+    }
     let object = value.as_object().ok_or(ConfigError::InvalidSettings)?;
     Ok(object
         .iter()
@@ -98,6 +103,9 @@ pub fn save_model_settings(
     if model_id.trim().is_empty() || !settings.is_object() {
         return Err(ConfigError::InvalidSettings);
     }
+    if contains_credential_field(&settings) {
+        return Err(ConfigError::CredentialInSettings);
+    }
     let mut all = load_model_settings(path)?;
     all.insert(model_id.to_owned(), settings);
     if let Some(parent) = path.parent() {
@@ -105,6 +113,31 @@ pub fn save_model_settings(
     }
     write_json_atomic(path, &all)?;
     Ok(())
+}
+
+fn contains_credential_field(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            let normalized = key
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>();
+            matches!(
+                normalized.as_str(),
+                "apikey"
+                    | "authorization"
+                    | "accesstoken"
+                    | "authtoken"
+                    | "bearertoken"
+                    | "password"
+                    | "secret"
+                    | "secretkey"
+            ) || contains_credential_field(value)
+        }),
+        Value::Array(values) => values.iter().any(contains_credential_field),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
 }
 
 pub fn load_app_settings(path: &Path) -> Result<AppSettings, ConfigError> {
@@ -490,4 +523,50 @@ pub fn partial_path(target: &Path) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("video.mp4");
     target.with_file_name(format!("{name}.part"))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn remembered_model_settings_reject_credential_fields_recursively() {
+        let directory = tempdir().expect("settings directory");
+        let path = directory.path().join("model-settings.json");
+        save_model_settings(
+            &path,
+            "example/model",
+            json!({"duration": 5, "generate_audio": null}),
+        )
+        .expect("credential-free controls");
+        let original = fs::read(&path).expect("saved settings");
+
+        for settings in [
+            json!({"api_key": "must-not-persist"}),
+            json!({"nested": {"Authorization": "Bearer must-not-persist"}}),
+            json!({"items": [{"access-token": "must-not-persist"}]}),
+        ] {
+            assert!(matches!(
+                save_model_settings(&path, "example/model", settings),
+                Err(ConfigError::CredentialInSettings)
+            ));
+            assert_eq!(fs::read(&path).expect("unchanged settings"), original);
+        }
+
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "example/model": {"nested": {"secret_key": "must-not-load"}}
+            }))
+            .expect("malicious settings fixture"),
+        )
+        .expect("write malicious settings fixture");
+        assert!(matches!(
+            load_model_settings(&path),
+            Err(ConfigError::CredentialInSettings)
+        ));
+    }
 }

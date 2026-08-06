@@ -1,0 +1,10 @@
+[Flatpak Ref]
+Name=io.github.EnchiladaBoy.VideoHarness
+Branch=stable
+Title=Video Harness
+Comment=Create AI videos across providers
+Url=@REPO_URL@
+RuntimeRepo=https://flathub.org/repo/flathub.flatpakrepo
+IsRuntime=false
+SuggestRemoteName=video-harness
+GPGKey=@GPG_KEY_BASE64@

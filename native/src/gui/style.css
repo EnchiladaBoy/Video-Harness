@@ -8,10 +8,10 @@
 
 .harness-card {
   background: @card_bg_color;
-  border: 1px solid alpha(@borders, .45);
-  border-radius: 14px;
-  box-shadow: 0 1px 2px alpha(black, .08);
-  padding: 18px;
+  border: 1px solid alpha(@borders, .35);
+  border-radius: 18px;
+  box-shadow: 0 8px 28px alpha(black, .06);
+  padding: 20px;
 }
 
 .harness-card-title {
@@ -39,10 +39,10 @@
 }
 
 .harness-drop-zone {
-  border: 2px dashed alpha(@accent_color, .5);
-  border-radius: 12px;
-  padding: 18px;
-  background: alpha(@accent_bg_color, .06);
+  border: 1px dashed alpha(@accent_color, .55);
+  border-radius: 16px;
+  padding: 22px;
+  background: alpha(@accent_bg_color, .08);
 }
 
 .harness-story-row {
@@ -67,4 +67,29 @@
   color: @accent_color;
   font-size: 1.4em;
   font-weight: 700;
+}
+
+.harness-inspector {
+  background: alpha(@card_bg_color, .72);
+  border-left: 1px solid alpha(@borders, .35);
+}
+
+.harness-action-bar {
+  background: alpha(@window_bg_color, .96);
+  border-top: 1px solid alpha(@borders, .35);
+}
+
+.cloud-cinema {
+  background: @card_bg_color;
+  border: 1px solid alpha(@accent_color, .24);
+  border-radius: 18px;
+  box-shadow: 0 12px 36px alpha(black, .08);
+}
+
+.cloud-cinema.paused {
+  border-color: alpha(@warning_color, .45);
+}
+
+.cloud-cinema.error {
+  border-color: alpha(@error_color, .5);
 }

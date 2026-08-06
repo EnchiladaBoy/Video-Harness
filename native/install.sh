@@ -19,9 +19,12 @@ usage() {
 Usage:
   ./install.sh install [GUI_BINARY]   Stage Video Harness and install desktop files
   ./install.sh status                 Show the installed GUI target
+  ./install.sh uninstall              Remove launchers and unmodified desktop files
 
-Install creates the video-harness launcher. It never changes openrouter-video
-or removes credentials, settings, history, downloads, or provider data.
+Install accepts x86_64 and aarch64 Linux. With no GUI_BINARY it uses a binary
+bundled at native/bin/video-harness, or builds the source tree as a fallback.
+It never changes openrouter-video or removes credentials, settings, history,
+downloads, provider data, or immutable releases.
 EOF
 }
 
@@ -100,20 +103,27 @@ retire_owned_transition_aliases() {
 install_release() {
     local source_gui="${1:-}"
     if [[ -z "${source_gui}" ]]; then
-        local cargo_bin
-        cargo_bin="$(command -v cargo 2>/dev/null || true)"
-        if [[ -z "${cargo_bin}" && -x "${HOME}/.cargo/bin/cargo" ]]; then
-            cargo_bin="${HOME}/.cargo/bin/cargo"
+        if [[ -x "${NATIVE_DIR}/bin/video-harness" ]]; then
+            source_gui="${NATIVE_DIR}/bin/video-harness"
+        else
+            local cargo_bin
+            cargo_bin="$(command -v cargo 2>/dev/null || true)"
+            if [[ -z "${cargo_bin}" && -x "${HOME}/.cargo/bin/cargo" ]]; then
+                cargo_bin="${HOME}/.cargo/bin/cargo"
+            fi
+            [[ -n "${cargo_bin}" ]] || fail "cargo is required to build the native release"
+            "${cargo_bin}" build --release --locked --bin video-harness --manifest-path "${NATIVE_DIR}/Cargo.toml"
+            source_gui="${NATIVE_DIR}/target/release/video-harness"
         fi
-        [[ -n "${cargo_bin}" ]] || fail "cargo is required to build the native release"
-        "${cargo_bin}" build --release --locked --bin video-harness --manifest-path "${NATIVE_DIR}/Cargo.toml"
-        source_gui="${NATIVE_DIR}/target/release/video-harness"
     fi
     [[ -f "${source_gui}" && -x "${source_gui}" ]] || fail "GUI executable not found: ${source_gui}"
 
     local machine
     machine="$(uname -m)"
-    [[ "${machine}" == "aarch64" ]] || fail "This installer currently supports Fedora ARM64; found ${machine}"
+    case "${machine}" in
+        x86_64|amd64|aarch64|arm64) ;;
+        *) fail "This package supports x86_64 and aarch64 Linux; found ${machine}" ;;
+    esac
 
     local version release_dir release_gui staging
     version="$(binary_version "${source_gui}")"
@@ -155,12 +165,50 @@ show_status() {
     echo "GUI: ${GUI_LINK} -> $(link_target "${GUI_LINK}")"
 }
 
+remove_if_unmodified() {
+    local source="$1"
+    local destination="$2"
+    [[ -e "${destination}" || -L "${destination}" ]] || return 0
+
+    if [[ -f "${destination}" && ! -L "${destination}" ]] && cmp -s -- "${source}" "${destination}"; then
+        rm -f -- "${destination}"
+    else
+        echo "Preserved modified or unexpected file: ${destination}" >&2
+    fi
+}
+
+uninstall_release() {
+    if [[ -L "${GUI_LINK}" ]]; then
+        local target
+        target="$(readlink -f -- "${GUI_LINK}" 2>/dev/null || true)"
+        case "${target}" in
+            "${RELEASES_DIR}"/*/video-harness) rm -f -- "${GUI_LINK}" ;;
+            *) echo "Preserved unowned launcher: ${GUI_LINK}" >&2 ;;
+        esac
+    elif [[ -e "${GUI_LINK}" ]]; then
+        echo "Preserved regular launcher: ${GUI_LINK}" >&2
+    fi
+
+    remove_if_unmodified \
+        "${NATIVE_DIR}/data/io.github.EnchiladaBoy.VideoHarness.desktop" \
+        "${DATA_ROOT}/applications/io.github.EnchiladaBoy.VideoHarness.desktop"
+    remove_if_unmodified \
+        "${NATIVE_DIR}/data/io.github.EnchiladaBoy.VideoHarness.metainfo.xml" \
+        "${DATA_ROOT}/metainfo/io.github.EnchiladaBoy.VideoHarness.metainfo.xml"
+    remove_if_unmodified \
+        "${NATIVE_DIR}/data/icons/io.github.EnchiladaBoy.VideoHarness.svg" \
+        "${DATA_ROOT}/icons/hicolor/scalable/apps/io.github.EnchiladaBoy.VideoHarness.svg"
+
+    echo "Removed Video Harness integration files that were still unmodified."
+    echo "Application data and immutable releases were preserved under ${LIB_ROOT}."
+}
+
 command_name="${1:-install}"
 if [[ $# -gt 0 ]]; then
     shift
 fi
 case "${command_name}" in
-    install|status) ;;
+    install|status|uninstall) ;;
     -h|--help|help)
         usage
         exit 0
@@ -180,4 +228,5 @@ fi
 case "${command_name}" in
     install) [[ $# -le 1 ]] || fail "install accepts at most one binary path"; install_release "${1:-}" ;;
     status) [[ $# -eq 0 ]] || fail "status takes no arguments"; show_status ;;
+    uninstall) [[ $# -eq 0 ]] || fail "uninstall takes no arguments"; uninstall_release ;;
 esac

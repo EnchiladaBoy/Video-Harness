@@ -1,11 +1,11 @@
 [package]
 name = "video-harness"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.92"
 description = "A native multi-provider workspace for AI video generation"
 license = "MIT"
-repository = "https://github.com/EnchiladaBoy/video-harness-cli"
+repository = "https://github.com/EnchiladaBoy/VideoHarness"
 keywords = ["video", "ai", "gtk", "openrouter", "fal"]
 categories = ["multimedia::video"]
 default-run = "video-harness"

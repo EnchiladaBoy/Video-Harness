@@ -19,9 +19,16 @@
   <developer id="io.github.enchiladaboy">
     <name>EnchiladaBoy</name>
   </developer>
-  <url type="homepage">https://github.com/EnchiladaBoy/video-harness-cli</url>
+  <url type="homepage">https://github.com/EnchiladaBoy/VideoHarness</url>
+  <url type="bugtracker">https://github.com/EnchiladaBoy/VideoHarness/issues</url>
+  <url type="vcs-browser">https://github.com/EnchiladaBoy/VideoHarness</url>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.6.0" date="2026-08-07">
+      <description>
+        <p>Adds a responsive interface, truthful generated-audio controls, Tiny Cloud Cinema job feedback, and multi-architecture Flatpak distribution.</p>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-08-06">
       <description>
         <p>Adds typed image, video, and audio inputs with model-aware validation.</p>

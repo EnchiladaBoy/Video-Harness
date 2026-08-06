@@ -79,7 +79,8 @@ fn catalog_fixture_maps_capabilities_pricing_and_cache_compatibly() {
     assert_eq!(catalog.preferred(), Some(flux));
     assert_eq!(flux.supported_durations, vec![4, 8]);
     assert_eq!(flux.supported_resolutions, vec!["720p", "1080p"]);
-    assert_eq!(flux.generate_audio, Some(false));
+    assert!(!flux.generated_audio.supported);
+    assert_eq!(flux.generated_audio.provider_default, Some(false));
     assert_eq!(
         flux.pricing_skus["cents_per_second_output_720p"],
         Decimal::new(17, 0)
@@ -129,6 +130,85 @@ fn model_reports_every_incompatible_setting() {
         problems
             .iter()
             .any(|problem| problem.contains("last_frame"))
+    );
+}
+
+#[test]
+fn generated_audio_capability_separates_support_from_request_default() {
+    let openrouter_on = VideoModel::from_api(&json!({
+        "id": "example/audio-on",
+        "generate_audio": true
+    }))
+    .expect("OpenRouter audio model");
+    assert!(openrouter_on.generated_audio.supported);
+    assert_eq!(openrouter_on.generated_audio.provider_default, Some(true));
+
+    for value in [json!(false), serde_json::Value::Null] {
+        let mut model = json!({"id": "example/no-audio"});
+        model["generate_audio"] = value;
+        let parsed = VideoModel::from_api(&model).expect("fail-closed OpenRouter model");
+        assert!(!parsed.generated_audio.supported);
+        assert_eq!(parsed.generated_audio.provider_default, Some(false));
+    }
+    let missing = VideoModel::from_api(&json!({"id": "example/missing-audio"}))
+        .expect("missing OpenRouter flag");
+    assert!(!missing.generated_audio.supported);
+
+    let legacy_fal = VideoModel::from_provider_api(
+        ProviderId::fal(),
+        &json!({"id": "fal/legacy", "generate_audio": true}),
+    )
+    .expect("legacy fal cache");
+    assert!(legacy_fal.generated_audio.supported);
+    assert_eq!(legacy_fal.generated_audio.provider_default, None);
+
+    let current_fal = VideoModel::from_provider_api(
+        ProviderId::fal(),
+        &json!({
+            "id": "fal/current",
+            "generated_audio_capability": {
+                "supported": true,
+                "provider_default": false
+            }
+        }),
+    )
+    .expect("structured fal capability");
+    assert!(current_fal.generated_audio.supported);
+    assert_eq!(current_fal.generated_audio.provider_default, Some(false));
+}
+
+#[test]
+fn audio_variant_pricing_requires_a_known_effective_choice() {
+    let model = VideoModel::from_provider_api(
+        ProviderId::fal(),
+        &json!({
+            "id": "fal/audio-price",
+            "generated_audio_capability": {
+                "supported": true,
+                "provider_default": null
+            },
+            "supported_durations": [5],
+            "pricing_skus": {
+                "duration_seconds_with_audio": "0.40",
+                "duration_seconds_without_audio": "0.20"
+            }
+        }),
+    )
+    .expect("audio-priced model");
+    let mut request =
+        VideoRequest::for_provider(ProviderId::fal(), &model.id, "test").expect("request");
+    request.duration = Some(5);
+    assert!(estimate_cost(&model, &request).amount.is_none());
+
+    request.generate_audio = Some(false);
+    assert_eq!(
+        estimate_cost(&model, &request).amount,
+        Some(Decimal::new(100, 2))
+    );
+    request.generate_audio = Some(true);
+    assert_eq!(
+        estimate_cost(&model, &request).amount,
+        Some(Decimal::new(200, 2))
     );
 }
 

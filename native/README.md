@@ -1,6 +1,6 @@
 # Video Harness native workspace
 
-This directory contains the Rust backend and GTK4/libadwaita application for Video Harness v0.5.0. See the [project README](../README.md) for product behavior and installation.
+This directory contains the Rust backend and GTK4/libadwaita application for Video Harness v0.6.0. See the [project README](../README.md) for product behavior and installation.
 
 ## Fedora prerequisites
 
@@ -29,5 +29,11 @@ video-harness
 ```
 
 The installer stages an immutable `video-harness` binary and installs the desktop, AppStream, and icon assets. It never changes `openrouter-video` or removes application data.
+
+The same installer accepts x86_64 and aarch64 prebuilt binaries. Release
+tarballs place one at `native/bin/video-harness`, so no Rust toolchain is needed
+when installing a bundle. `./install.sh uninstall` removes only the managed
+launcher and byte-for-byte unmodified desktop integration files; application
+data and immutable releases remain available.
 
 Compatibility-sensitive XDG and keyring IDs deliberately remain `openrouter-video-studio`. Generation history remains schema v2 in `history.sqlite3`; GUI draft/upload state uses the separate `gui-state.sqlite3` sidecar.

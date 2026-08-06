@@ -7,6 +7,7 @@ pub mod domain;
 pub mod gui;
 pub mod gui_state;
 pub mod history;
+pub mod migration;
 pub mod providers;
 pub mod workflow;
 

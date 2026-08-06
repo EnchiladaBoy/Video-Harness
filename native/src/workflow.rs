@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -176,10 +175,6 @@ pub enum ServiceCommand {
         op_id: u64,
         limit: usize,
     },
-    OpenVideo {
-        op_id: u64,
-        path: PathBuf,
-    },
     Shutdown,
 }
 
@@ -195,7 +190,6 @@ pub enum ServiceScope {
     Generation,
     Import,
     History,
-    OpenVideo,
 }
 
 #[derive(Debug, Clone)]
@@ -418,10 +412,6 @@ pub enum ServiceEvent {
         provider_id: Option<ProviderId>,
         job_id: Option<String>,
         remote_continues: bool,
-    },
-    VideoOpened {
-        op_id: u64,
-        path: PathBuf,
     },
     Error {
         op_id: u64,
@@ -1343,7 +1333,6 @@ async fn run_service(
                             Err(_) => emit_error(&events, op_id, None, ServiceScope::History, "History task failed".into(), true, None),
                         }
                     }
-                    ServiceCommand::OpenVideo { op_id, path } => open_video(op_id, path, &events).await,
                     ServiceCommand::CancelCurrent { op_id } => {
                         if let Some(operation) = &preparation {
                             preparation_invalidated = true;
@@ -1881,47 +1870,6 @@ async fn refresh_catalog(
             emit_provider_error(&events, op_id, ServiceScope::Catalog, error, None)
         }
         Err(_) => {}
-    }
-}
-
-async fn open_video(op_id: u64, path: PathBuf, events: &mpsc::UnboundedSender<ServiceEvent>) {
-    let resolved = match tokio::fs::canonicalize(&path).await {
-        Ok(path) if path.is_file() => path,
-        _ => {
-            emit_error(
-                events,
-                op_id,
-                None,
-                ServiceScope::OpenVideo,
-                format!("Video file no longer exists: {}", path.display()),
-                true,
-                None,
-            );
-            return;
-        }
-    };
-    match std::process::Command::new("xdg-open")
-        .arg(&resolved)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(_) => {
-            let _ = events.send(ServiceEvent::VideoOpened {
-                op_id,
-                path: resolved,
-            });
-        }
-        Err(error) => emit_error(
-            events,
-            op_id,
-            None,
-            ServiceScope::OpenVideo,
-            format!("Could not start the default video player: {error}"),
-            true,
-            None,
-        ),
     }
 }
 

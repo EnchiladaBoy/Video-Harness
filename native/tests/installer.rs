@@ -77,9 +77,13 @@ fn cleanup(root: &Path) {
     let _ = fs::remove_dir_all(root);
 }
 
+fn installer_arch_supported() -> bool {
+    matches!(std::env::consts::ARCH, "aarch64" | "x86_64")
+}
+
 #[test]
 fn install_is_gui_only_and_retires_owned_native_transition_aliases() {
-    if std::env::consts::ARCH != "aarch64" {
+    if !installer_arch_supported() {
         return;
     }
 
@@ -186,7 +190,7 @@ fn install_is_gui_only_and_retires_owned_native_transition_aliases() {
 
 #[test]
 fn install_preserves_unowned_legacy_links_and_the_stable_command() {
-    if std::env::consts::ARCH != "aarch64" {
+    if !installer_arch_supported() {
         return;
     }
 
@@ -237,7 +241,7 @@ fn install_preserves_unowned_legacy_links_and_the_stable_command() {
 
 #[test]
 fn install_preserves_regular_files_at_legacy_alias_names() {
-    if std::env::consts::ARCH != "aarch64" {
+    if !installer_arch_supported() {
         return;
     }
 
@@ -277,7 +281,7 @@ fn install_preserves_regular_files_at_legacy_alias_names() {
 
 #[test]
 fn install_refuses_to_replace_a_regular_gui_launcher() {
-    if std::env::consts::ARCH != "aarch64" {
+    if !installer_arch_supported() {
         return;
     }
 
@@ -294,6 +298,66 @@ fn install_refuses_to_replace_a_regular_gui_launcher() {
         ),
         "Refusing to replace the regular file",
     );
+
+    cleanup(&root);
+}
+
+#[test]
+fn uninstall_removes_only_owned_unmodified_integration_files() {
+    if !installer_arch_supported() {
+        return;
+    }
+
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture = manifest.join("fixtures/fake-video-harness.sh");
+    let version = fixture_version(&fixture);
+    let root = unique_temp_dir();
+
+    assert_success(run_installer(
+        &root,
+        &["install", fixture.to_str().expect("UTF-8 fixture path")],
+    ));
+
+    let modified_desktop =
+        root.join("share/applications/io.github.EnchiladaBoy.VideoHarness.desktop");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&modified_desktop)
+        .expect("open installed desktop file")
+        .write_all(b"\n# user customization\n")
+        .expect("customize desktop file");
+    let data_sentinel = root.join("lib/history.sqlite3");
+    fs::write(&data_sentinel, b"must survive uninstall").expect("write data sentinel");
+
+    assert_success(run_installer(&root, &["uninstall"]));
+    assert!(!root.join("bin/video-harness").exists());
+    assert!(
+        modified_desktop.is_file(),
+        "modified desktop file is preserved"
+    );
+    assert!(
+        !root
+            .join("share/metainfo/io.github.EnchiladaBoy.VideoHarness.metainfo.xml")
+            .exists()
+    );
+    assert!(
+        !root
+            .join("share/icons/hicolor/scalable/apps/io.github.EnchiladaBoy.VideoHarness.svg")
+            .exists()
+    );
+    assert!(
+        root.join(format!("lib/releases/{version}/video-harness"))
+            .is_file()
+    );
+    assert_eq!(
+        fs::read(&data_sentinel).expect("read preserved data"),
+        b"must survive uninstall"
+    );
+
+    // Repeating uninstall is harmless and still leaves modified/user data alone.
+    assert_success(run_installer(&root, &["uninstall"]));
+    assert!(modified_desktop.is_file());
+    assert!(data_sentinel.is_file());
 
     cleanup(&root);
 }

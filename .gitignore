@@ -10,6 +10,8 @@ htmlcov/
 build/
 dist/
 native/target/
+flatpak-build/
+flatpak-repo/
 *.part
 
 # Local editor, OS, and secret material.
