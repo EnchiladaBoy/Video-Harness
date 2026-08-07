@@ -1,65 +1,60 @@
 # Video Harness release runbook
 
-Releases publish the Tauri/Svelte application as signed Flatpaks for x86_64 and
-aarch64, a signed update repository on GitHub Pages, and best-effort native
-tarballs containing the same desktop GUI. No live provider request belongs in
-release verification.
+Releases publish the Tauri/Svelte desktop application as unsigned, single-file
+AppImages for x86_64 and aarch64 Linux. GitHub hosts the executables and a plain
+`SHA256SUMS` file. No personal signing key, release secret, Flatpak repository,
+or GitHub Pages deployment is required.
 
-## One-time repository setup
+## Release policy
 
-1. Confirm the repository is `EnchiladaBoy/Video-Harness` and the local
-   remote is `git@github.com:EnchiladaBoy/Video-Harness.git`.
-2. Keep the repository public so both native architecture runners are
-   available.
-3. In **Settings → Pages**, select **GitHub Actions** as the source.
-4. Create an environment named `release`, add required reviewers, prevent
-   self-review if desired, and restrict deployment branches/tags to protected
-   release tags.
-5. Create a separate `github-pages` environment if GitHub has not made it
-   automatically.
-
-## Signing key
-
-Use the dedicated identity:
-
-```text
-Video Harness Release <EnchiladaBoy@users.noreply.github.com>
-```
-
-Create an offline, expiry-dated certification primary key and an expiry-dated
-signing subkey on an offline machine. Back up the revocation certificate and
-primary secret key offline. Export only the signing subkey for CI. Review the
-subkey fingerprint and expiry before every release.
-
-Add these encrypted secrets to the protected `release` environment:
-
-- `FLATPAK_GPG_PRIVATE_KEY`: ASCII-armored export containing the signing subkey
-  and a stub, not the usable primary secret key.
-- `FLATPAK_GPG_PASSPHRASE`: the signing subkey passphrase.
-- `FLATPAK_GPG_KEY_ID`: the full signing subkey fingerprint.
-
-Never place key exports in the workspace or repository. The release job exports
-only the public key and attaches it to the release.
+- Build each architecture natively on GitHub's Ubuntu 22.04 runner. This keeps
+  the glibc baseline older than the development runners and avoids unsupported
+  ARM cross-bundling.
+- Pin npm, Cargo, and GitHub Action inputs. A release build must not modify any
+  lockfile.
+- Require an unsigned annotated release tag whose commit is contained in
+  `main`, and require every version-bearing file to match the tag.
+- Never replace an existing GitHub release. Correct a bad release with a new
+  version.
+- Keep GitHub's keyless artifact attestations. They require no user-managed key
+  or passphrase and record which workflow produced each file.
 
 ## Cut v0.7.0
 
-1. Confirm `native/Cargo.toml`, `native/Cargo.lock`, desktop manifests,
-   AppStream, and README all say `0.7.0`; run
-   `packaging/check-release-version.sh`.
-2. Run CI from `main` and require both Flatpak architecture jobs to pass,
-   including `--version`, permissions, and H.264 discovery.
-3. Create and push an annotated signed tag: `git tag -s v0.7.0` followed by
-   `git push origin v0.7.0`.
-4. GitHub must report the tag signature as verified. The workflow independently
-   checks that verification before building.
-5. Approve the protected `release` environment only after reviewing both
-   unsigned architecture artifacts.
-6. Verify the GitHub release contains both `.flatpak` bundles, both native
-   archives, `SHA256SUMS`, its detached signature, the public key,
-   `.flatpakref`, and `.flatpakrepo`. Verify the artifact attestations too.
-7. Install `VideoHarness.flatpakref` on one x86_64 and one aarch64 machine, then
-   confirm a subsequent repository update succeeds.
+1. Confirm the complete CI run on `main` is green, including both Portable
+   AppImage jobs.
+2. Run `packaging/check-release-version.sh v0.7.0` with `appstreamcli` and
+   `desktop-file-validate` installed.
+3. Create an annotated but unsigned tag and push it:
 
-The signing job creates independent signed architecture commits, signs the
-combined repository summary, and deploys that exact repository to
-<https://enchiladaboy.github.io/Video-Harness/>. Native tarballs update manually.
+   ```bash
+   git -c tag.gpgSign=false tag -a v0.7.0 -m "Video Harness 0.7.0"
+   git push origin v0.7.0
+   ```
+
+4. The release workflow builds and publishes exactly these files:
+
+   - `Video-Harness-0.7.0-linux-x86_64.AppImage`
+   - `Video-Harness-0.7.0-linux-aarch64.AppImage`
+   - `SHA256SUMS`
+
+5. Download the assets and verify the hashes:
+
+   ```bash
+   sha256sum --check SHA256SUMS
+   ```
+
+6. On both CPU architectures, make the matching AppImage executable and smoke
+   its version before opening the GUI. For example, on x86_64:
+
+   ```bash
+   chmod +x Video-Harness-0.7.0-linux-x86_64.AppImage
+   ./Video-Harness-0.7.0-linux-x86_64.AppImage --version
+   ```
+
+7. Verify H.264/AAC playback, mute, seeking, file selection, downloads into the
+   XDG Videos directory, and opening a completed render externally.
+
+AppImage targets glibc-based desktop Linux. It does not promise Alpine/musl or
+unconfigured NixOS compatibility. If FUSE mounting is unavailable, run the
+same file with `--appimage-extract-and-run`.

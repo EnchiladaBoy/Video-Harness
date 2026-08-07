@@ -58,5 +58,13 @@ if [[ -n "${EXPECTED_TAG}" && "${EXPECTED_TAG}" != "v${CORE_VERSION}" ]]; then
     fail "tag ${EXPECTED_TAG} does not match v${CORE_VERSION}"
 fi
 
-"${PROJECT_DIR}/flatpak/check-manifest.sh"
-echo "Core, desktop, UI, bundle, and release metadata agree on ${CORE_VERSION}."
+command -v desktop-file-validate >/dev/null 2>&1 \
+    || fail "desktop-file-validate is required"
+command -v appstreamcli >/dev/null 2>&1 \
+    || fail "appstreamcli is required"
+desktop-file-validate \
+    "${PROJECT_DIR}/native/data/io.github.EnchiladaBoy.VideoHarness.desktop"
+appstreamcli validate --no-net \
+    "${PROJECT_DIR}/native/data/io.github.EnchiladaBoy.VideoHarness.metainfo.xml"
+
+echo "Core, desktop, UI, AppImage, and release metadata agree on ${CORE_VERSION}."

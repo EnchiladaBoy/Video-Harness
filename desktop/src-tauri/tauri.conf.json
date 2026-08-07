@@ -41,6 +41,11 @@
       "icons/icon.icns"
     ],
     "category": "Video",
-    "shortDescription": "Create AI videos across providers"
+    "shortDescription": "Create AI videos across providers",
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": true
+      }
+    }
   }
 }

@@ -1,4 +1,4 @@
-name: Signed release
+name: Portable Linux release
 
 on:
   push:
@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   verify:
-    name: Verify signed release tag
+    name: Verify release tag and metadata
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -25,37 +25,47 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Require a GitHub-verified annotated tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+      - name: Require an unsigned annotated tag from main
         run: |
-          TAG_TYPE="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
-            --jq '.object.type')"
-          [[ "${TAG_TYPE}" == tag ]]
-          TAG_OBJECT="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
-            --jq '.object.sha')"
-          VERIFIED="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT}" \
-            --jq '.verification.verified')"
-          [[ "${VERIFIED}" == true ]]
+          [[ "$(git cat-file -t "${GITHUB_REF}")" == tag ]]
+          if git cat-file -p "${GITHUB_REF}" \
+            | grep -Eq -- '-----BEGIN (PGP|SSH) SIGNATURE-----'; then
+            echo "Release tags must be unsigned" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "${GITHUB_REF}^{commit}" origin/main
 
-      - name: Match tag, core, desktop, AppStream, and Flatpak metadata
+      - name: Install metadata validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            appstream desktop-file-utils
+
+      - name: Match tag and release metadata
         run: packaging/check-release-version.sh "${GITHUB_REF_NAME}"
 
+      - name: Refuse to replace an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists and is immutable" >&2
+            exit 1
+          fi
+
   build:
-    name: Build ${{ matrix.arch }} release inputs
+    name: Build portable Linux executable (${{ matrix.arch }})
     needs: verify
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
           - arch: aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     permissions:
@@ -63,6 +73,30 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install AppImage build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            file \
+            gstreamer1.0-libav \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-pulseaudio \
+            libayatana-appindicator3-dev \
+            libfuse2 \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            pkg-config \
+            xdg-utils
+
+      - name: Install Rust 1.95
+        run: rustup toolchain install 1.95 --profile minimal
 
       - name: Install Node.js 24
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -75,189 +109,95 @@ jobs:
         working-directory: ui
         run: npm ci && npm run build
 
-      - name: Install official Flatpak build environment
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends dbus-daemon flatpak
-          flatpak --user remote-add --if-not-exists flathub \
-            https://dl.flathub.org/repo/flathub.flatpakrepo
-          flatpak --user install -y flathub \
-            org.flatpak.Builder//stable \
-            org.gnome.Platform//50 \
-            org.gnome.Sdk//50 \
-            org.freedesktop.Sdk.Extension.rust-stable//25.08 \
-            org.freedesktop.Platform.codecs-extra//25.08-extra
-          flatpak --user info --show-commit org.flatpak.Builder
-
-      - name: Build unsigned architecture ref
-        run: |
-          bash .github/scripts/run-with-annotation.sh \
-            "Release Flatpak build (${{ matrix.arch }})" \
-            dbus-run-session -- flatpak run org.flatpak.Builder \
-              --user --install-deps-from=flathub \
-              --force-clean --arch=${{ matrix.arch }} \
-              --default-branch=stable \
-              --repo=flatpak-repo flatpak-build \
-              flatpak/io.github.EnchiladaBoy.VideoHarness.yml
-          SOURCE_DATE_EPOCH="$(git show -s --format=%ct)"
-          tar --sort=name --owner=0 --group=0 --numeric-owner \
-            --mtime="@${SOURCE_DATE_EPOCH}" \
-            -C flatpak-repo -cJf "flatpak-repo-${{ matrix.arch }}.tar.xz" .
-
-      - name: Build Tauri native archive in Debian 13
+      - name: Build and validate unsigned AppImage
+        env:
+          RUSTUP_TOOLCHAIN: "1.95"
         run: |
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct)"
           export SOURCE_DATE_EPOCH
-          docker run --rm \
-            -e SOURCE_DATE_EPOCH \
-            -v "${PWD}:/source" \
-            -w /source \
-            rust:1.95-trixie \
-            bash packaging/build-tarball-container.sh
+          bash .github/scripts/run-with-annotation.sh \
+            "AppImage build (${{ matrix.arch }})" \
+            packaging/build-appimage.sh
+          git diff --exit-code -- \
+            desktop/src-tauri/Cargo.lock native/Cargo.lock ui/package-lock.json
 
-      - name: Upload unsigned release inputs
+      - name: Upload portable executable
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-${{ matrix.arch }}
-          path: |
-            flatpak-repo-${{ matrix.arch }}.tar.xz
-            dist/video-harness-*-linux-${{ matrix.arch }}.tar.xz
+          name: appimage-${{ matrix.arch }}
+          path: dist/Video-Harness-*-linux-${{ matrix.arch }}.AppImage
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 7
 
-  sign-and-publish:
-    name: Sign and publish release
-    needs: [verify, build]
+  runtime-smoke:
+    name: Clean AppImage runtime (${{ matrix.arch }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    container: ubuntu:22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Install only headless desktop smoke dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            dbus-daemon \
+            xauth \
+            xdotool \
+            xvfb
+
+      - name: Check out smoke-test script
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download matching portable executable
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: appimage-${{ matrix.arch }}
+          path: appimage-under-test
+
+      - name: Require an actual visible application window
+        run: |
+          chmod +x appimage-under-test/Video-Harness-*.AppImage
+          packaging/smoke-appimage-gui.sh \
+            appimage-under-test/Video-Harness-*.AppImage
+
+  publish:
+    name: Publish portable executables
+    needs: [verify, build, runtime-smoke]
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    environment: release
+    timeout-minutes: 15
     permissions:
       contents: write
-      pages: write
       id-token: write
       attestations: write
     steps:
-      - name: Check out source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Download both architecture inputs
+      - name: Download both architecture builds
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: release-*
-          path: release-inputs
+          pattern: appimage-*
+          path: release-assets
           merge-multiple: true
 
-      - name: Install signing and repository tools
+      - name: Validate release inputs and write checksums
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends flatpak gnupg ostree
-
-      - name: Assemble and sign multi-architecture repository
-        env:
-          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
-          FLATPAK_GPG_PASSPHRASE: ${{ secrets.FLATPAK_GPG_PASSPHRASE }}
-          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
-        run: |
-          set -euo pipefail
-          APP_ID=io.github.EnchiladaBoy.VideoHarness
-          VERSION="${GITHUB_REF_NAME#v}"
-          FLATPAK_GPG_KEY_ID="${FLATPAK_GPG_KEY_ID^^}"
-          [[ "${FLATPAK_GPG_KEY_ID}" =~ ^[A-F0-9]{40}$ ]]
-          export GNUPGHOME="${RUNNER_TEMP}/video-harness-gnupg"
-          install -d -m 0700 "${GNUPGHOME}"
-          printf '%s\n' allow-preset-passphrase >"${GNUPGHOME}/gpg-agent.conf"
-          printf '%s\n' "${FLATPAK_GPG_PRIVATE_KEY}" | gpg --batch --import
-          gpg --batch --list-secret-keys "${FLATPAK_GPG_KEY_ID}"
-          gpg --batch --list-keys "${FLATPAK_GPG_KEY_ID}" 2>&1 \
-            | grep -F -- \
-                'Video Harness Release <EnchiladaBoy@users.noreply.github.com>' \
-                >/dev/null
-
-          KEYGRIP="$(gpg --batch --with-colons --with-keygrip \
-            --list-secret-keys "${FLATPAK_GPG_KEY_ID}" \
-            | awk -F: -v wanted="${FLATPAK_GPG_KEY_ID}" '
-                $1 == "fpr" { matching = ($10 == wanted); next }
-                matching && $1 == "grp" { print $10; exit }
-              ')"
-          [[ -n "${KEYGRIP}" ]]
-          PRESET="$(command -v gpg-preset-passphrase || true)"
-          if [[ -z "${PRESET}" ]]; then
-            PRESET=/usr/lib/gnupg2/gpg-preset-passphrase
-          fi
-          [[ -x "${PRESET}" ]]
-          gpgconf --kill gpg-agent
-          gpgconf --launch gpg-agent
-          printf '%s' "${FLATPAK_GPG_PASSPHRASE}" \
-            | "${PRESET}" --preset "${KEYGRIP}"
-          printf 'release signing check' \
-            | gpg --batch --yes --local-user "${FLATPAK_GPG_KEY_ID}" \
-                --detach-sign --output "${RUNNER_TEMP}/signing-check.sig"
-
-          mkdir pages-repo release-assets
-          ostree init --repo=pages-repo --mode=archive-z2
-          for arch in x86_64 aarch64; do
-            source_repo="${RUNNER_TEMP}/repo-${arch}"
-            mkdir "${source_repo}"
-            tar -C "${source_repo}" -xJf \
-              "release-inputs/flatpak-repo-${arch}.tar.xz"
-            while IFS= read -r ref; do
-              ostree --repo=pages-repo pull-local "${source_repo}" "${ref}"
-            done < <(ostree refs --repo="${source_repo}")
-          done
-
-          for arch in x86_64 aarch64; do
-            flatpak build-sign \
-              --arch="${arch}" \
-              --gpg-sign="${FLATPAK_GPG_KEY_ID}" \
-              --gpg-homedir="${GNUPGHOME}" \
-              pages-repo "${APP_ID}" stable
-          done
-          flatpak build-update-repo \
-            --generate-static-deltas \
-            --prune --prune-depth=3 \
-            --title="Video Harness" \
-            --comment="Signed stable releases of Video Harness" \
-            --description="The official Video Harness Flatpak update repository" \
-            --homepage="https://github.com/EnchiladaBoy/Video-Harness" \
-            --icon="https://raw.githubusercontent.com/EnchiladaBoy/Video-Harness/main/native/data/icons/io.github.EnchiladaBoy.VideoHarness.svg" \
-            --default-branch=stable \
-            --gpg-sign="${FLATPAK_GPG_KEY_ID}" \
-            --gpg-homedir="${GNUPGHOME}" \
-            pages-repo
-
-          gpg --batch --armor --export "${FLATPAK_GPG_KEY_ID}" \
-            >release-assets/VideoHarness-release-key.asc
-          flatpak/render-repository-files.sh \
-            release-assets/VideoHarness-release-key.asc pages-repo
-          install -m 0644 flatpak/pages/index.html pages-repo/index.html
-          install -m 0644 pages-repo/VideoHarness.flatpakref release-assets/
-          install -m 0644 pages-repo/VideoHarness.flatpakrepo release-assets/
-
-          for arch in x86_64 aarch64; do
-            flatpak build-bundle \
-              --arch="${arch}" \
-              --gpg-keys=release-assets/VideoHarness-release-key.asc \
-              --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
-              pages-repo \
-              "release-assets/VideoHarness-${VERSION}-${arch}.flatpak" \
-              "${APP_ID}" stable
-            install -m 0644 \
-              "release-inputs/dist/video-harness-${VERSION}-linux-${arch}.tar.xz" \
-              release-assets/
-          done
-
+          mapfile -t appimages < <(find release-assets -maxdepth 1 \
+            -type f -name 'Video-Harness-*.AppImage' -print | sort)
+          [[ "${#appimages[@]}" -eq 2 ]]
+          test -f "release-assets/Video-Harness-${GITHUB_REF_NAME#v}-linux-x86_64.AppImage"
+          test -f "release-assets/Video-Harness-${GITHUB_REF_NAME#v}-linux-aarch64.AppImage"
           (
             cd release-assets
-            sha256sum \
-              VideoHarness-*.flatpak \
-              video-harness-*.tar.xz \
-              VideoHarness.flatpakref \
-              VideoHarness.flatpakrepo \
-              VideoHarness-release-key.asc \
-              >SHA256SUMS
-            gpg --batch --yes --armor \
-              --local-user "${FLATPAK_GPG_KEY_ID}" \
-              --detach-sign SHA256SUMS
+            sha256sum Video-Harness-*.AppImage >SHA256SUMS
           )
 
       - name: Attest release artifacts
@@ -265,36 +205,12 @@ jobs:
         with:
           subject-path: release-assets/*
 
-      - name: Publish GitHub release assets
+      - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" release-assets/* --clobber
-          else
-            gh release create "${GITHUB_REF_NAME}" release-assets/* \
-              --verify-tag \
-              --title "Video Harness ${GITHUB_REF_NAME#v}" \
-              --generate-notes
-          fi
-
-      - name: Upload signed repository for GitHub Pages
-        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
-        with:
-          path: pages-repo
-
-  deploy-pages:
-    name: Deploy Flatpak repository
-    needs: sign-and-publish
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy signed repository
-        id: deployment
-        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
+          gh release create "${GITHUB_REF_NAME}" release-assets/* \
+            --verify-tag \
+            --title "Video Harness ${GITHUB_REF_NAME#v}" \
+            --generate-notes

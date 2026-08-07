@@ -5,8 +5,8 @@ providers. It gives prompts, reference media, model controls, price review,
 job monitoring, downloads, and playback one clear graphical home.
 
 Version 0.7.0 makes the Tauri 2 + Svelte interface the stable Video Harness
-frontend. Official packages ship for x86_64 and aarch64 Linux. Windows x64 and
-macOS x64 builds are compile- and test-checked in CI, but they are future
+frontend. Portable AppImages ship for x86_64 and aarch64 Linux. Windows x64
+and macOS x64 builds are compile- and test-checked in CI, but they are future
 targets rather than supported release platforms today. The older
 GTK4/libadwaita frontend remains in the source tree only as a compatibility and
 developer fallback.
@@ -47,45 +47,27 @@ explicitly advertises that capability.
 
 ## Install on Linux
 
-Flatpak is the recommended cross-distribution package. Download
-`VideoHarness.flatpakref` from the
-[latest release](https://github.com/EnchiladaBoy/Video-Harness/releases/latest),
-then run:
+Download the AppImage for your CPU from the
+[latest release](https://github.com/EnchiladaBoy/Video-Harness/releases/latest):
+
+- `Video-Harness-0.7.0-linux-x86_64.AppImage` for most Intel and AMD PCs.
+- `Video-Harness-0.7.0-linux-aarch64.AppImage` for 64-bit ARM systems.
+
+Make the downloaded file executable and run it directly; nothing is installed:
 
 ```bash
-flatpak install --user VideoHarness.flatpakref
-flatpak run io.github.EnchiladaBoy.VideoHarness
+chmod +x Video-Harness-0.7.0-linux-x86_64.AppImage
+./Video-Harness-0.7.0-linux-x86_64.AppImage
 ```
 
-For H.264 MP4 playback, install the matching Freedesktop codec add-on used by
-the current Flatpak runtime:
+The AppImage bundles the Tauri GUI and its media framework, including common
+MP4 playback support. It targets glibc-based desktop Linux and is built on
+Ubuntu 22.04 for a broad compatibility baseline; Alpine/musl and unusual
+unconfigured environments such as NixOS are not supported. If FUSE mounting is
+unavailable, add `--appimage-extract-and-run` when launching the same file.
 
-```bash
-flatpak install --user flathub org.freedesktop.Platform.codecs-extra//25.08-extra
-```
-
-The Flatpak is available for x86_64 and aarch64. It has only the permissions
-needed for provider networking, graphics, sound, Secret Service, file-picker
-portals, and creating files in your XDG Videos directory. A one-time importer
-can read the three legacy `openrouter-video-studio` data directories; it never
-modifies them.
-
-Each release also includes signed standalone bundles named
-`VideoHarness-0.7.0-x86_64.flatpak` and
-`VideoHarness-0.7.0-aarch64.flatpak`.
-
-Best-effort native Linux archives are also attached for x86_64 and aarch64.
-They are named `video-harness-0.7.0-linux-x86_64.tar.xz` and
-`video-harness-0.7.0-linux-aarch64.tar.xz`. Extract the archive for your
-machine and run:
-
-```bash
-./install.sh
-```
-
-Native archives use the host's glibc, GTK 3, WebKitGTK 4.1, sound, and GStreamer
-stack, and do not update automatically. Flatpak is the more portable option
-across distributions.
+AppImages update manually: download the newer file when a release is available.
+`SHA256SUMS` is attached beside each release for download-integrity checks.
 
 ## Build from source on Linux
 
@@ -94,7 +76,7 @@ On Debian or Ubuntu, the packages used by CI are:
 
 ```bash
 sudo apt install build-essential libwebkit2gtk-4.1-dev \
-  libappindicator3-dev librsvg2-dev patchelf pkg-config
+  libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config
 ```
 
 See the official
@@ -117,6 +99,16 @@ Run the result directly:
 ```bash
 ./desktop/src-tauri/target/release/video-harness
 ```
+
+To build the same unsigned portable executable used by releases:
+
+```bash
+packaging/build-appimage.sh
+```
+
+The result is written to `dist/` for the current CPU architecture. AppImage
+media bundling is fully supported on Ubuntu build systems; see
+[packaging/README.md](packaging/README.md) for the complete dependency list.
 
 Or, from the repository root, install the build for the current user:
 
@@ -181,7 +173,7 @@ cargo clippy --locked --lib --tests --no-default-features -- -D warnings
 cargo test --locked --lib --tests --no-default-features
 
 cd ..
-flatpak/check-manifest.sh
+packaging/check-release-version.sh
 packaging/test-installer.sh
 ```
 
@@ -217,14 +209,9 @@ provider's final usage charge is authoritative.
 
 ## Release channels
 
-- The signed Flatpak update repository lives at
-  <https://enchiladaboy.github.io/Video-Harness/> and is the primary release
-  channel.
-- Native Linux archives are best-effort and update manually by installing a
-  newer archive.
-- Release checksums, their detached signature, and the dedicated release public
-  key are attached to every
-  [GitHub release](https://github.com/EnchiladaBoy/Video-Harness/releases).
-
-Release signing uses a dedicated offline primary key and a time-limited signing
-subkey. The repository intentionally contains no private signing material.
+- [GitHub releases](https://github.com/EnchiladaBoy/Video-Harness/releases)
+  provide the x86_64 and aarch64 AppImages plus `SHA256SUMS`.
+- Releases are unsigned and require no project signing key. GitHub Actions adds
+  keyless build-provenance attestations without a user-managed secret.
+- AppImages update manually by replacing the downloaded executable with the
+  file from a newer release.

@@ -1,4 +1,9 @@
-# Flatpak packaging
+# Optional Flatpak packaging
+
+Official releases are unsigned portable AppImages. The retained Flatpak
+manifest is an optional developer/community packaging target; it is not built
+or published by the stable release workflow and requires no project signing
+key.
 
 The manifest packages the Tauri/Svelte desktop application as
 `io.github.EnchiladaBoy.VideoHarness` against GNOME 50. Cargo dependencies are
@@ -52,23 +57,9 @@ useful for installing and smoke-testing the finished app. Headless CI wraps
 the build command in `dbus-run-session`; a regular Linux desktop session
 already supplies the required session bus.
 
-CI also passes `flatpak info --show-permissions` through
-`check-installed-permissions.sh`, which requires every intended grant and
-rejects broad host or home access.
+After a local install, pass `flatpak info --show-permissions` through
+`check-installed-permissions.sh` to require every intended grant and reject
+broad host or home access.
 
-`codecs-extra` is an add-on to the Freedesktop base used by GNOME 50. It is
-installed explicitly in CI so H.264 MP4 discovery is tested on both
-architectures.
-
-The release workflow assembles both architecture refs in one OSTree repository,
-then pauses at GitHub's protected `release` environment. Only that job imports
-the time-limited signing subkey. Set these environment secrets:
-
-- `FLATPAK_GPG_PRIVATE_KEY`: ASCII-armored private signing subkey.
-- `FLATPAK_GPG_PASSPHRASE`: subkey passphrase.
-- `FLATPAK_GPG_KEY_ID`: full signing subkey fingerprint.
-
-Configure required reviewers on the `release` environment. The corresponding
-primary identity is `Video Harness Release
-<EnchiladaBoy@users.noreply.github.com>`. Keep the primary key offline; never
-store it, the subkey, or either passphrase in this repository.
+`codecs-extra` is an add-on to the Freedesktop base used by GNOME 50 and makes
+H.264 MP4 playback available to this optional local build.

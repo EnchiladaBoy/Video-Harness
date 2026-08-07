@@ -209,7 +209,7 @@ jobs:
       - name: Install Rust quality components
         run: rustup component add rustfmt clippy
 
-      - name: Validate release and Flatpak metadata
+      - name: Validate release metadata
         run: packaging/check-release-version.sh
 
       - name: Check formatting
@@ -227,21 +227,45 @@ jobs:
       - name: Smoke-test architecture-neutral installer
         run: packaging/test-installer.sh
 
-  flatpak:
-    name: Flatpak (${{ matrix.arch }})
+  appimage:
+    name: Portable AppImage (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
           - arch: aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install AppImage build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            file \
+            gstreamer1.0-libav \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-pulseaudio \
+            libayatana-appindicator3-dev \
+            libfuse2 \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            pkg-config \
+            xdg-utils
+
+      - name: Install Rust 1.95
+        run: rustup toolchain install 1.95 --profile minimal
 
       - name: Install Node.js 24
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -254,67 +278,63 @@ jobs:
         working-directory: ui
         run: npm ci && npm run build
 
-      - name: Install Flatpak host client
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends dbus-daemon flatpak
-          flatpak --user remote-add --if-not-exists flathub \
-            https://dl.flathub.org/repo/flathub.flatpakrepo
-
-      - name: Install official builder, pinned SDK, runtime, and codecs
-        run: |
-          flatpak --user install -y flathub \
-            org.flatpak.Builder//stable \
-            org.gnome.Platform//50 \
-            org.gnome.Sdk//50 \
-            org.freedesktop.Sdk.Extension.rust-stable//25.08 \
-            org.freedesktop.Platform.codecs-extra//25.08-extra
-          flatpak --user info --show-commit org.flatpak.Builder
-
-      - name: Validate manifest
-        run: flatpak/check-manifest.sh
-
-      - name: Build unsigned Flatpak repository
-        run: |
-          bash .github/scripts/run-with-annotation.sh \
-            "Flatpak build (${{ matrix.arch }})" \
-            dbus-run-session -- flatpak run org.flatpak.Builder \
-              --user --install-deps-from=flathub \
-              --force-clean --arch=${{ matrix.arch }} \
-              --default-branch=stable \
-              --repo=flatpak-repo flatpak-build \
-              flatpak/io.github.EnchiladaBoy.VideoHarness.yml
-
-      - name: Install and smoke-test local ref
-        run: |
-          flatpak --user remote-add --if-not-exists --no-gpg-verify \
-            video-harness-ci "file://${PWD}/flatpak-repo"
-          flatpak --user install -y video-harness-ci \
-            io.github.EnchiladaBoy.VideoHarness//stable
-          flatpak --user run io.github.EnchiladaBoy.VideoHarness --version
-          flatpak --user run --command=sh io.github.EnchiladaBoy.VideoHarness \
-            -c 'gst-inspect-1.0 avdec_h264'
-          flatpak --user info --show-permissions \
-            io.github.EnchiladaBoy.VideoHarness | tee flatpak-permissions.txt
-          flatpak/check-installed-permissions.sh flatpak-permissions.txt
-
-      - name: Build unsigned smoke-test bundle
+      - name: Build and validate unsigned AppImage
         env:
-          RELEASE_ARCH: ${{ matrix.arch }}
+          RUSTUP_TOOLCHAIN: "1.95"
         run: |
-          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' native/Cargo.toml | head -n 1)"
-          flatpak build-bundle \
-            --arch="${RELEASE_ARCH}" \
-            --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
-            flatpak-repo "VideoHarness-${VERSION}-${RELEASE_ARCH}.flatpak" \
-            io.github.EnchiladaBoy.VideoHarness stable
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          bash .github/scripts/run-with-annotation.sh \
+            "AppImage build (${{ matrix.arch }})" \
+            packaging/build-appimage.sh \
+              --output-dir "${RUNNER_TEMP}/video-harness-dist"
+          git diff --exit-code -- \
+            desktop/src-tauri/Cargo.lock native/Cargo.lock ui/package-lock.json
 
-      - name: Upload unsigned CI artifacts
+      - name: Upload portable CI artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: flatpak-${{ matrix.arch }}
-          path: |
-            VideoHarness-*.flatpak
-            flatpak-permissions.txt
+          name: appimage-${{ matrix.arch }}
+          path: ${{ runner.temp }}/video-harness-dist/Video-Harness-*.AppImage
           if-no-files-found: error
           retention-days: 7
+
+  appimage-runtime:
+    name: Clean AppImage runtime (${{ matrix.arch }})
+    needs: appimage
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    container: ubuntu:22.04
+    steps:
+      - name: Install only headless desktop smoke dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            dbus-daemon \
+            xauth \
+            xdotool \
+            xvfb
+
+      - name: Check out smoke-test script
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download matching portable executable
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: appimage-${{ matrix.arch }}
+          path: appimage-under-test
+
+      - name: Require an actual visible application window
+        run: |
+          chmod +x appimage-under-test/Video-Harness-*.AppImage
+          packaging/smoke-appimage-gui.sh \
+            appimage-under-test/Video-Harness-*.AppImage
