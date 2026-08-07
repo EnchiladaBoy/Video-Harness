@@ -48,7 +48,9 @@ flatpak run --command=sh io.github.EnchiladaBoy.VideoHarness \
 `org.flatpak.Builder` runs in its own Flatpak environment. The
 `--install-deps-from=flathub` flag makes the SDK and runtime declared by the
 manifest available inside that environment; the host installs above remain
-useful for installing and smoke-testing the finished app.
+useful for installing and smoke-testing the finished app. Headless CI wraps
+the build command in `dbus-run-session`; a regular Linux desktop session
+already supplies the required session bus.
 
 CI also passes `flatpak info --show-permissions` through
 `check-installed-permissions.sh`, which requires every intended grant and
