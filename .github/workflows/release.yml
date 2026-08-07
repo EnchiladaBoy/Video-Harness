@@ -156,17 +156,30 @@ jobs:
             libasound2 \
             libdrm2 \
             libegl1 \
+            libexpat1 \
+            libfribidi0 \
             libgbm1 \
+            libgcc-s1 \
             libgl1 \
             libgl1-mesa-dri \
+            libgmp10 \
+            libgpg-error0 \
             libharfbuzz0b \
+            libice6 \
+            libjack-jackd2-0 \
+            libpipewire-0.3-0 \
+            libsm6 \
             libstdc++6 \
+            libusb-1.0-0 \
+            libuuid1 \
+            libwayland-client0 \
             libx11-6 \
             libx11-xcb1 \
             libxcb1 \
             xauth \
             xdotool \
-            xvfb
+            xvfb \
+            zlib1g
 
       - name: Check out smoke-test script
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
