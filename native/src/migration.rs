@@ -933,7 +933,11 @@ fn backup_sqlite_atomic(
                 source,
             }
         })?;
-        File::open(&temporary)
+        // Windows requires a write-capable handle for FlushFileBuffers,
+        // which is what File::sync_all uses there.
+        OpenOptions::new()
+            .write(true)
+            .open(&temporary)
             .and_then(|file| file.sync_all())
             .map_err(|source| LegacyMigrationError::Io {
                 action: "sync migrated database",

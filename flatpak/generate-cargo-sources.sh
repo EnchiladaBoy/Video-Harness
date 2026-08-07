@@ -75,7 +75,7 @@ END {
     separator()
     print "  {"
     print "    \"type\": \"inline\","
-    print "    \"contents\": \"[source.crates-io]\\nreplace-with = \\\"vendored-sources\\\"\\n\\n[source.vendored-sources]\\ndirectory = \\\"vendor\\\"\\n\","
+    print "    \"contents\": \"[source.crates-io]\\nreplace-with = \\\"vendored-sources\\\"\\n\\n[source.vendored-sources]\\ndirectory = \\\"cargo/vendor\\\"\\n\","
     print "    \"dest\": \"cargo\","
     print "    \"dest-filename\": \"config.toml\""
     print "  }"

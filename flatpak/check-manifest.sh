@@ -83,6 +83,8 @@ trap 'rm -f -- "${generated_sources}"' EXIT
 "${SCRIPT_DIR}/generate-cargo-sources.sh" "${generated_sources}"
 cmp -s -- "${generated_sources}" "${SCRIPT_DIR}/cargo-sources.json" \
     || fail "cargo-sources.json is stale; run flatpak/generate-cargo-sources.sh"
+grep -Fq -- 'directory = \"cargo/vendor\"' "${generated_sources}" \
+    || fail "Cargo vendor source must resolve to cargo/vendor from the build root"
 rm -f -- "${generated_sources}"
 trap - EXIT
 
