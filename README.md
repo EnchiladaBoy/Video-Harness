@@ -89,7 +89,7 @@ across distributions.
 
 ## Build from source on Linux
 
-Install Node.js 24, Rust 1.92, a C toolchain, and the Tauri 2 system libraries.
+Install Node.js 24, Rust 1.95, a C toolchain, and the Tauri 2 system libraries.
 On Debian or Ubuntu, the packages used by CI are:
 
 ```bash

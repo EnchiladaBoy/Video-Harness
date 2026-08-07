@@ -12,7 +12,7 @@ frontend or the default release package. See the
 
 ## Build and test the portable engine
 
-The intended toolchain is Rust 1.92 or newer. TLS uses Rustls and SQLite is
+The intended toolchain is Rust 1.95 or newer. TLS uses Rustls and SQLite is
 bundled, so the engine does not need OpenSSL or a system SQLite development
 package.
 

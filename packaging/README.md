@@ -17,7 +17,7 @@ docker run --rm \
   -e SOURCE_DATE_EPOCH \
   -v "$PWD:/source" \
   -w /source \
-  rust:1.92-trixie \
+  rust:1.95-trixie \
   bash packaging/build-tarball-container.sh
 ```
 

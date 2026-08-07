@@ -3,7 +3,7 @@
 This archive is the best-effort Video Harness package for its named CPU
 architecture. Flatpak is the primary cross-distribution release.
 
-The release binary is built in the official Rust 1.92 Debian 13 (Trixie)
+The release binary is built in the official Rust 1.95 Debian 13 (Trixie)
 container. It embeds the Svelte interface and dynamically uses the host's
 glibc, GTK 3, WebKitGTK 4.1, graphics, sound, and GStreamer stack. H.264
 playback also needs the appropriate GStreamer plugins for the distribution.

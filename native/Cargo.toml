@@ -2,7 +2,7 @@
 name = "video-harness"
 version = "0.7.0"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.95"
 description = "A multi-provider desktop workspace for AI video generation"
 license = "MIT"
 repository = "https://github.com/EnchiladaBoy/Video-Harness"

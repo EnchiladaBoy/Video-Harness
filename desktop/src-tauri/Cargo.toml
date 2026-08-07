@@ -2,7 +2,7 @@
 name = "video-harness-desktop"
 version = "0.7.0"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.95"
 description = "Tauri desktop shell for Video Harness"
 license = "MIT"
 repository = "https://github.com/EnchiladaBoy/Video-Harness"
