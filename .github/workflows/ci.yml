@@ -104,15 +104,27 @@ jobs:
 
       - name: Test platform-specific core behavior
         working-directory: native
-        run: cargo +1.95 test --locked --lib --no-default-features
+        shell: bash
+        run: |
+          bash ../.github/scripts/run-with-annotation.sh \
+            "Core tests (${{ matrix.platform }})" \
+            cargo +1.95 test --locked --lib --no-default-features
 
       - name: Check Tauri desktop shell
         working-directory: desktop/src-tauri
-        run: cargo +1.95 check --locked
+        shell: bash
+        run: |
+          bash ../../.github/scripts/run-with-annotation.sh \
+            "Tauri check (${{ matrix.platform }})" \
+            cargo +1.95 check --locked
 
       - name: Test Tauri desktop shell
         working-directory: desktop/src-tauri
-        run: cargo +1.95 test --locked
+        shell: bash
+        run: |
+          bash ../../.github/scripts/run-with-annotation.sh \
+            "Tauri tests (${{ matrix.platform }})" \
+            cargo +1.95 test --locked
 
   desktop-linux:
     name: Tauri desktop shell (Linux)
@@ -262,10 +274,12 @@ jobs:
 
       - name: Build unsigned Flatpak repository
         run: |
-          flatpak-builder --user --force-clean --arch=${{ matrix.arch }} \
-            --default-branch=stable \
-            --repo=flatpak-repo flatpak-build \
-            flatpak/io.github.EnchiladaBoy.VideoHarness.yml
+          bash .github/scripts/run-with-annotation.sh \
+            "Flatpak build (${{ matrix.arch }})" \
+            flatpak-builder --user --force-clean --arch=${{ matrix.arch }} \
+              --default-branch=stable \
+              --repo=flatpak-repo flatpak-build \
+              flatpak/io.github.EnchiladaBoy.VideoHarness.yml
 
       - name: Install and smoke-test local ref
         run: |

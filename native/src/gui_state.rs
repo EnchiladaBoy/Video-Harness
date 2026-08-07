@@ -1534,12 +1534,12 @@ mod tests {
 
     #[test]
     fn upload_receipt_is_reused_only_before_expiry() {
-        let (_directory, store) = store();
+        let (directory, store) = store();
         let now = Utc::now();
         let receipt = StoredUploadReceipt {
             provider_id: ProviderId::fal(),
             source_sha256: "a".repeat(64),
-            source_path: PathBuf::from("/tmp/start.png"),
+            source_path: directory.path().join("start.png"),
             remote_url: "https://v3.fal.media/files/start.png".into(),
             content_type: "image/png".into(),
             byte_length: 42,
