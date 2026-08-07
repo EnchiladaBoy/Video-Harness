@@ -279,7 +279,8 @@ jobs:
           bash .github/scripts/run-with-annotation.sh \
             "Flatpak build (${{ matrix.arch }})" \
             flatpak run org.flatpak.Builder \
-              --user --force-clean --arch=${{ matrix.arch }} \
+              --user --install-deps-from=flathub \
+              --force-clean --arch=${{ matrix.arch }} \
               --default-branch=stable \
               --repo=flatpak-repo flatpak-build \
               flatpak/io.github.EnchiladaBoy.VideoHarness.yml

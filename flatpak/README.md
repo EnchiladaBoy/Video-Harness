@@ -32,7 +32,8 @@ Then build an unsigned local repository and smoke-test it:
 npm --prefix ui ci
 npm --prefix ui run build
 flatpak run org.flatpak.Builder \
-  --user --force-clean --default-branch=stable \
+  --user --install-deps-from=flathub \
+  --force-clean --default-branch=stable \
   --repo=flatpak-repo \
   flatpak-build flatpak/io.github.EnchiladaBoy.VideoHarness.yml
 flatpak --user remote-add --if-not-exists --no-gpg-verify \
@@ -43,6 +44,11 @@ flatpak run io.github.EnchiladaBoy.VideoHarness --version
 flatpak run --command=sh io.github.EnchiladaBoy.VideoHarness \
   -c 'gst-inspect-1.0 avdec_h264'
 ```
+
+`org.flatpak.Builder` runs in its own Flatpak environment. The
+`--install-deps-from=flathub` flag makes the SDK and runtime declared by the
+manifest available inside that environment; the host installs above remain
+useful for installing and smoke-testing the finished app.
 
 CI also passes `flatpak info --show-permissions` through
 `check-installed-permissions.sh`, which requires every intended grant and
