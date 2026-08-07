@@ -43,6 +43,7 @@ if grep -Eq -- '--filesystem=(home|host)(:|$)' "${MANIFEST}"; then
 fi
 require_literal 'runtime-version: "50"'
 require_literal 'org.freedesktop.Sdk.Extension.rust-stable'
+require_literal 'strip: true'
 require_literal 'cargo build --release --locked --offline --manifest-path desktop/src-tauri/Cargo.toml --bin video-harness'
 require_literal 'install -Dm0755 desktop/src-tauri/target/release/video-harness /app/bin/video-harness'
 require_literal 'path: ../desktop'

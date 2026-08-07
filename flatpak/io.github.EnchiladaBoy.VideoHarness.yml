@@ -20,6 +20,7 @@ finish-args:
   - --talk-name=org.freedesktop.secrets
 
 build-options:
+  strip: true
   append-path: /usr/lib/sdk/rust-stable/bin
   env:
     CARGO_HOME: /run/build/video-harness/cargo
