@@ -146,12 +146,24 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Install only headless desktop smoke dependencies
+      - name: Install AppImage host baseline and headless smoke dependencies
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates \
             dbus-daemon \
+            fontconfig \
+            libasound2 \
+            libdrm2 \
+            libegl1 \
+            libgbm1 \
+            libgl1 \
+            libgl1-mesa-dri \
+            libharfbuzz0b \
+            libstdc++6 \
+            libx11-6 \
+            libx11-xcb1 \
+            libxcb1 \
             xauth \
             xdotool \
             xvfb
