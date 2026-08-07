@@ -19,11 +19,16 @@
   <developer id="io.github.enchiladaboy">
     <name>EnchiladaBoy</name>
   </developer>
-  <url type="homepage">https://github.com/EnchiladaBoy/VideoHarness</url>
-  <url type="bugtracker">https://github.com/EnchiladaBoy/VideoHarness/issues</url>
-  <url type="vcs-browser">https://github.com/EnchiladaBoy/VideoHarness</url>
+  <url type="homepage">https://github.com/EnchiladaBoy/Video-Harness</url>
+  <url type="bugtracker">https://github.com/EnchiladaBoy/Video-Harness/issues</url>
+  <url type="vcs-browser">https://github.com/EnchiladaBoy/Video-Harness</url>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.7.0" date="2026-08-07">
+      <description>
+        <p>Introduces the new cross-platform desktop interface, dependable in-app playback, complete provider job IDs, and safe render removal with optional local file deletion.</p>
+      </description>
+    </release>
     <release version="0.6.0" date="2026-08-07">
       <description>
         <p>Adds a responsive interface, truthful generated-audio controls, Tiny Cloud Cinema job feedback, and multi-architecture Flatpak distribution.</p>

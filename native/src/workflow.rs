@@ -32,7 +32,7 @@ use crate::history::{HistoryError, HistoryStore, JobRecord};
 use crate::providers::fal::{FalOptions, FalProvider};
 use crate::providers::openrouter::OpenRouterProvider;
 use crate::providers::{
-    ProviderAccount, ProviderError, ProviderErrorKind, UploadProgress, VideoProvider,
+    MediaStager, ProviderAccount, ProviderError, ProviderErrorKind, UploadProgress, VideoProvider,
 };
 
 /// A Review remains billable-action-ready for only a short window. Any edit
@@ -98,6 +98,10 @@ pub enum ServiceCommand {
         op_id: u64,
         draft: GenerationDraft,
         revision: u64,
+        /// Explicit local-media upload service. `None` preserves the selected
+        /// provider's native staging behavior and never enables a hidden
+        /// cross-provider upload.
+        staging_provider_id: Option<ProviderId>,
     },
     /// Consume a still-fresh Review and perform exactly one paid submission.
     SubmitPrepared {
@@ -174,6 +178,13 @@ pub enum ServiceCommand {
     LoadHistory {
         op_id: u64,
         limit: usize,
+    },
+    /// Remove a terminal generation from local history. This never attempts
+    /// to cancel or delete the provider-side job.
+    DeleteGeneration {
+        op_id: u64,
+        key: ProviderJobKey,
+        delete_output: bool,
     },
     Shutdown,
 }
@@ -382,6 +393,11 @@ pub enum ServiceEvent {
         op_id: u64,
         records: Vec<JobRecord>,
     },
+    GenerationDeleted {
+        op_id: u64,
+        key: ProviderJobKey,
+        output_deleted: bool,
+    },
     Imported {
         op_id: u64,
         provider_id: ProviderId,
@@ -462,6 +478,7 @@ struct PreparedGeneration {
     deadline: Instant,
     draft_fingerprint: String,
     draft_fingerprint_candidates: Vec<String>,
+    staging_credential_provider: Option<ProviderId>,
 }
 
 struct PreparedPayload {
@@ -472,6 +489,7 @@ struct PreparedPayload {
     quote: CostQuote,
     draft_fingerprint: String,
     draft_fingerprint_candidates: Vec<String>,
+    staging_credential_provider: Option<ProviderId>,
 }
 
 struct PreparationOutcome {
@@ -688,6 +706,7 @@ async fn run_service(
                                     deadline: Instant::now() + lifetime,
                                     draft_fingerprint: payload.draft_fingerprint,
                                     draft_fingerprint_candidates: payload.draft_fingerprint_candidates,
+                                    staging_credential_provider: payload.staging_credential_provider,
                                 };
                                 let _ = events.send(ServiceEvent::ReviewReady {
                                     op_id: outcome.op_id,
@@ -899,7 +918,12 @@ async fn run_service(
                             Err(error) => emit_provider_error(&events, op_id, ServiceScope::Quote, error, None),
                         }
                     }
-                    ServiceCommand::PrepareGeneration { op_id, draft, revision } => {
+                    ServiceCommand::PrepareGeneration {
+                        op_id,
+                        draft,
+                        revision,
+                        staging_provider_id,
+                    } => {
                         let provider_id = draft.provider_id.clone();
                         if preparation.is_some() || submission_task.is_some() {
                             emit_error(&events, op_id, Some(provider_id), ServiceScope::Preparation, "Another Review preparation or paid submission is in progress".into(), true, None);
@@ -972,6 +996,72 @@ async fn run_service(
                                 continue;
                             }
                         };
+                        let has_local_media = draft
+                            .media
+                            .iter()
+                            .any(|media| matches!(media.source, MediaSource::LocalFile { .. }));
+                        let requested_stager = if has_local_media {
+                            staging_provider_id.or_else(|| {
+                                provider
+                                    .media_capabilities()
+                                    .local_files
+                                    .then(|| provider_id.clone())
+                            })
+                        } else {
+                            None
+                        };
+                        let stager = if has_local_media {
+                            let Some(stager_provider_id) = requested_stager else {
+                                emit_error(
+                                    &events,
+                                    op_id,
+                                    Some(provider_id.clone()),
+                                    ServiceScope::Preparation,
+                                    "Local reference files need an explicitly selected upload service. Connect fal.ai for temporary CDN staging, or use public HTTPS URLs."
+                                        .into(),
+                                    true,
+                                    None,
+                                );
+                                continue;
+                            };
+                            let Some(stager_key) = sessions
+                                .get(&stager_provider_id)
+                                .and_then(|session| session.key.clone())
+                            else {
+                                emit_error(
+                                    &events,
+                                    op_id,
+                                    Some(provider_id.clone()),
+                                    ServiceScope::Preparation,
+                                    format!(
+                                        "Connect {} before uploading local reference files",
+                                        descriptor(&stager_provider_id).display_name
+                                    ),
+                                    true,
+                                    None,
+                                );
+                                continue;
+                            };
+                            match make_media_stager(
+                                &stager_provider_id,
+                                &stager_key,
+                                executor.clone(),
+                            ) {
+                                Ok(stager) => Some(stager),
+                                Err(error) => {
+                                    emit_provider_error(
+                                        &events,
+                                        op_id,
+                                        ServiceScope::Preparation,
+                                        error,
+                                        None,
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
                         let _ = events.send(ServiceEvent::PreparationStarted {
                             op_id,
                             provider_id: provider_id.clone(),
@@ -987,6 +1077,7 @@ async fn run_service(
                             draft_fingerprint,
                             draft_fingerprints,
                             provider,
+                            stager,
                             gui_state.clone(),
                             Arc::clone(&cancel),
                             events.clone(),
@@ -1333,6 +1424,59 @@ async fn run_service(
                             Err(_) => emit_error(&events, op_id, None, ServiceScope::History, "History task failed".into(), true, None),
                         }
                     }
+                    ServiceCommand::DeleteGeneration { op_id, key, delete_output } => {
+                        if monitors.contains_key(&key) {
+                            emit_error(
+                                &events,
+                                op_id,
+                                Some(key.provider_id.clone()),
+                                ServiceScope::History,
+                                "This render is still being monitored. Wait for it to finish before removing it.".into(),
+                                true,
+                                Some(key.remote_job_id.clone()),
+                            );
+                            continue;
+                        }
+                        let deletion_history = history.clone();
+                        let deletion_state = gui_state.clone();
+                        let deletion_paths = paths.clone();
+                        let deletion_key = key.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            delete_generation_locally(
+                                &deletion_history,
+                                &deletion_state,
+                                &deletion_paths,
+                                &deletion_key,
+                                delete_output,
+                            )
+                        }).await {
+                            Ok(Ok(output_deleted)) => {
+                                let _ = events.send(ServiceEvent::GenerationDeleted {
+                                    op_id,
+                                    key,
+                                    output_deleted,
+                                });
+                            }
+                            Ok(Err(message)) => emit_error(
+                                &events,
+                                op_id,
+                                Some(key.provider_id.clone()),
+                                ServiceScope::History,
+                                message,
+                                true,
+                                Some(key.remote_job_id.clone()),
+                            ),
+                            Err(_) => emit_error(
+                                &events,
+                                op_id,
+                                Some(key.provider_id.clone()),
+                                ServiceScope::History,
+                                "Render cleanup task failed".into(),
+                                true,
+                                Some(key.remote_job_id.clone()),
+                            ),
+                        }
+                    }
                     ServiceCommand::CancelCurrent { op_id } => {
                         if let Some(operation) = &preparation {
                             preparation_invalidated = true;
@@ -1662,6 +1806,74 @@ async fn run_service(
     }
 }
 
+fn remove_recorded_output(path: &Path, videos_dir: &Path) -> Result<bool, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => {
+            return Err("The saved video could not be inspected, so it was left alone.".into());
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("The saved output is not a regular video file, so it was left alone.".into());
+    }
+
+    let canonical_videos = videos_dir.canonicalize().map_err(|_| {
+        "The Videos folder is unavailable, so the video was left alone.".to_string()
+    })?;
+    let canonical_output = path
+        .canonicalize()
+        .map_err(|_| "The saved video could not be verified, so it was left alone.".to_string())?;
+    if !canonical_output.starts_with(&canonical_videos) {
+        return Err("The saved output is outside the Videos folder, so it was left alone.".into());
+    }
+
+    std::fs::remove_file(&canonical_output).map_err(|_| {
+        "The saved video could not be deleted. Close any app using it and try again.".to_string()
+    })?;
+    Ok(true)
+}
+
+fn delete_generation_locally(
+    history: &HistoryStore,
+    gui_state: &GuiStateStore,
+    paths: &AppPaths,
+    key: &ProviderJobKey,
+    delete_output: bool,
+) -> Result<bool, String> {
+    let record = history
+        .get_provider(key)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "That render is no longer in local history.".to_string())?;
+    if !record.terminal() {
+        return Err("Only finished renders can be removed from the reel.".into());
+    }
+
+    let output_deleted = if delete_output {
+        record
+            .output_path
+            .as_deref()
+            .map(|path| remove_recorded_output(path, &paths.videos_dir))
+            .transpose()?
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    // Sidecar recovery state goes first: if compatible history cleanup ever
+    // fails, the visible record remains available for a safe retry.
+    gui_state
+        .remove_generation_state(key)
+        .map_err(|error| error.to_string())?;
+    let removed = history
+        .delete_provider(key)
+        .map_err(|error| error.to_string())?;
+    if !removed {
+        return Err("That render disappeared while it was being removed.".into());
+    }
+    Ok(output_deleted)
+}
+
 fn connection(provider_id: &ProviderId, session: &ProviderSession) -> ProviderConnection {
     let credential_status = session
         .store
@@ -1681,10 +1893,10 @@ fn invalidate_prepared_for_provider(
     op_id: u64,
     events: &mpsc::UnboundedSender<ServiceEvent>,
 ) {
-    if !prepared
-        .as_ref()
-        .is_some_and(|item| &item.request.provider_id == provider_id)
-    {
+    if !prepared.as_ref().is_some_and(|item| {
+        &item.request.provider_id == provider_id
+            || item.staging_credential_provider.as_ref() == Some(provider_id)
+    }) {
         return;
     }
     let invalidated = prepared.take().expect("checked prepared provider");
@@ -1760,6 +1972,32 @@ fn make_provider(
             provider_id.clone(),
             ProviderErrorKind::Configuration,
             format!("Unsupported video provider {provider_id}"),
+        )),
+    }
+}
+
+fn make_media_stager(
+    provider_id: &ProviderId,
+    key: &SecretString,
+    executor: Option<Arc<dyn HttpExecutor>>,
+) -> Result<Arc<dyn MediaStager>, ProviderError> {
+    match provider_id.as_str() {
+        "fal" => {
+            let provider = match executor {
+                Some(executor) => {
+                    FalProvider::with_executor(key.clone(), FalOptions::default(), executor)
+                }
+                None => FalProvider::new(key.clone()),
+            }?;
+            Ok(Arc::new(provider))
+        }
+        _ => Err(ProviderError::new(
+            provider_id.clone(),
+            ProviderErrorKind::Configuration,
+            format!(
+                "{} is not configured as a local-media staging service",
+                descriptor(provider_id).display_name
+            ),
         )),
     }
 }
@@ -1881,6 +2119,7 @@ async fn run_prepare_generation(
     draft_fingerprint: String,
     draft_fingerprint_candidates: Vec<String>,
     provider: Arc<dyn VideoProvider>,
+    stager: Option<Arc<dyn MediaStager>>,
     gui_state: GuiStateStore,
     cancel: Arc<AtomicBool>,
     events: mpsc::UnboundedSender<ServiceEvent>,
@@ -1893,6 +2132,7 @@ async fn run_prepare_generation(
         draft_fingerprint,
         draft_fingerprint_candidates,
         provider,
+        stager,
         gui_state,
         cancel,
         &events,
@@ -1909,6 +2149,7 @@ async fn prepare_generation_inner(
     draft_fingerprint: String,
     draft_fingerprint_candidates: Vec<String>,
     provider: Arc<dyn VideoProvider>,
+    stager: Option<Arc<dyn MediaStager>>,
     gui_state: GuiStateStore,
     cancel: Arc<AtomicBool>,
     events: &mpsc::UnboundedSender<ServiceEvent>,
@@ -1923,21 +2164,24 @@ async fn prepare_generation_inner(
         kind: TaskFailureKind::Ordinary,
     })?;
     provider
-        .validate_draft(&draft)
+        .validate_draft_with_local_staging(&draft, stager.is_some())
         .await
         .map_err(|error| TaskFailure::provider(ServiceScope::Preparation, error, None))?;
+    let stager_descriptor = stager.as_ref().map(|stager| stager.descriptor());
     let mut staged_media = Vec::with_capacity(draft.media.len());
     for (media_index, media) in draft.media.iter().enumerate() {
         if cancel.load(Ordering::Acquire) {
             return Err(preparation_cancelled(provider_id));
         }
         let local_path = media.source.local_path().map(Path::to_path_buf);
-        let cached = if let Some(path) = &local_path {
+        let receipt_scope = stager_descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.credential_provider.clone());
+        let cached = if let (Some(path), Some(receipt_scope)) = (&local_path, receipt_scope) {
             let lookup = gui_state.clone();
-            let lookup_provider = provider_id.clone();
             let lookup_path = path.clone();
             match tokio::task::spawn_blocking(move || {
-                lookup.usable_upload_receipt_for_path(&lookup_provider, &lookup_path, Utc::now())
+                lookup.usable_upload_receipt_for_path(&receipt_scope, &lookup_path, Utc::now())
             })
             .await
             {
@@ -1962,31 +2206,53 @@ async fn prepare_generation_inner(
                 path: path.clone(),
             });
         }
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<UploadProgress>();
-        let staged = {
-            let stage = provider.stage_media(media, cached.as_ref(), Some(progress_tx));
-            tokio::pin!(stage);
-            loop {
-                tokio::select! {
-                    result = &mut stage => {
-                        break result.map_err(|error| {
-                            TaskFailure::provider(ServiceScope::Preparation, error, None)
-                        })?;
-                    }
-                    progress = progress_rx.recv() => {
-                        if let Some(progress) = progress {
-                            let _ = events.send(ServiceEvent::MediaUploadProgress {
-                                op_id,
-                                provider_id: provider_id.clone(),
-                                media_index,
-                                sent: progress.sent,
-                                total: progress.total,
-                            });
+        let staged = match &media.source {
+            MediaSource::RemoteUrl { url } => StagedMedia::remote(media.role, url.clone())
+                .map_err(|error| TaskFailure {
+                    provider_id: provider_id.clone(),
+                    scope: ServiceScope::Preparation,
+                    message: error.to_string(),
+                    recoverable: true,
+                    job_id: None,
+                    kind: TaskFailureKind::Ordinary,
+                })?,
+            MediaSource::LocalFile { .. } => {
+                let Some(stager) = stager.as_ref() else {
+                    return Err(TaskFailure {
+                        provider_id: provider_id.clone(),
+                        scope: ServiceScope::Preparation,
+                        message: "Local reference files need an explicitly selected upload service"
+                            .into(),
+                        recoverable: true,
+                        job_id: None,
+                        kind: TaskFailureKind::Ordinary,
+                    });
+                };
+                let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<UploadProgress>();
+                let stage = stager.stage_local(media, cached.as_ref(), Some(progress_tx));
+                tokio::pin!(stage);
+                loop {
+                    tokio::select! {
+                        result = &mut stage => {
+                            break result.map_err(|error| {
+                                TaskFailure::provider(ServiceScope::Preparation, error, None)
+                            })?;
                         }
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                        if cancel.load(Ordering::Acquire) {
-                            return Err(preparation_cancelled(provider_id));
+                        progress = progress_rx.recv() => {
+                            if let Some(progress) = progress {
+                                let _ = events.send(ServiceEvent::MediaUploadProgress {
+                                    op_id,
+                                    provider_id: provider_id.clone(),
+                                    media_index,
+                                    sent: progress.sent,
+                                    total: progress.total,
+                                });
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                            if cancel.load(Ordering::Acquire) {
+                                return Err(preparation_cancelled(provider_id));
+                            }
                         }
                     }
                 }
@@ -2056,6 +2322,8 @@ async fn prepare_generation_inner(
         quote,
         draft_fingerprint,
         draft_fingerprint_candidates,
+        staging_credential_provider: stager_descriptor
+            .and_then(|descriptor| descriptor.credential_provider),
     })
 }
 
@@ -3524,5 +3792,44 @@ mod tests {
                 .expect("reordered OpenRouter fingerprints")[0],
             "OpenRouter's documented mixed input_references array remains ordered"
         );
+    }
+
+    #[test]
+    fn recorded_output_deletion_is_confined_to_regular_files_in_videos() {
+        let root = tempfile::tempdir().expect("create root fixture");
+        let videos = root.path().join("Videos");
+        std::fs::create_dir_all(&videos).expect("create Videos fixture");
+        let output = videos.join("finished.mp4");
+        std::fs::write(&output, b"video").expect("create output fixture");
+
+        assert!(remove_recorded_output(&output, &videos).expect("delete verified output"));
+        assert!(!output.exists());
+        assert!(!remove_recorded_output(&output, &videos).expect("missing output is idempotent"));
+
+        let outside = root.path().join("outside.mp4");
+        std::fs::write(&outside, b"keep").expect("create outside fixture");
+        let error = remove_recorded_output(&outside, &videos)
+            .expect_err("outside output must not be deleted");
+        assert!(error.contains("outside the Videos folder"));
+        assert!(outside.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_output_deletion_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("create root fixture");
+        let videos = root.path().join("Videos");
+        std::fs::create_dir_all(&videos).expect("create Videos fixture");
+        let target = videos.join("target.mp4");
+        let link = videos.join("linked.mp4");
+        std::fs::write(&target, b"keep").expect("create target fixture");
+        symlink(&target, &link).expect("create symlink fixture");
+
+        let error =
+            remove_recorded_output(&link, &videos).expect_err("symlink output must not be deleted");
+        assert!(error.contains("not a regular video file"));
+        assert!(target.exists());
     }
 }

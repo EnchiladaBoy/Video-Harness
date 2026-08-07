@@ -109,6 +109,27 @@ impl MediaCapabilities {
     }
 }
 
+/// Who can retrieve media after a stager has uploaded it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedVisibility {
+    /// The staged object is reachable without authentication by anyone who
+    /// has its capability URL.
+    PublicByLink,
+}
+
+/// Stable metadata for a service that turns local media into provider-ready
+/// public HTTPS URLs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaStagerDescriptor {
+    pub id: String,
+    pub display_name: String,
+    /// Credential provider needed by this stager, if any.
+    pub credential_provider: Option<ProviderId>,
+    pub visibility: StagedVisibility,
+    /// Requested lifetime of newly staged objects.
+    pub retention: Option<Duration>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadProgress {
     pub sent: u64,
@@ -131,6 +152,23 @@ pub async fn media_sha256(path: &Path) -> Result<(String, u64), std::io::Error> 
         size = size.saturating_add(read as u64);
     }
     Ok((format!("{:x}", hasher.finalize()), size))
+}
+
+/// Provider-independent boundary for uploading local input media.
+///
+/// Generator adapters consume the resulting public HTTPS URL but do not need
+/// to own the upload service or its credential. Remote URLs bypass this
+/// boundary and should be passed through by the caller.
+#[async_trait]
+pub trait MediaStager: Send + Sync {
+    fn descriptor(&self) -> MediaStagerDescriptor;
+
+    async fn stage_local(
+        &self,
+        media: &DraftMedia,
+        cached_receipt: Option<&UploadReceipt>,
+        progress: Option<mpsc::UnboundedSender<UploadProgress>>,
+    ) -> Result<StagedMedia, ProviderError>;
 }
 
 #[async_trait]
@@ -167,6 +205,19 @@ pub trait VideoProvider: Send + Sync {
     /// public-HTTPS placeholders only after their paths and provider media
     /// capabilities have been checked.
     async fn validate_draft(&self, draft: &GenerationDraft) -> Result<(), ProviderError> {
+        self.validate_draft_with_local_staging(draft, false).await
+    }
+
+    /// Validate an editable draft when the caller has explicitly resolved an
+    /// independent local-media stager. Passing `false` is identical to
+    /// [`VideoProvider::validate_draft`]; passing `true` permits local files to
+    /// use inert public-HTTPS placeholders when this generator accepts remote
+    /// reference URLs. This method never uploads bytes.
+    async fn validate_draft_with_local_staging(
+        &self,
+        draft: &GenerationDraft,
+        local_staging_available: bool,
+    ) -> Result<(), ProviderError> {
         let descriptor = self.descriptor();
         if draft.provider_id != descriptor.id {
             return Err(ProviderError::new(
@@ -199,7 +250,10 @@ pub trait VideoProvider: Send + Sync {
                         ),
                     ));
                 }
-                MediaSource::LocalFile { .. } if capabilities.local_files => {
+                MediaSource::LocalFile { .. }
+                    if capabilities.local_files
+                        || (local_staging_available && capabilities.remote_urls) =>
+                {
                     let extension = match media.role.kind() {
                         MediaKind::Image => "png",
                         MediaKind::Video => "mp4",

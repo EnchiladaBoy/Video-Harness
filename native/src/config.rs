@@ -15,6 +15,7 @@ use serde_json::Value;
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::atomic::replace_file;
 use crate::domain::{OPENROUTER_PROVIDER_ID, ProviderId};
 
 pub const APP_NAME: &str = "openrouter-video-studio";
@@ -191,6 +192,24 @@ pub struct AppPaths {
 }
 
 impl AppPaths {
+    /// Construct application paths supplied by a platform integration.
+    ///
+    /// This performs no environment discovery and does not create any of the
+    /// directories. Call [`Self::ensure`] when the paths are ready for use.
+    pub fn new(
+        data_dir: impl Into<PathBuf>,
+        cache_dir: impl Into<PathBuf>,
+        config_dir: impl Into<PathBuf>,
+        videos_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+            cache_dir: cache_dir.into(),
+            config_dir: config_dir.into(),
+            videos_dir: videos_dir.into(),
+        }
+    }
+
     pub fn discover() -> Result<Self, ConfigError> {
         let home = env::var_os("HOME")
             .filter(|value| !value.is_empty())
@@ -205,12 +224,12 @@ impl AppPaths {
         let cache_home = xdg_dir("XDG_CACHE_HOME", &home.join(".cache"), &home);
         let config_home = xdg_dir("XDG_CONFIG_HOME", &home.join(".config"), &home);
         let videos_dir = discover_videos_dir_from(&home, &config_home);
-        Self {
-            data_dir: data_home.join(APP_NAME),
-            cache_dir: cache_home.join(APP_NAME),
-            config_dir: config_home.join(APP_NAME),
+        Self::new(
+            data_home.join(APP_NAME),
+            cache_home.join(APP_NAME),
+            config_home.join(APP_NAME),
             videos_dir,
-        }
+        )
     }
 
     pub fn history_db(&self) -> PathBuf {
@@ -340,7 +359,7 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), ConfigEr
             file.write_all(b"\n")?;
             file.sync_all()?;
             drop(file);
-            fs::rename(&temporary, path)?;
+            replace_file(&temporary, path)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -531,6 +550,57 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn injected_app_paths_are_exact_and_derive_storage_locations() {
+        let root = PathBuf::from("injected-platform-paths");
+        let data = root.join("data");
+        let cache = root.join("cache");
+        let config = root.join("config");
+        let videos = root.join("finished-videos");
+        let paths = AppPaths::new(&data, &cache, &config, &videos);
+
+        assert_eq!(paths.data_dir, data);
+        assert_eq!(paths.cache_dir, cache);
+        assert_eq!(paths.config_dir, config);
+        assert_eq!(paths.videos_dir, videos);
+        assert_eq!(paths.history_db(), data.join("history.sqlite3"));
+        assert_eq!(paths.gui_state_db(), data.join("gui-state.sqlite3"));
+        assert_eq!(paths.catalog_cache(), cache.join("video-models.json"));
+        assert_eq!(paths.model_settings(), config.join("model-settings.json"));
+        assert_eq!(paths.app_settings(), config.join(APP_SETTINGS_FILE));
+
+        assert_eq!(
+            paths
+                .provider_catalog_cache(&ProviderId::openrouter())
+                .expect("OpenRouter catalog path"),
+            cache.join("video-models.json")
+        );
+        assert_eq!(
+            paths
+                .provider_model_settings(&ProviderId::openrouter())
+                .expect("OpenRouter settings path"),
+            config.join("model-settings.json")
+        );
+        assert_eq!(
+            paths
+                .provider_catalog_cache(&ProviderId::fal())
+                .expect("fal catalog path"),
+            cache
+                .join("providers")
+                .join("fal")
+                .join("video-models.json")
+        );
+        assert_eq!(
+            paths
+                .provider_model_settings(&ProviderId::fal())
+                .expect("fal settings path"),
+            config
+                .join("providers")
+                .join("fal")
+                .join("model-settings.json")
+        );
+    }
 
     #[test]
     fn remembered_model_settings_reject_credential_fields_recursively() {

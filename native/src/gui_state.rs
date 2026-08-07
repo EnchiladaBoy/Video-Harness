@@ -640,6 +640,22 @@ impl GuiStateStore {
         Ok(changed > 0)
     }
 
+    /// Remove all GUI-only recovery data owned by one provider generation.
+    pub fn remove_generation_state(&self, key: &ProviderJobKey) -> Result<bool, GuiStateError> {
+        let mut connection = self.ready_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let media = transaction.execute(
+            "DELETE FROM generation_media WHERE provider_id = ?1 AND remote_job_id = ?2",
+            params![key.provider_id.as_str(), key.remote_job_id],
+        )?;
+        let resumable = transaction.execute(
+            "DELETE FROM resumable_jobs WHERE provider_id = ?1 AND remote_job_id = ?2",
+            params![key.provider_id.as_str(), key.remote_job_id],
+        )?;
+        transaction.commit()?;
+        Ok(media + resumable > 0)
+    }
+
     pub fn resumable_jobs(&self) -> Result<Vec<ResumableJob>, GuiStateError> {
         let connection = self.ready_connection()?;
         let mut statement = connection.prepare(
@@ -1590,6 +1606,76 @@ mod tests {
         assert_eq!(store.generation_media(&key).expect("load media"), media);
         assert!(store.remove_resumable_job(&key).expect("remove job"));
         assert!(store.resumable_jobs().expect("load empty jobs").is_empty());
+    }
+
+    #[test]
+    fn removing_generation_state_clears_media_and_recovery_without_touching_other_jobs() {
+        let (_directory, store) = store();
+        let target = ProviderJobKey {
+            provider_id: ProviderId::fal(),
+            remote_job_id: "remove-me".into(),
+        };
+        let survivor = ProviderJobKey {
+            provider_id: ProviderId::fal(),
+            remote_job_id: "keep-me".into(),
+        };
+        for key in [&target, &survivor] {
+            store
+                .save_resumable_job(&ResumableJob {
+                    key: key.clone(),
+                    locator: JobLocator::Fal {
+                        endpoint_id: "model".into(),
+                        request_id: key.remote_job_id.clone(),
+                        status_url: None,
+                        response_url: None,
+                    },
+                    accepted_at: Utc::now(),
+                    monitoring_paused: true,
+                })
+                .expect("save resumable job");
+            store
+                .replace_generation_media(
+                    key,
+                    &[GenerationMediaAssociation {
+                        key: key.clone(),
+                        position: 0,
+                        draft_media_id: "reference".into(),
+                        role: "reference".into(),
+                        source: StoredMediaSource::RemoteUrl(
+                            "https://example.test/reference.png".into(),
+                        ),
+                        resolved_url: "https://example.test/reference.png".into(),
+                    }],
+                )
+                .expect("save generation media");
+        }
+
+        assert!(
+            store
+                .remove_generation_state(&target)
+                .expect("remove generation state")
+        );
+        assert!(
+            !store
+                .remove_generation_state(&target)
+                .expect("repeat generation-state removal")
+        );
+        assert!(
+            store
+                .generation_media(&target)
+                .expect("read removed media")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .generation_media(&survivor)
+                .expect("read surviving media")
+                .len(),
+            1
+        );
+        let resumable = store.resumable_jobs().expect("read resumable jobs");
+        assert_eq!(resumable.len(), 1);
+        assert_eq!(resumable[0].key, survivor);
     }
 
     #[test]

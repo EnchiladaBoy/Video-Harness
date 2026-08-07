@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PUBLIC_KEY="${1:-}"
 OUTPUT_DIR="${2:-}"
-REPOSITORY_URL="${3:-https://enchiladaboy.github.io/VideoHarness/}"
+REPOSITORY_URL="${3:-https://enchiladaboy.github.io/Video-Harness/}"
 
 if [[ -z "${PUBLIC_KEY}" || -z "${OUTPUT_DIR}" ]]; then
     echo "Usage: $0 PUBLIC_KEY OUTPUT_DIR [REPOSITORY_URL]" >&2

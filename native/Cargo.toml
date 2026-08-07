@@ -1,12 +1,12 @@
 [package]
 name = "video-harness"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.92"
-description = "A native multi-provider workspace for AI video generation"
+description = "A multi-provider desktop workspace for AI video generation"
 license = "MIT"
-repository = "https://github.com/EnchiladaBoy/VideoHarness"
-keywords = ["video", "ai", "gtk", "openrouter", "fal"]
+repository = "https://github.com/EnchiladaBoy/Video-Harness"
+keywords = ["video", "ai", "desktop", "openrouter", "fal"]
 categories = ["multimedia::video"]
 default-run = "video-harness"
 publish = false
@@ -18,14 +18,19 @@ path = "src/lib.rs"
 [[bin]]
 name = "video-harness"
 path = "src/bin/video-harness.rs"
+required-features = ["legacy-gtk"]
+
+[features]
+default = ["legacy-gtk"]
+legacy-gtk = ["dep:adw", "dep:gtk"]
 
 [dependencies]
 async-trait = "0.1.89"
-adw = { package = "libadwaita", version = "0.9.2", features = ["v1_6"] }
+adw = { package = "libadwaita", version = "0.9.2", features = ["v1_6"], optional = true }
 bytes = "1.10"
 chrono = { version = "0.4.45", features = ["clock", "serde"] }
 futures-util = "0.3.31"
-gtk = { package = "gtk4", version = "0.11.4", features = ["v4_10"] }
+gtk = { package = "gtk4", version = "0.11.4", features = ["v4_10"], optional = true }
 httpdate = "1.0.3"
 keyring = "4.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
@@ -39,6 +44,9 @@ thiserror = "2.0.18"
 tokio = { version = "1.49", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 unicode-normalization = "0.1.25"
 url = { version = "2.5.8", features = ["serde"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3.23"

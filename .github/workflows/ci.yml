@@ -13,6 +13,169 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  web-ui:
+    name: Svelte desktop UI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Check UI types and accessibility
+        working-directory: ui
+        run: npm run check
+
+      - name: Run UI tests
+        working-directory: ui
+        run: npm test
+
+      - name: Build desktop UI
+        working-directory: ui
+        run: npm run build
+
+  portable-core:
+    name: Platform-neutral Rust core
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container: rust:1.92-trixie
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust quality components
+        run: rustup component add clippy
+
+      - name: Check without the legacy GTK frontend
+        working-directory: native
+        run: cargo check --locked --lib --no-default-features
+
+      - name: Test without the legacy GTK frontend
+        working-directory: native
+        run: cargo test --locked --lib --tests --no-default-features
+
+      - name: Lint without the legacy GTK frontend
+        working-directory: native
+        run: cargo clippy --locked --lib --tests --no-default-features -- -D warnings
+
+  future-platform-core:
+    name: Desktop shell and core (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Windows x64
+            runner: windows-2025
+          - platform: macOS x64
+            runner: macos-26-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust 1.92
+        run: rustup toolchain install 1.92 --profile minimal
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build desktop UI
+        working-directory: ui
+        run: npm ci && npm run build
+
+      - name: Check without the legacy GTK frontend
+        working-directory: native
+        run: cargo +1.92 check --locked --lib --no-default-features
+
+      - name: Test platform-specific core behavior
+        working-directory: native
+        run: cargo +1.92 test --locked --lib --no-default-features
+
+      - name: Check Tauri desktop shell
+        working-directory: desktop/src-tauri
+        run: cargo +1.92 check --locked
+
+      - name: Test Tauri desktop shell
+        working-directory: desktop/src-tauri
+        run: cargo +1.92 test --locked
+
+  desktop-linux:
+    name: Tauri desktop shell (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev \
+            patchelf \
+            pkg-config
+
+      - name: Install Rust 1.92
+        run: |
+          rustup toolchain install 1.92 --profile minimal
+          rustup component add --toolchain 1.92 rustfmt clippy
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build desktop UI
+        working-directory: ui
+        run: npm ci && npm run build
+
+      - name: Check Rust formatting
+        working-directory: desktop/src-tauri
+        run: cargo +1.92 fmt --check
+
+      - name: Check Tauri desktop shell
+        working-directory: desktop/src-tauri
+        run: cargo +1.92 check --locked
+
+      - name: Test Tauri desktop shell
+        working-directory: desktop/src-tauri
+        run: cargo +1.92 test --locked
+
+      - name: Lint Tauri desktop shell
+        working-directory: desktop/src-tauri
+        run: cargo +1.92 clippy --locked --all-targets -- -D warnings
+
+      - name: Smoke-test Tauri release archive assembly
+        run: |
+          cargo +1.92 build --locked \
+            --manifest-path desktop/src-tauri/Cargo.toml \
+            --bin video-harness
+          desktop/src-tauri/target/debug/video-harness --version
+          SOURCE_DATE_EPOCH=0 packaging/build-tarball.sh \
+            --binary desktop/src-tauri/target/debug/video-harness \
+            --output-dir "${RUNNER_TEMP}/video-harness-dist"
+          tar -tJf "${RUNNER_TEMP}/video-harness-dist/"*.tar.xz \
+            | grep -F '/native/bin/video-harness'
+
   quality:
     name: Rust, metadata, and installers
     runs-on: ubuntu-24.04
@@ -27,13 +190,9 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             appstream \
-            dbus-x11 \
             desktop-file-utils \
             gcc \
-            libadwaita-1-dev \
-            libgtk-4-dev \
-            pkg-config \
-            xvfb
+            pkg-config
 
       - name: Install Rust quality components
         run: rustup component add rustfmt clippy
@@ -45,13 +204,13 @@ jobs:
         working-directory: native
         run: cargo fmt --check
 
-      - name: Lint all Rust targets
+      - name: Lint the platform-neutral core
         working-directory: native
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --locked --lib --tests --no-default-features -- -D warnings
 
-      - name: Run deterministic test suite
+      - name: Run deterministic core test suite
         working-directory: native
-        run: xvfb-run -a cargo test --all-targets --locked
+        run: cargo test --locked --lib --tests --no-default-features
 
       - name: Smoke-test architecture-neutral installer
         run: packaging/test-installer.sh
@@ -71,6 +230,17 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build locked desktop UI
+        working-directory: ui
+        run: npm ci && npm run build
 
       - name: Install Flatpak tooling
         run: |

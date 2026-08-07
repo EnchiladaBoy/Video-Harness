@@ -4,7 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname -- "${SCRIPT_DIR}")"
 MANIFEST="${SCRIPT_DIR}/io.github.EnchiladaBoy.VideoHarness.yml"
-CARGO_TOML="${PROJECT_DIR}/native/Cargo.toml"
+NATIVE_CARGO_TOML="${PROJECT_DIR}/native/Cargo.toml"
+DESKTOP_CARGO_TOML="${PROJECT_DIR}/desktop/src-tauri/Cargo.toml"
 METAINFO="${PROJECT_DIR}/native/data/io.github.EnchiladaBoy.VideoHarness.metainfo.xml"
 
 fail() {
@@ -42,9 +43,28 @@ if grep -Eq -- '--filesystem=(home|host)(:|$)' "${MANIFEST}"; then
 fi
 require_literal 'runtime-version: "50"'
 require_literal 'org.freedesktop.Sdk.Extension.rust-stable'
-require_literal 'cargo build --release --locked --offline'
+require_literal 'cargo build --release --locked --offline --manifest-path desktop/src-tauri/Cargo.toml --bin video-harness'
+require_literal 'install -Dm0755 desktop/src-tauri/target/release/video-harness /app/bin/video-harness'
+require_literal 'path: ../desktop'
+require_literal 'dest: desktop'
+require_literal 'path: ../native'
+require_literal 'dest: native'
+require_literal 'path: ../ui/dist'
+require_literal 'dest: ui/dist'
+dir_source_count="$(grep -c '^      - type: dir$' "${MANIFEST}")"
+[[ "${dir_source_count}" -eq 3 ]] \
+    || fail "manifest must contain exactly the three reviewed local source directories"
+if grep -Eq '^[[:space:]]+path:[[:space:]]+\.\.[[:space:]]*$' "${MANIFEST}"; then
+    fail "copying the repository root into the Flatpak build is forbidden"
+fi
+if grep -Fq -- 'legacy-gtk' "${MANIFEST}"; then
+    fail "the stable Flatpak must not build the retired GTK frontend"
+fi
 
-package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${CARGO_TOML}" | head -n 1)"
+package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${DESKTOP_CARGO_TOML}" | head -n 1)"
+core_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${NATIVE_CARGO_TOML}" | head -n 1)"
+[[ "${package_version}" == "${core_version}" ]] \
+    || fail "desktop and core Cargo versions differ (${package_version} != ${core_version})"
 grep -Fq -- "<release version=\"${package_version}\"" "${METAINFO}" \
     || fail "Cargo and AppStream versions differ (${package_version})"
 

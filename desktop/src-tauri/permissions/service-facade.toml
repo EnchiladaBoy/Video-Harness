@@ -1,0 +1,23 @@
+[[permission]]
+identifier = "service-facade"
+description = "Allows only the reviewed Video Harness workflow commands. It does not grant generic filesystem, HTTP, opener, dialog, process, or shell access."
+commands.allow = [
+    "open_session",
+    "get_snapshot",
+    "connect_provider",
+    "forget_provider",
+    "acknowledge_safety_hold",
+    "choose_media",
+    "attach_dropped_media",
+    "add_remote_media",
+    "prepare_generation",
+    "submit_prepared",
+    "invalidate_prepared",
+    "save_draft",
+    "pause_job",
+    "resume_job",
+    "delete_render",
+    "open_output",
+    "grant_playback",
+    "release_playback",
+]

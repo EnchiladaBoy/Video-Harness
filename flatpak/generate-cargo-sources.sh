@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-LOCK_FILE="${SCRIPT_DIR}/../native/Cargo.lock"
+LOCK_FILE="${SCRIPT_DIR}/../desktop/src-tauri/Cargo.lock"
 OUTPUT_FILE="${1:-${SCRIPT_DIR}/cargo-sources.json}"
 TEMP_FILE="${OUTPUT_FILE}.new.$$"
 

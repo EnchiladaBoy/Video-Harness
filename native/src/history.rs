@@ -392,6 +392,28 @@ impl HistoryStore {
             .map_err(HistoryError::from)
     }
 
+    /// Remove one provider-qualified generation from compatible history.
+    ///
+    /// OpenRouter records are deliberately mirrored into the legacy `jobs`
+    /// table. Both projections must disappear in the same transaction or the
+    /// startup reconciliation pass would restore the canonical row.
+    pub fn delete_provider(&self, key: &ProviderJobKey) -> Result<bool, HistoryError> {
+        let mut connection = self.ready_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut removed = transaction.execute(
+            "DELETE FROM generations WHERE provider_id = ?1 AND remote_job_id = ?2",
+            params![key.provider_id.as_str(), key.remote_job_id],
+        )?;
+        if key.provider_id.as_str() == OPENROUTER_PROVIDER_ID {
+            removed += transaction.execute(
+                "DELETE FROM jobs WHERE job_id = ?1",
+                params![key.remote_job_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(removed > 0)
+    }
+
     /// Legacy OpenRouter-only listing.
     pub fn list(&self, limit: usize) -> Result<Vec<JobRecord>, HistoryError> {
         self.list_provider(&ProviderId::openrouter(), limit)

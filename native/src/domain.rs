@@ -14,6 +14,8 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use url::{Host, Url};
 
+use crate::atomic::replace_file;
+
 pub const PREFERRED_MODEL_ID: &str = "black-forest-labs/flux-3-video";
 pub const OPENROUTER_PROVIDER_ID: &str = "openrouter";
 pub const FAL_PROVIDER_ID: &str = "fal";
@@ -2017,7 +2019,7 @@ impl VideoCatalog {
                 .unwrap_or("catalog")
         ));
         fs::write(&temporary, serde_json::to_vec(&payload)?)?;
-        fs::rename(temporary, path)?;
+        replace_file(&temporary, path)?;
         Ok(())
     }
 

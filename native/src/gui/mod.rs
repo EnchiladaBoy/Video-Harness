@@ -2,6 +2,7 @@
 
 pub mod cloud_cinema;
 pub mod composer_state;
+pub mod layout;
 mod window;
 
 use std::fmt;

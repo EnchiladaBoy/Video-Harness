@@ -12,8 +12,9 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use super::cloud_cinema::{CloudCinema, CloudCinemaActivity};
-use super::composer_state::{AudioChoice, COMPACT_MAX_WIDTH, CatalogReducer, ModelKey};
+use super::layout::COMPACT_MAX_WIDTH;
 
+use crate::composer::{AudioChoice, CatalogReducer, ModelKey};
 use crate::config::AppPaths;
 use crate::domain::{
     CostQuote, DraftMedia, GenerationDraft, MediaCardinality, MediaKind, MediaRole, MediaSource,
@@ -33,6 +34,8 @@ use crate::workflow::{
 };
 
 const PROVIDERS: [(&str, &str); 2] = [("openrouter", "OpenRouter"), ("fal", "fal.ai")];
+const MODEL_PICKER_MIN_CHARS: i32 = 12;
+const MODEL_PICKER_MAX_CHARS: i32 = 22;
 
 pub fn install_style() {
     let provider = gtk::CssProvider::new();
@@ -170,7 +173,7 @@ fn present_migration_consent(
     dialog.add_response("clean", "Start clean");
     dialog.add_response("import", "Import workspace");
     dialog.set_close_response("cancel");
-    dialog.set_default_response(Some("clean"));
+    dialog.set_default_response(Some("cancel"));
     dialog.set_response_appearance("import", adw::ResponseAppearance::Suggested);
     let app = application.clone();
     let response_window = startup.clone();
@@ -351,6 +354,12 @@ struct PreparedReview {
     draft_fingerprint: String,
 }
 
+#[derive(Clone, Copy)]
+struct PendingReviewPreparation {
+    op_id: u64,
+    revision: u64,
+}
+
 struct HarnessWindow {
     window: adw::ApplicationWindow,
     toast_overlay: adw::ToastOverlay,
@@ -362,12 +371,15 @@ struct HarnessWindow {
     loading_draft: Cell<bool>,
     save_timer: RefCell<Option<glib::SourceId>>,
     prepared: RefCell<Option<PreparedReview>>,
+    pending_review_preparation: Cell<Option<PendingReviewPreparation>>,
+    staging_confirmation_active: Cell<bool>,
     pending_submit_op: Cell<Option<u64>>,
     pending_submit_revision: Cell<Option<u64>>,
     pending_submit_provider: RefCell<Option<ProviderId>>,
     uncertain_revision: Cell<Option<u64>>,
     uncertain_submissions: RefCell<BTreeMap<(ProviderId, String), UncertainSubmissionRecord>>,
     pending_uncertain_clears: RefCell<HashMap<u64, (ProviderId, String)>>,
+    connected_providers: RefCell<HashSet<ProviderId>>,
     pause_before_shutdown: Cell<bool>,
     pending_close_draft_op: Cell<Option<u64>>,
     shutdown_requested: Cell<bool>,
@@ -526,12 +538,15 @@ impl HarnessWindow {
             loading_draft: Cell::new(false),
             save_timer: RefCell::new(None),
             prepared: RefCell::new(None),
+            pending_review_preparation: Cell::new(None),
+            staging_confirmation_active: Cell::new(false),
             pending_submit_op: Cell::new(None),
             pending_submit_revision: Cell::new(None),
             pending_submit_provider: RefCell::new(None),
             uncertain_revision: Cell::new(None),
             uncertain_submissions: RefCell::new(BTreeMap::new()),
             pending_uncertain_clears: RefCell::new(HashMap::new()),
+            connected_providers: RefCell::new(HashSet::new()),
             pause_before_shutdown: Cell::new(false),
             pending_close_draft_op: Cell::new(None),
             shutdown_requested: Cell::new(false),
@@ -692,6 +707,8 @@ impl HarnessWindow {
                 }
                 this.capture_active_model_snapshot();
                 this.refresh_model_controls();
+                this.update_media_input_availability();
+                this.rebuild_media();
                 this.draft_changed();
             }
         });
@@ -762,13 +779,6 @@ impl HarnessWindow {
             let Some(this) = weak.upgrade() else {
                 return false;
             };
-            if this.selected_provider() == ProviderId::openrouter() {
-                this.toast(
-                    "OpenRouter accepts reference media by public HTTPS URL only.",
-                    "dialog-warning-symbolic",
-                );
-                return false;
-            }
             let mut added_paths = Vec::new();
             let mut rejected = 0usize;
             for file in files.files() {
@@ -777,6 +787,10 @@ impl HarnessWindow {
                         rejected += 1;
                         continue;
                     };
+                    if !this.model_accepts_new_media_kind(kind) {
+                        rejected += 1;
+                        continue;
+                    }
                     added_paths.push(path.clone());
                     this.media.borrow_mut().push(MediaItem {
                         source: MediaSource::local(path),
@@ -798,7 +812,7 @@ impl HarnessWindow {
             } else {
                 if rejected > 0 {
                     this.toast(
-                        "Reference media must be an image, MP4/MOV video, or MP3/WAV audio file.",
+                        "None of those files are supported by the selected model and media formats.",
                         "dialog-warning-symbolic",
                     );
                 }
@@ -1189,17 +1203,6 @@ impl HarnessWindow {
             .collect();
         if strict {
             draft.validate().map_err(|error| error.to_string())?;
-            if draft.provider_id == ProviderId::openrouter()
-                && draft
-                    .media
-                    .iter()
-                    .any(|media| matches!(media.source, MediaSource::LocalFile { .. }))
-            {
-                return Err(
-                    "OpenRouter reference media must use public HTTPS URLs. Local rows are kept in your draft, but cannot be reviewed with OpenRouter; switch to fal.ai or replace them with URLs."
-                        .into(),
-                );
-            }
             self.validate_model_media(&draft)?;
         }
         Ok(draft)
@@ -1308,6 +1311,23 @@ impl HarnessWindow {
             }
         }
         Ok(())
+    }
+
+    fn model_accepts_new_media_kind(&self, kind: MediaKind) -> bool {
+        let Some(model) = self.selected_model() else {
+            return false;
+        };
+        if kind != MediaKind::Image
+            && self
+                .catalogs
+                .borrow()
+                .get(&model.provider_id)
+                .is_some_and(|catalog| catalog.stale)
+        {
+            return false;
+        }
+        model.supports_media_kind(kind)
+            || (kind == MediaKind::Image && !model.supported_frame_images.is_empty())
     }
 
     fn draft_editor_state(&self) -> DraftEditorState {
@@ -1428,7 +1448,11 @@ impl HarnessWindow {
         self.relink_removals.replace(removals);
     }
 
-    fn prepare_review(&self) {
+    fn prepare_review(self: &Rc<Self>) {
+        if self.pending_review_preparation.get().is_some() || self.staging_confirmation_active.get()
+        {
+            return;
+        }
         if self.close_in_progress() {
             self.toast(
                 "Finish or cancel closing before preparing another generation.",
@@ -1443,6 +1467,107 @@ impl HarnessWindow {
                 return;
             }
         };
+        let has_local_media = draft
+            .media
+            .iter()
+            .any(|item| matches!(item.source, MediaSource::LocalFile { .. }));
+        if draft.provider_id == ProviderId::openrouter() && has_local_media {
+            if !self
+                .connected_providers
+                .borrow()
+                .contains(&ProviderId::fal())
+            {
+                self.toast(
+                    "Connect fal.ai in Providers & Settings before staging OpenRouter files.",
+                    "dialog-warning-symbolic",
+                );
+                self.update_compatibility();
+                return;
+            }
+            self.confirm_openrouter_file_staging(draft);
+            return;
+        }
+        let staging_provider_id =
+            (has_local_media && draft.provider_id == ProviderId::fal()).then(ProviderId::fal);
+        self.start_review_preparation(draft, staging_provider_id);
+    }
+
+    fn confirm_openrouter_file_staging(self: &Rc<Self>, draft: GenerationDraft) {
+        if self.staging_confirmation_active.get() || self.pending_review_preparation.get().is_some()
+        {
+            return;
+        }
+        self.staging_confirmation_active.set(true);
+        let local_files = draft
+            .media
+            .iter()
+            .filter_map(|item| item.source.local_path())
+            .collect::<Vec<_>>();
+        let total_bytes = local_files.iter().fold(0u64, |total, path| {
+            total.saturating_add(path.metadata().map(|metadata| metadata.len()).unwrap_or(0))
+        });
+        let count = local_files.len();
+        let dialog = adw::AlertDialog::builder()
+            .heading("Upload local references?")
+            .body(format!(
+                "{count} local file(s) ({}) will upload to fal.ai's public-by-link CDN with a requested 24-hour expiry. Their HTTPS URLs will then be sent to OpenRouter and the selected model provider. This step does not submit a paid generation.",
+                byte_size(total_bytes)
+            ))
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("upload", "Upload and prepare review");
+        dialog.set_close_response("cancel");
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_response_appearance("upload", adw::ResponseAppearance::Suggested);
+        self.update_compatibility();
+        let revision = self.revision.get();
+        let weak = Self::weak(self);
+        dialog.connect_response(None, move |_, response| {
+            let Some(this) = weak.upgrade() else { return };
+            if !this.staging_confirmation_active.replace(false) {
+                return;
+            }
+            if response != "upload" {
+                this.update_compatibility();
+                return;
+            }
+            if this.revision.get() != revision {
+                this.toast(
+                    "The draft changed, so the upload confirmation was discarded.",
+                    "dialog-warning-symbolic",
+                );
+                this.update_compatibility();
+                return;
+            }
+            if !this
+                .connected_providers
+                .borrow()
+                .contains(&ProviderId::fal())
+            {
+                this.toast(
+                    "The fal.ai upload connection is no longer available.",
+                    "dialog-warning-symbolic",
+                );
+                this.update_compatibility();
+                return;
+            }
+            this.start_review_preparation(draft.clone(), Some(ProviderId::fal()));
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    fn start_review_preparation(
+        &self,
+        draft: GenerationDraft,
+        staging_provider_id: Option<ProviderId>,
+    ) {
+        if self.pending_review_preparation.get().is_some() {
+            return;
+        }
+        let op_id = self.op_id();
+        let revision = self.revision.get();
+        self.pending_review_preparation
+            .set(Some(PendingReviewPreparation { op_id, revision }));
         self.review.set_sensitive(false);
         self.review.set_label("Preparing review…");
         self.show_compatibility(
@@ -1457,11 +1582,21 @@ impl HarnessWindow {
             },
             "harness-warning",
         );
-        self.send(ServiceCommand::PrepareGeneration {
-            op_id: self.op_id(),
+        if !self.send(ServiceCommand::PrepareGeneration {
+            op_id,
             draft,
-            revision: self.revision.get(),
-        });
+            revision,
+            staging_provider_id,
+        }) {
+            if self
+                .pending_review_preparation
+                .get()
+                .is_some_and(|pending| pending.op_id == op_id)
+            {
+                self.pending_review_preparation.set(None);
+            }
+            self.update_compatibility();
+        }
     }
 
     fn update_compatibility(&self) {
@@ -1491,6 +1626,32 @@ impl HarnessWindow {
                 "Submitting one paid request. Keep Video Harness open until its remote job ID is safely stored.",
                 "harness-warning",
             );
+            return;
+        }
+        if self.staging_confirmation_active.get() {
+            self.review.set_sensitive(false);
+            self.review.set_label("Awaiting upload confirmation…");
+            self.show_compatibility(
+                "Confirm or cancel the fal.ai staging disclosure before continuing.",
+                "harness-warning",
+            );
+            return;
+        }
+        if let Some(pending) = self.pending_review_preparation.get() {
+            self.review.set_sensitive(false);
+            if pending.revision == self.revision.get() {
+                self.review.set_label("Preparing review…");
+                self.show_compatibility(
+                    "Preparing reference media and fetching a fresh price…",
+                    "harness-warning",
+                );
+            } else {
+                self.review.set_label("Discarding outdated review…");
+                self.show_compatibility(
+                    "The draft changed. Waiting for the outdated Review preparation to stop safely…",
+                    "harness-warning",
+                );
+            }
             return;
         }
         let relink_count = self.pending_relinks.borrow().len();
@@ -1535,6 +1696,38 @@ impl HarnessWindow {
         }
         let message = match self.build_draft(true) {
             Ok(draft)
+                if draft.provider_id == ProviderId::openrouter()
+                    && draft
+                        .media
+                        .iter()
+                        .any(|item| matches!(item.source, MediaSource::LocalFile { .. })) =>
+            {
+                let fal_connected = self
+                    .connected_providers
+                    .borrow()
+                    .contains(&ProviderId::fal());
+                self.review
+                    .set_sensitive(fal_connected && self.pending_submit_op.get().is_none());
+                self.review.set_label(if fal_connected {
+                    "Review generation"
+                } else {
+                    "Connect fal.ai for uploads"
+                });
+                self.show_compatibility(
+                    if fal_connected {
+                        "Ready to review. You will confirm before local files upload to fal.ai's public-by-link CDN for up to 24 hours; their HTTPS URLs are then sent through OpenRouter."
+                    } else {
+                        "OpenRouter video generation needs directly downloadable HTTPS references. Connect fal.ai to use its temporary public-by-link upload service, or replace local files with URLs."
+                    },
+                    if fal_connected {
+                        "harness-good"
+                    } else {
+                        "harness-warning"
+                    },
+                );
+                return;
+            }
+            Ok(draft)
                 if draft.provider_id == ProviderId::fal()
                     && draft
                         .media
@@ -1545,7 +1738,7 @@ impl HarnessWindow {
                     .set_sensitive(self.pending_submit_op.get().is_none());
                 self.review.set_label("Review generation");
                 self.show_compatibility(
-                    "Ready to review. Local reference media uploads to a public fal CDN at Review and expires after 24 hours.",
+                    "Ready to review. Local reference media uploads to fal.ai's public-by-link CDN at Review with a requested 24-hour expiry.",
                     "harness-good",
                 );
                 return;
@@ -1592,21 +1785,36 @@ impl HarnessWindow {
     }
 
     fn update_media_input_availability(&self) {
-        let local_allowed = self.selected_provider() != ProviderId::openrouter();
-        self.add_files.set_sensitive(local_allowed);
-        self.drop_zone.set_sensitive(local_allowed);
-        if local_allowed {
-            self.add_files
-                .set_tooltip_text(Some("Choose local image, video, or audio reference files"));
-            self.drop_title.set_text("Drop reference media here");
+        let selected_model = self.selected_model();
+        let accepts_media = [MediaKind::Image, MediaKind::Video, MediaKind::Audio]
+            .into_iter()
+            .any(|kind| self.model_accepts_new_media_kind(kind));
+        self.add_files.set_sensitive(accepts_media);
+        self.drop_zone.set_sensitive(accepts_media);
+        self.add_files.set_tooltip_text(Some(if accepts_media {
+            "Choose local image, video, or audio reference files"
+        } else if selected_model.is_some() {
+            "The selected model does not accept supported reference media"
+        } else {
+            "Choose an available model before adding reference media"
+        }));
+        self.drop_title.set_text(if accepts_media {
+            "Drop reference media here"
+        } else if selected_model.is_some() {
+            "This model has no supported media inputs"
+        } else {
+            "Choose a model to add reference media"
+        });
+        if !accepts_media {
+            self.drop_hint
+                .set_text("Select a model with image, video, or audio input support");
+        } else if self.selected_provider() == ProviderId::openrouter() {
+            self.drop_hint.set_text(
+                "Files stay local until Review; fal.ai staging is confirmed before upload",
+            );
+        } else {
             self.drop_hint
                 .set_text("Files stay local until you press Review");
-        } else {
-            self.add_files
-                .set_tooltip_text(Some("OpenRouter accepts public HTTPS reference URLs only"));
-            self.drop_title.set_text("OpenRouter uses URL references");
-            self.drop_hint
-                .set_text("Choose a media type and add a public HTTPS URL below");
         }
     }
 
@@ -1625,13 +1833,6 @@ impl HarnessWindow {
     }
 
     fn choose_files(self: &Rc<Self>) {
-        if self.selected_provider() == ProviderId::openrouter() {
-            self.toast(
-                "OpenRouter accepts reference media by public HTTPS URL only.",
-                "dialog-warning-symbolic",
-            );
-            return;
-        }
         let dialog = gtk::FileDialog::builder()
             .title("Choose reference media")
             .modal(true)
@@ -1672,14 +1873,20 @@ impl HarnessWindow {
                 let Some(this) = weak.upgrade() else { return };
                 let mut media = this.media.borrow_mut();
                 let mut added_paths = Vec::new();
+                let mut rejected = 0usize;
                 for index in 0..files.n_items() {
                     let Some(file) = files.item(index).and_downcast::<gio::File>() else {
                         continue;
                     };
                     if let Some(path) = file.path() {
                         let Some(kind) = classify_local_reference(&path) else {
+                            rejected += 1;
                             continue;
                         };
+                        if !this.model_accepts_new_media_kind(kind) {
+                            rejected += 1;
+                            continue;
+                        }
                         added_paths.push(path.clone());
                         media.push(MediaItem {
                             source: MediaSource::local(path),
@@ -1688,9 +1895,19 @@ impl HarnessWindow {
                     }
                 }
                 drop(media);
-                this.rebuild_media();
-                this.draft_changed();
-                this.record_relink_candidates(added_paths);
+                if !added_paths.is_empty() {
+                    this.rebuild_media();
+                    this.draft_changed();
+                    this.record_relink_candidates(added_paths);
+                }
+                if rejected > 0 {
+                    this.toast(
+                        &format!(
+                            "Skipped {rejected} file(s) unsupported by the selected model or media format."
+                        ),
+                        "dialog-warning-symbolic",
+                    );
+                }
             },
         );
     }
@@ -1765,15 +1982,15 @@ impl HarnessWindow {
             );
             return;
         };
+        if !self.model_accepts_new_media_kind(kind) {
+            self.toast(
+                "The selected model does not advertise support for that reference type.",
+                "dialog-warning-symbolic",
+            );
+            return;
+        }
         let role = role_for_kind(kind, self.remote_role.selected());
         let source = if value.starts_with("file:") {
-            if self.selected_provider() == ProviderId::openrouter() {
-                self.toast(
-                    "OpenRouter accepts reference media by public HTTPS URL only. The local file was not added.",
-                    "dialog-error-symbolic",
-                );
-                return;
-            }
             let file = gio::File::for_uri(&value);
             match file.path() {
                 Some(path) => match classify_local_reference(&path) {
@@ -1904,13 +2121,19 @@ impl HarnessWindow {
             if self.selected_provider() == ProviderId::openrouter()
                 && matches!(item.source, MediaSource::LocalFile { .. })
             {
-                let blocked = gtk::Label::new(Some(
-                    "Blocked for OpenRouter — retained locally; switch provider or use a public HTTPS URL",
-                ));
-                blocked.set_halign(gtk::Align::Start);
-                blocked.set_wrap(true);
-                blocked.add_css_class("harness-warning");
-                labels.append(&blocked);
+                let fal_connected = self
+                    .connected_providers
+                    .borrow()
+                    .contains(&ProviderId::fal());
+                let staging = gtk::Label::new(Some(if fal_connected {
+                    "Will use fal.ai public-by-link staging after you confirm at Review"
+                } else {
+                    "Connect fal.ai to stage this file, or replace it with a public HTTPS URL"
+                }));
+                staging.set_halign(gtk::Align::Start);
+                staging.set_wrap(true);
+                staging.add_css_class("harness-warning");
+                labels.append(&staging);
             }
             body.append(&labels);
 
@@ -2852,6 +3075,9 @@ impl HarnessWindow {
                 credential_status,
                 ..
             } => {
+                self.connected_providers
+                    .borrow_mut()
+                    .insert(provider_id.clone());
                 if let Some(widgets) = self.provider_widgets.get(&provider_id) {
                     widgets.status.set_text("Connected");
                     widgets.status.remove_css_class("harness-muted");
@@ -2859,6 +3085,8 @@ impl HarnessWindow {
                     widgets.storage.set_text(&credential_status.message);
                     widgets.forget.set_sensitive(true);
                 }
+                self.rebuild_media();
+                self.update_compatibility();
                 self.toast("Provider connected.", "emblem-ok-symbolic");
             }
             ServiceEvent::ApiKeyForgotten {
@@ -2866,6 +3094,7 @@ impl HarnessWindow {
                 credential_status,
                 ..
             } => {
+                self.connected_providers.borrow_mut().remove(&provider_id);
                 if let Some(widgets) = self.provider_widgets.get(&provider_id) {
                     widgets.status.set_text("Needs API key");
                     widgets.status.remove_css_class("harness-good");
@@ -2873,6 +3102,8 @@ impl HarnessWindow {
                     widgets.storage.set_text(&credential_status.message);
                     widgets.forget.set_sensitive(false);
                 }
+                self.rebuild_media();
+                self.update_compatibility();
             }
             ServiceEvent::CatalogLoaded {
                 provider_id,
@@ -2901,6 +3132,7 @@ impl HarnessWindow {
                     .insert(provider_id.clone(), catalog);
                 if provider_id == self.selected_provider() {
                     self.refresh_models();
+                    self.update_media_input_availability();
                     self.update_compatibility();
                 }
                 if capabilities_changed {
@@ -2919,66 +3151,106 @@ impl HarnessWindow {
                     self.apply_draft(draft, editor_state, revision);
                 }
             }
-            ServiceEvent::PreparationStarted { media_count, .. } => {
-                self.show_compatibility(
-                    &format!(
-                        "Preparing review and checking {media_count} reference-media item(s)…"
-                    ),
-                    "harness-warning",
-                );
+            ServiceEvent::PreparationStarted {
+                op_id, media_count, ..
+            } => {
+                if self
+                    .pending_review_preparation
+                    .get()
+                    .is_some_and(|pending| {
+                        pending_review_is_current(pending, op_id, self.revision.get())
+                    })
+                {
+                    self.show_compatibility(
+                        &format!(
+                            "Preparing review and checking {media_count} reference-media item(s)…"
+                        ),
+                        "harness-warning",
+                    );
+                }
             }
             ServiceEvent::MediaUploadStarted {
-                media_index, path, ..
+                op_id,
+                media_index,
+                path,
+                ..
             } => {
-                self.show_compatibility(
-                    &format!(
-                        "Uploading {}: {} (generation has not been submitted)",
-                        typed_media_ordinal(&self.media.borrow(), media_index),
-                        path.file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("media")
-                    ),
-                    "harness-warning",
-                );
+                if self
+                    .pending_review_preparation
+                    .get()
+                    .is_some_and(|pending| {
+                        pending_review_is_current(pending, op_id, self.revision.get())
+                    })
+                {
+                    self.show_compatibility(
+                        &format!(
+                            "Uploading {}: {} (generation has not been submitted)",
+                            typed_media_ordinal(&self.media.borrow(), media_index),
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("media")
+                        ),
+                        "harness-warning",
+                    );
+                }
             }
             ServiceEvent::MediaUploadProgress {
+                op_id,
                 media_index,
                 sent,
                 total,
                 ..
             } => {
-                let percent = sent.saturating_mul(100).checked_div(total).unwrap_or(0);
-                self.show_compatibility(
-                    &format!(
-                        "Uploading {}… {percent}%",
-                        typed_media_ordinal(&self.media.borrow(), media_index)
-                    ),
-                    "harness-warning",
-                );
+                if self
+                    .pending_review_preparation
+                    .get()
+                    .is_some_and(|pending| {
+                        pending_review_is_current(pending, op_id, self.revision.get())
+                    })
+                {
+                    let percent = sent.saturating_mul(100).checked_div(total).unwrap_or(0);
+                    self.show_compatibility(
+                        &format!(
+                            "Uploading {}… {percent}%",
+                            typed_media_ordinal(&self.media.borrow(), media_index)
+                        ),
+                        "harness-warning",
+                    );
+                }
             }
             ServiceEvent::MediaUploadCompleted {
+                op_id,
                 media_index,
                 reused,
                 expires_at,
                 ..
             } => {
-                let source = if reused {
-                    "reused secure upload"
-                } else {
-                    "upload complete"
-                };
-                let expiry = expires_at
-                    .map(|value| format!("; expires {}", value.format("%Y-%m-%d %H:%M UTC")))
-                    .unwrap_or_default();
-                self.show_compatibility(
-                    &format!(
-                        "{}: {source}{expiry}. Fetching a fresh quote…",
-                        typed_media_ordinal(&self.media.borrow(), media_index)
-                    ),
-                    "harness-warning",
-                );
+                if self
+                    .pending_review_preparation
+                    .get()
+                    .is_some_and(|pending| {
+                        pending_review_is_current(pending, op_id, self.revision.get())
+                    })
+                {
+                    let source = if reused {
+                        "reused staged upload"
+                    } else {
+                        "upload complete"
+                    };
+                    let expiry = expires_at
+                        .map(|value| format!("; expires {}", value.format("%Y-%m-%d %H:%M UTC")))
+                        .unwrap_or_default();
+                    self.show_compatibility(
+                        &format!(
+                            "{}: {source}{expiry}. Fetching a fresh quote…",
+                            typed_media_ordinal(&self.media.borrow(), media_index)
+                        ),
+                        "harness-warning",
+                    );
+                }
             }
             ServiceEvent::ReviewReady {
+                op_id,
                 prepared_id,
                 revision,
                 provider_id,
@@ -2986,8 +3258,15 @@ impl HarnessWindow {
                 quote,
                 expires_at,
                 draft_fingerprint,
-                ..
             } => {
+                if !self
+                    .pending_review_preparation
+                    .get()
+                    .is_some_and(|pending| pending_review_matches(pending, op_id))
+                {
+                    return;
+                }
+                self.pending_review_preparation.set(None);
                 self.review.set_label("Review generation");
                 if revision != self.revision.get() {
                     self.update_compatibility();
@@ -3005,12 +3284,35 @@ impl HarnessWindow {
                 self.review.set_sensitive(true);
                 self.show_review(provider_id, request, quote, expires_at);
             }
-            ServiceEvent::PreparedInvalidated { revision, .. } => {
-                if revision >= self.revision.get() {
+            ServiceEvent::PreparedInvalidated {
+                op_id,
+                prepared_id,
+                revision,
+            } => {
+                let invalidates_visible_review = match prepared_id {
+                    Some(prepared_id) => self
+                        .prepared
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|prepared| prepared.id == prepared_id),
+                    None => revision >= self.revision.get(),
+                };
+                if invalidates_visible_review {
                     self.prepared.borrow_mut().take();
                 }
-                self.review.set_label("Review generation");
-                self.update_compatibility();
+                let completes_pending_preparation = self
+                    .pending_review_preparation
+                    .get()
+                    .is_some_and(|pending| {
+                        invalidation_completes_pending_review(pending, op_id, prepared_id)
+                    });
+                if completes_pending_preparation {
+                    self.pending_review_preparation.set(None);
+                }
+                if self.pending_review_preparation.get().is_none() {
+                    self.review.set_label("Review generation");
+                    self.update_compatibility();
+                }
             }
             ServiceEvent::DraftLoaded {
                 draft: Some(draft),
@@ -3072,6 +3374,13 @@ impl HarnessWindow {
                 self.update_compatibility();
             }
             ServiceEvent::UncertainSubmissionBlocked { op_id, record } => {
+                if self
+                    .pending_review_preparation
+                    .get()
+                    .is_some_and(|pending| pending_review_matches(pending, op_id))
+                {
+                    self.pending_review_preparation.set(None);
+                }
                 self.clear_pending_submission(op_id);
                 self.prepared.borrow_mut().take();
                 self.uncertain_submissions.borrow_mut().insert(
@@ -3426,6 +3735,13 @@ impl HarnessWindow {
                 job_id,
                 ..
             } => {
+                if self
+                    .pending_review_preparation
+                    .get()
+                    .is_some_and(|pending| pending_review_matches(pending, op_id))
+                {
+                    self.pending_review_preparation.set(None);
+                }
                 self.pending_uncertain_clears.borrow_mut().remove(&op_id);
                 let closing_save_failed = self.pending_close_draft_op.get() == Some(op_id);
                 if closing_save_failed {
@@ -3433,8 +3749,10 @@ impl HarnessWindow {
                     self.show_draft_save_failure(&message);
                 }
                 self.clear_pending_submission(op_id);
-                self.review.set_label("Review generation");
-                self.update_compatibility();
+                if self.pending_review_preparation.get().is_none() {
+                    self.review.set_label("Review generation");
+                    self.update_compatibility();
+                }
                 if let Some(job_id) = job_id {
                     for (key, widgets) in self.jobs.borrow().iter() {
                         if key.remote_job_id == job_id
@@ -3475,6 +3793,7 @@ impl HarnessWindow {
             ServiceEvent::QuoteReady { .. }
             | ServiceEvent::SettingsSaved { .. }
             | ServiceEvent::DefaultProviderSaved { .. }
+            | ServiceEvent::GenerationDeleted { .. }
             | ServiceEvent::Imported { .. } => {}
         }
         self.apply_job_filters();
@@ -3482,7 +3801,12 @@ impl HarnessWindow {
     }
 
     fn update_connections(&self, connections: &[ProviderConnection]) {
+        let mut connected = self.connected_providers.borrow_mut();
+        connected.clear();
         for connection in connections {
+            if connection.connected {
+                connected.insert(connection.descriptor.id.clone());
+            }
             let Some(widgets) = self.provider_widgets.get(&connection.descriptor.id) else {
                 continue;
             };
@@ -4189,6 +4513,7 @@ impl ComposeWidgets {
 
         let provider = dropdown(&["OpenRouter", "fal.ai"]);
         let model = dropdown(&["Loading models…"]);
+        set_ellipsized_dropdown_factory(&model, MODEL_PICKER_MIN_CHARS, MODEL_PICKER_MAX_CHARS);
         model.set_enable_search(true);
         model.set_sensitive(false);
         provider.set_hexpand(true);
@@ -4198,7 +4523,7 @@ impl ComposeWidgets {
         model_description.set_wrap(true);
         model_description.add_css_class("harness-muted");
         let provider_group = adw::PreferencesGroup::builder()
-            .title("Provider & model")
+            .title("Provider &amp; model")
             .description(
                 "Search the live catalog; capability and pricing badges update with the selection.",
             )
@@ -4539,8 +4864,8 @@ impl ProvidersWidgets {
             content.append(&card(
                 name,
                 match id {
-                    "fal" => "Local references upload to fal's public CDN only when you Review; uploads expire after 24 hours.",
-                    _ => "OpenRouter accepts public HTTPS reference URLs; local reference files are intentionally blocked.",
+                    "fal" => "Local references upload to fal.ai's public-by-link CDN only when you Review, with a requested 24-hour expiry.",
+                    _ => "OpenRouter uses public HTTPS references. Local files can be staged through fal.ai after an explicit confirmation.",
                 },
                 &body,
             ));
@@ -4685,6 +5010,68 @@ fn field_label(text: &str) -> gtk::Label {
 fn dropdown(values: &[&str]) -> gtk::DropDown {
     let model = gtk::StringList::new(values);
     gtk::DropDown::builder().model(&model).build()
+}
+
+fn set_ellipsized_dropdown_factory(
+    dropdown: &gtk::DropDown,
+    min_width_chars: i32,
+    max_width_chars: i32,
+) {
+    // Once a selected-item factory is replaced, GTK otherwise reuses it for
+    // the popup. Preserve the original full-text rows so search results stay
+    // easy to distinguish while only the 360 px sidebar button is bounded.
+    if dropdown.list_factory().is_none()
+        && let Some(default_factory) = dropdown.factory()
+    {
+        dropdown.set_list_factory(Some(&default_factory));
+    }
+    let selected_factory = ellipsized_string_factory(min_width_chars, max_width_chars);
+    dropdown.set_factory(Some(&selected_factory));
+}
+
+fn ellipsized_string_factory(
+    min_width_chars: i32,
+    max_width_chars: i32,
+) -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(move |_, object| {
+        let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let label = gtk::Label::new(None);
+        label.set_halign(gtk::Align::Start);
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label.set_single_line_mode(true);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        label.set_width_chars(min_width_chars);
+        label.set_max_width_chars(max_width_chars);
+        item.set_child(Some(&label));
+    });
+    factory.connect_bind(|_, object| {
+        let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let Some(label) = item.child().and_downcast::<gtk::Label>() else {
+            return;
+        };
+        let Some(value) = item.item().and_downcast::<gtk::StringObject>() else {
+            return;
+        };
+        let text = value.string();
+        label.set_text(text.as_str());
+        label.set_tooltip_text(Some(text.as_str()));
+    });
+    factory.connect_unbind(|_, object| {
+        let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        if let Some(label) = item.child().and_downcast::<gtk::Label>() {
+            label.set_text("");
+            label.set_tooltip_text(None);
+        }
+    });
+    factory
 }
 
 fn text(view: &gtk::TextView) -> String {
@@ -5093,12 +5480,60 @@ fn ready_relink_candidate(
     })
 }
 
+fn pending_review_matches(pending: PendingReviewPreparation, op_id: u64) -> bool {
+    pending.op_id == op_id
+}
+
+fn pending_review_is_current(pending: PendingReviewPreparation, op_id: u64, revision: u64) -> bool {
+    pending_review_matches(pending, op_id) && pending.revision == revision
+}
+
+fn invalidation_completes_pending_review(
+    pending: PendingReviewPreparation,
+    op_id: u64,
+    prepared_id: Option<PreparedGenerationId>,
+) -> bool {
+    prepared_id.is_none() && pending_review_matches(pending, op_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{FrameImage, FrameType, InputReference, VideoRequest};
     use serde_json::json;
     use tempfile::tempdir;
+
+    fn drain_gtk_events() {
+        let context = glib::MainContext::default();
+        for _ in 0..32 {
+            if !context.pending() {
+                break;
+            }
+            context.iteration(false);
+        }
+    }
+
+    fn descendant_label_with_width(root: &gtk::Widget, max_width_chars: i32) -> Option<gtk::Label> {
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            if let Ok(label) = widget.clone().downcast::<gtk::Label>()
+                && label.max_width_chars() == max_width_chars
+            {
+                return Some(label);
+            }
+            if let Some(label) = descendant_label_with_width(&widget, max_width_chars) {
+                return Some(label);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    fn selected_model_label(dropdown: &gtk::DropDown) -> gtk::Label {
+        let root = dropdown.clone().upcast::<gtk::Widget>();
+        descendant_label_with_width(&root, MODEL_PICKER_MAX_CHARS)
+            .expect("ellipsized selected-model label")
+    }
 
     #[test]
     fn navigation_indexes_use_stable_provider_ids() {
@@ -5283,6 +5718,30 @@ mod tests {
     }
 
     #[test]
+    fn review_events_only_complete_the_matching_pending_operation() {
+        let pending = PendingReviewPreparation {
+            op_id: 41,
+            revision: 9,
+        };
+
+        assert!(pending_review_matches(pending, 41));
+        assert!(!pending_review_matches(pending, 42));
+        assert!(pending_review_is_current(pending, 41, 9));
+        assert!(!pending_review_is_current(pending, 41, 10));
+
+        // The service can invalidate a prior prepared Review under the new
+        // preparation's op id before starting that preparation. Only its
+        // terminal id-less invalidation completes the pending operation.
+        assert!(!invalidation_completes_pending_review(
+            pending,
+            41,
+            Some(PreparedGenerationId(3)),
+        ));
+        assert!(!invalidation_completes_pending_review(pending, 42, None));
+        assert!(invalidation_completes_pending_review(pending, 41, None));
+    }
+
+    #[test]
     fn gtk_workspaces_construct_when_a_display_is_available() {
         if gtk::init().is_err() {
             return;
@@ -5291,8 +5750,71 @@ mod tests {
 
         let compose = ComposeWidgets::build();
         assert!(compose.model.enables_search());
+        assert!(
+            compose.model.list_factory().is_some(),
+            "the full-text popup factory must survive selected-label customization"
+        );
         assert_eq!(compose.page.min_sidebar_width(), 360.0);
         assert_eq!(compose.page.max_sidebar_width(), 360.0);
+
+        let host = gtk::Window::builder()
+            .default_width(1100)
+            .default_height(760)
+            .child(&compose.page)
+            .build();
+        host.present();
+        let long_openrouter_name = format!(
+            "OpenRouter / {} / cinematic-video-preview-with-an-intentionally-long-display-name",
+            "very-long-provider-namespace".repeat(6)
+        );
+        compose.model.set_model(Some(&gtk::StringList::new(
+            &[long_openrouter_name.as_str()],
+        )));
+        compose.model.set_sensitive(true);
+        drain_gtk_events();
+
+        let selected = selected_model_label(&compose.model);
+        assert_eq!(selected.ellipsize(), gtk::pango::EllipsizeMode::Middle);
+        assert_eq!(selected.text(), long_openrouter_name);
+        assert_eq!(
+            selected.tooltip_text().as_deref(),
+            Some(long_openrouter_name.as_str())
+        );
+        let (_, natural_width, _, _) = compose.model.measure(gtk::Orientation::Horizontal, -1);
+        assert!(
+            natural_width <= compose.page.max_sidebar_width() as i32,
+            "a long model name expanded the picker to {natural_width}px"
+        );
+
+        // Provider changes replace the picker model. Rebinding must update
+        // both the visible text and its full-name tooltip rather than leave a
+        // stale OpenRouter item in the fixed-width control.
+        let fal_name = "fal.ai / compact-video-model";
+        compose
+            .provider
+            .set_selected(index_for_provider(&ProviderId::fal()));
+        compose
+            .model
+            .set_model(Some(&gtk::StringList::new(&[fal_name])));
+        drain_gtk_events();
+        let selected = selected_model_label(&compose.model);
+        assert_eq!(selected.text(), fal_name);
+        assert_eq!(selected.tooltip_text().as_deref(), Some(fal_name));
+
+        compose
+            .provider
+            .set_selected(index_for_provider(&ProviderId::openrouter()));
+        compose.model.set_model(Some(&gtk::StringList::new(
+            &[long_openrouter_name.as_str()],
+        )));
+        drain_gtk_events();
+        let selected = selected_model_label(&compose.model);
+        assert_eq!(selected.text(), long_openrouter_name);
+        assert_eq!(
+            selected.tooltip_text().as_deref(),
+            Some(long_openrouter_name.as_str())
+        );
+        host.close();
 
         let jobs = JobsWidgets::build();
         assert_eq!(jobs.page.min_sidebar_width(), 340.0);

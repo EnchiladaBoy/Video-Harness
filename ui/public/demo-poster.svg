@@ -1,0 +1,21 @@
+<svg width="1280" height="720" viewBox="0 0 1280 720" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1280" height="720" fill="#091525"/>
+  <circle cx="640" cy="540" r="420" fill="url(#glow)"/>
+  <path d="M0 510C157 456 270 588 426 525C570 467 668 505 790 548C940 601 1050 463 1280 517V720H0V510Z" fill="#17304B"/>
+  <path d="M0 582C157 528 270 660 426 597C570 539 668 577 790 620C940 673 1050 535 1280 589V720H0V582Z" fill="#10263B"/>
+  <rect x="475" y="312" width="330" height="188" rx="10" fill="#111D2D" stroke="#EEF5F4" stroke-width="6"/>
+  <circle cx="554" cy="298" r="62" fill="#111D2D" stroke="#62E0D1" stroke-width="7"/>
+  <circle cx="726" cy="298" r="62" fill="#111D2D" stroke="#62E0D1" stroke-width="7"/>
+  <path d="M554 245V351M501 298H607M516 260L592 336M592 260L516 336" stroke="#EEF5F4" stroke-width="5"/>
+  <path d="M726 245V351M673 298H779M688 260L764 336M764 260L688 336" stroke="#EEF5F4" stroke-width="5"/>
+  <rect x="512" y="373" width="18" height="18" fill="#FF9A74"/>
+  <text x="640" y="421" fill="#EEF5F4" font-family="monospace" font-size="24" font-weight="700" text-anchor="middle">VIDEO HARNESS</text>
+  <text x="640" y="458" fill="#9AD6DC" font-family="sans-serif" font-size="17" text-anchor="middle">Your finished film will appear here</text>
+  <path d="M310 160H326M318 152V168M1010 202H1026M1018 194V210M910 117H926M918 109V125M238 284H254M246 276V292" stroke="#FF9A74" stroke-width="4"/>
+  <defs>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(640 540) rotate(90) scale(420)">
+      <stop stop-color="#245176"/>
+      <stop offset="1" stop-color="#091525" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+</svg>

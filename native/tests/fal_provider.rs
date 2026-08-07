@@ -19,7 +19,9 @@ use video_harness::domain::{
     VideoRequest,
 };
 use video_harness::providers::fal::{FalOptions, FalProvider, FalUploadExecutor};
-use video_harness::providers::{ProviderError, ProviderErrorKind, UploadProgress, VideoProvider};
+use video_harness::providers::{
+    MediaStager, ProviderError, ProviderErrorKind, StagedVisibility, UploadProgress, VideoProvider,
+};
 
 const KEY: &str = "fal-test-placeholder";
 const PNG_FIXTURE: &[u8] = b"\x89PNG\r\n\x1a\nfixture image bytes";
@@ -979,6 +981,12 @@ async fn local_media_uses_documented_cdn_initiation_and_reuses_valid_receipt() {
     )]);
     let upload_executor = Arc::new(ScriptedUploadExecutor::default());
     let provider = provider_with_upload(executor.clone(), upload_executor.clone());
+    let stager = <FalProvider as MediaStager>::descriptor(&provider);
+    assert_eq!(stager.id, "fal-cdn-v3");
+    assert_eq!(stager.display_name, "fal.ai CDN");
+    assert_eq!(stager.credential_provider, Some(ProviderId::fal()));
+    assert_eq!(stager.visibility, StagedVisibility::PublicByLink);
+    assert_eq!(stager.retention, Some(Duration::from_secs(24 * 60 * 60)));
     assert!(provider.media_capabilities().local_files);
     assert!(provider.media_capabilities().uploaded_files_public);
     assert_eq!(
@@ -988,10 +996,10 @@ async fn local_media_uses_documented_cdn_initiation_and_reuses_valid_receipt() {
 
     let media = DraftMedia::local(&media_path, MediaRole::StartFrame);
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-    let staged = provider
-        .stage_media(&media, None, Some(progress_tx))
-        .await
-        .expect("stage local fal media");
+    let staged =
+        <FalProvider as MediaStager>::stage_local(&provider, &media, None, Some(progress_tx))
+            .await
+            .expect("stage local fal media");
     let receipt = staged.receipt.clone().expect("upload receipt");
     assert_eq!(receipt.provider_id, ProviderId::fal());
     assert_eq!(receipt.size_bytes, PNG_FIXTURE.len() as u64);

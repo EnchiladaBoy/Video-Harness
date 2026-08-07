@@ -11,7 +11,8 @@ usage() {
 Usage: packaging/build-tarball.sh [--binary PATH] [--output-dir DIR]
 
 Create the best-effort native Video Harness archive for the current machine.
-Without --binary, build native/target/release/video-harness first.
+Without --binary, build desktop/src-tauri/target/release/video-harness first.
+The compiled Svelte UI must already exist at ui/dist/index.html.
 EOF
 }
 
@@ -44,14 +45,18 @@ case "$(uname -m)" in
     *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${PROJECT_DIR}/native/Cargo.toml" | head -n 1)"
+VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${PROJECT_DIR}/desktop/src-tauri/Cargo.toml" | head -n 1)"
 [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][A-Za-z0-9.-]+)?$ ]] \
     || { echo "Unsafe package version: ${VERSION}" >&2; exit 1; }
 
 if [[ -z "${BINARY}" ]]; then
-    cargo build --manifest-path "${PROJECT_DIR}/native/Cargo.toml" \
+    [[ -f "${PROJECT_DIR}/ui/dist/index.html" ]] || {
+        echo "Desktop UI is absent; run 'npm --prefix ui ci && npm --prefix ui run build' first" >&2
+        exit 1
+    }
+    cargo build --manifest-path "${PROJECT_DIR}/desktop/src-tauri/Cargo.toml" \
         --release --locked --bin video-harness
-    BINARY="${PROJECT_DIR}/native/target/release/video-harness"
+    BINARY="${PROJECT_DIR}/desktop/src-tauri/target/release/video-harness"
 fi
 [[ -x "${BINARY}" ]] || { echo "Executable not found: ${BINARY}" >&2; exit 1; }
 "${BINARY}" --version | grep -Fq -- "${VERSION}" \
@@ -63,7 +68,14 @@ fi
 
 mkdir -p -- "${OUTPUT_DIR}"
 STAGING_ROOT="$(mktemp -d)"
-trap 'rm -rf -- "${STAGING_ROOT}"' EXIT
+ARCHIVE_TEMP=""
+cleanup() {
+    rm -rf -- "${STAGING_ROOT}"
+    if [[ -n "${ARCHIVE_TEMP}" ]]; then
+        rm -f -- "${ARCHIVE_TEMP}"
+    fi
+}
+trap cleanup EXIT
 PACKAGE_NAME="video-harness-${VERSION}"
 PACKAGE_ROOT="${STAGING_ROOT}/${PACKAGE_NAME}"
 
@@ -81,11 +93,13 @@ install -Dm0644 -- "${PROJECT_DIR}/LICENSE" "${PACKAGE_ROOT}/LICENSE"
 install -Dm0644 -- "${SCRIPT_DIR}/NATIVE-BUNDLE.md" "${PACKAGE_ROOT}/NATIVE-BUNDLE.md"
 
 ARCHIVE="${OUTPUT_DIR}/video-harness-${VERSION}-linux-${RELEASE_ARCH}.tar.xz"
+ARCHIVE_TEMP="${ARCHIVE}.new"
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}"
 tar --sort=name \
     --mtime="@${SOURCE_DATE_EPOCH}" \
     --owner=0 --group=0 --numeric-owner \
-    -C "${STAGING_ROOT}" -cJf "${ARCHIVE}.new" "${PACKAGE_NAME}"
-mv -f -- "${ARCHIVE}.new" "${ARCHIVE}"
+    -C "${STAGING_ROOT}" -cJf "${ARCHIVE_TEMP}" "${PACKAGE_NAME}"
+mv -f -- "${ARCHIVE_TEMP}" "${ARCHIVE}"
+ARCHIVE_TEMP=""
 
 echo "Created ${ARCHIVE}"

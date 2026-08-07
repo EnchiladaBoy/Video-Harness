@@ -34,13 +34,14 @@ use crate::domain::{
 };
 
 use super::{
-    MediaCapabilities, ProviderAccount, ProviderError, ProviderErrorKind, UploadProgress,
-    VideoProvider, media_sha256,
+    MediaCapabilities, MediaStager, MediaStagerDescriptor, ProviderAccount, ProviderError,
+    ProviderErrorKind, StagedVisibility, UploadProgress, VideoProvider, media_sha256,
 };
 
 pub const DEFAULT_PLATFORM_URL: &str = "https://api.fal.ai/v1";
 pub const DEFAULT_QUEUE_URL: &str = "https://queue.fal.run";
 pub const DEFAULT_STORAGE_URL: &str = "https://rest.fal.ai";
+pub const FAL_CDN_STAGER_ID: &str = "fal-cdn-v3";
 pub const INPUT_UPLOAD_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
@@ -1098,6 +1099,33 @@ impl FalProvider {
 }
 
 #[async_trait]
+impl MediaStager for FalProvider {
+    fn descriptor(&self) -> MediaStagerDescriptor {
+        MediaStagerDescriptor {
+            id: FAL_CDN_STAGER_ID.into(),
+            display_name: "fal.ai CDN".into(),
+            credential_provider: Some(ProviderId::fal()),
+            visibility: StagedVisibility::PublicByLink,
+            retention: Some(Duration::from_secs(INPUT_UPLOAD_RETENTION_SECONDS)),
+        }
+    }
+
+    async fn stage_local(
+        &self,
+        media: &DraftMedia,
+        cached_receipt: Option<&UploadReceipt>,
+        progress: Option<mpsc::UnboundedSender<UploadProgress>>,
+    ) -> Result<StagedMedia, ProviderError> {
+        if !matches!(&media.source, MediaSource::LocalFile { .. }) {
+            return Err(validation("A media stager requires a local reference file"));
+        }
+        // Keep the single audited fal upload implementation authoritative
+        // until the legacy provider-owned staging entry point can be removed.
+        <Self as VideoProvider>::stage_media(self, media, cached_receipt, progress).await
+    }
+}
+
+#[async_trait]
 impl VideoProvider for FalProvider {
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor {
@@ -1129,12 +1157,7 @@ impl VideoProvider for FalProvider {
                 continue;
             };
             let size = std::fs::metadata(path)
-                .map_err(|error| {
-                    validation(format!(
-                        "Could not inspect local media {}: {error}",
-                        path.display()
-                    ))
-                })?
+                .map_err(|error| validation(format!("Could not inspect local media: {error}")))?
                 .len();
             match media.role.kind() {
                 MediaKind::Image => {

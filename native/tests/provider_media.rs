@@ -103,6 +103,62 @@ async fn openrouter_accepts_public_urls_and_explicitly_blocks_local_media() {
 }
 
 #[tokio::test]
+async fn openrouter_dry_validation_accepts_local_placeholders_only_with_explicit_staging() {
+    let executor = Arc::new(CatalogExecutor::default());
+    let provider = OpenRouterProvider::new(
+        OpenRouterClient::with_executor(
+            SecretString::from("openrouter-test-placeholder".to_owned()),
+            ClientOptions {
+                base_url: Url::parse("https://api.fixture.invalid/api/v1")
+                    .expect("fixture base URL"),
+                max_retries: 0,
+                backoff_base: Duration::ZERO,
+                ..ClientOptions::default()
+            },
+            executor.clone(),
+        )
+        .expect("fixture client"),
+    );
+    let directory = tempdir().expect("temporary media");
+    let path = directory.path().join("reference.png");
+    fs::write(&path, b"\x89PNG\r\n\x1a\nfixture").expect("fixture local media");
+    let mut draft = GenerationDraft::new(
+        ProviderId::openrouter(),
+        "fixture/video",
+        "An explicitly staged local-reference fixture",
+    )
+    .expect("fixture draft");
+    draft
+        .media
+        .push(DraftMedia::local(path, MediaRole::Reference));
+
+    let error = provider
+        .validate_draft_with_local_staging(&draft, false)
+        .await
+        .expect_err("local staging must be explicitly available");
+    assert_eq!(error.kind, ProviderErrorKind::Validation);
+    assert!(
+        error
+            .message
+            .contains("does not support local reference files")
+    );
+    assert!(
+        executor.methods.lock().expect("method lock").is_empty(),
+        "URL-only validation must reject before catalog transport"
+    );
+
+    provider
+        .validate_draft_with_local_staging(&draft, true)
+        .await
+        .expect("an explicit stager permits inert local placeholders");
+    assert_eq!(
+        *executor.methods.lock().expect("method lock"),
+        vec![Method::GET],
+        "dry validation may fetch the catalog but must never upload or POST"
+    );
+}
+
+#[tokio::test]
 async fn openrouter_dry_validation_enforces_catalog_capabilities_without_posting() {
     let executor = Arc::new(CatalogExecutor::default());
     let provider = OpenRouterProvider::new(

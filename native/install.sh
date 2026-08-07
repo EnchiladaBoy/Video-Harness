@@ -22,9 +22,10 @@ Usage:
   ./install.sh uninstall              Remove launchers and unmodified desktop files
 
 Install accepts x86_64 and aarch64 Linux. With no GUI_BINARY it uses a binary
-bundled at native/bin/video-harness, or builds the source tree as a fallback.
-It never changes openrouter-video or removes credentials, settings, history,
-downloads, provider data, or immutable releases.
+bundled at native/bin/video-harness, or builds the Tauri desktop application
+from the source tree as a fallback. It never changes openrouter-video or
+removes credentials, settings, history, downloads, provider data, or immutable
+releases.
 EOF
 }
 
@@ -106,14 +107,20 @@ install_release() {
         if [[ -x "${NATIVE_DIR}/bin/video-harness" ]]; then
             source_gui="${NATIVE_DIR}/bin/video-harness"
         else
-            local cargo_bin
+            local cargo_bin npm_bin
             cargo_bin="$(command -v cargo 2>/dev/null || true)"
             if [[ -z "${cargo_bin}" && -x "${HOME}/.cargo/bin/cargo" ]]; then
                 cargo_bin="${HOME}/.cargo/bin/cargo"
             fi
-            [[ -n "${cargo_bin}" ]] || fail "cargo is required to build the native release"
-            "${cargo_bin}" build --release --locked --bin video-harness --manifest-path "${NATIVE_DIR}/Cargo.toml"
-            source_gui="${NATIVE_DIR}/target/release/video-harness"
+            npm_bin="$(command -v npm 2>/dev/null || true)"
+            [[ -n "${cargo_bin}" ]] || fail "cargo is required to build the desktop release"
+            [[ -n "${npm_bin}" ]] || fail "npm is required to build the desktop release"
+            "${npm_bin}" --prefix "${PROJECT_DIR}/ui" ci
+            "${npm_bin}" --prefix "${PROJECT_DIR}/ui" run build
+            "${cargo_bin}" build --release --locked \
+                --manifest-path "${PROJECT_DIR}/desktop/src-tauri/Cargo.toml" \
+                --bin video-harness
+            source_gui="${PROJECT_DIR}/desktop/src-tauri/target/release/video-harness"
         fi
     fi
     [[ -f "${source_gui}" && -x "${source_gui}" ]] || fail "GUI executable not found: ${source_gui}"

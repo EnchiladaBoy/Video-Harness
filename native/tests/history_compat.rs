@@ -5,7 +5,9 @@ use rusqlite::Connection;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use tempfile::tempdir;
-use video_harness::domain::{JobLocator, JobStatus, ProviderId, VideoJob, VideoRequest};
+use video_harness::domain::{
+    JobLocator, JobStatus, ProviderId, ProviderJobKey, VideoJob, VideoRequest,
+};
 use video_harness::history::{HistoryError, HistoryStore};
 
 fn fixture(name: &str) -> Value {
@@ -448,6 +450,107 @@ fn composite_keys_isolate_fal_and_openrouter_and_fal_never_touches_jobs() {
         .expect("fal record");
     assert_eq!(fal_record.currency.as_deref(), Some("USD"));
     assert!(matches!(fal_record.locator, JobLocator::Fal { .. }));
+}
+
+#[test]
+fn deleting_openrouter_history_removes_both_projections_without_resurrection() {
+    let directory = tempdir().expect("temporary directory");
+    let database = directory.path().join("history.sqlite3");
+    let store = HistoryStore::new(&database);
+    let key =
+        ProviderJobKey::new(ProviderId::openrouter(), "delete-me").expect("OpenRouter history key");
+    store
+        .create_job(
+            &request("A render to remove"),
+            &job(&key.remote_job_id, "completed", Some("0.42")),
+        )
+        .expect("save OpenRouter job");
+
+    assert!(store.delete_provider(&key).expect("delete history"));
+    assert!(!store.delete_provider(&key).expect("repeat deletion"));
+
+    let connection = Connection::open(&database).expect("inspect deleted history");
+    let rows: (i64, i64) = connection
+        .query_row(
+            "SELECT
+                 (SELECT count(*) FROM generations
+                    WHERE provider_id = 'openrouter' AND remote_job_id = 'delete-me'),
+                 (SELECT count(*) FROM jobs WHERE job_id = 'delete-me')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("count both history projections");
+    assert_eq!(rows, (0, 0));
+    drop(connection);
+
+    let reopened = HistoryStore::new(&database);
+    reopened.initialize().expect("reconcile reopened history");
+    assert!(
+        reopened
+            .get_provider(&key)
+            .expect("read reopened history")
+            .is_none()
+    );
+}
+
+#[test]
+fn provider_qualified_deletion_preserves_the_same_remote_id_at_other_providers() {
+    let directory = tempdir().expect("temporary directory");
+    let database = directory.path().join("history.sqlite3");
+    let store = HistoryStore::new(&database);
+    let shared_id = "shared-delete-id";
+    let openrouter_key =
+        ProviderJobKey::new(ProviderId::openrouter(), shared_id).expect("OpenRouter key");
+    let fal_key = ProviderJobKey::new(ProviderId::fal(), shared_id).expect("fal key");
+    store
+        .create_job(
+            &request("OpenRouter copy"),
+            &job(shared_id, "completed", None),
+        )
+        .expect("save OpenRouter job");
+    let fal_request =
+        VideoRequest::for_provider(ProviderId::fal(), "fal-ai/test-video", "fal copy")
+            .expect("fal request");
+    store
+        .create_provider_job(
+            &ProviderId::fal(),
+            &fal_request,
+            &fal_job(shared_id, "completed", None),
+        )
+        .expect("save fal job");
+
+    assert!(
+        store
+            .delete_provider(&openrouter_key)
+            .expect("delete only OpenRouter")
+    );
+    assert!(
+        store
+            .get_provider(&openrouter_key)
+            .expect("query OpenRouter")
+            .is_none()
+    );
+    assert!(store.get_provider(&fal_key).expect("query fal").is_some());
+
+    store
+        .create_job(
+            &request("OpenRouter replacement"),
+            &job(shared_id, "completed", None),
+        )
+        .expect("restore OpenRouter job");
+    assert!(store.delete_provider(&fal_key).expect("delete only fal"));
+    assert!(
+        store
+            .get_provider(&fal_key)
+            .expect("query deleted fal")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_provider(&openrouter_key)
+            .expect("query preserved OpenRouter")
+            .is_some()
+    );
 }
 
 #[test]

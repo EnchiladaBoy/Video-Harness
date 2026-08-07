@@ -19,8 +19,9 @@ use video_harness::domain::{
     DraftMedia, GenerationDraft, InputReference, InputReferenceKind, JobLocator, JobStatus,
     MediaRole, ProviderId, ProviderJobKey, VideoCatalog, VideoJob, VideoRequest,
 };
-use video_harness::gui_state::{DraftEditorState, GuiStateStore, StoredDraft};
+use video_harness::gui_state::{DraftEditorState, GuiStateStore, StoredDraft, StoredUploadReceipt};
 use video_harness::history::HistoryStore;
+use video_harness::providers::media_sha256;
 use video_harness::workflow::{
     PreparedGenerationId, ServiceCommand, ServiceConfig, ServiceEvent, ServiceHandle, ServiceScope,
     spawn_service_with_executor,
@@ -481,6 +482,71 @@ async fn cached_catalog_is_immediate_and_live_refresh_does_not_block_actor() {
 }
 
 #[tokio::test]
+async fn terminal_generation_deletion_keeps_or_removes_the_saved_video_as_requested() {
+    let (_root, paths) = fixture_paths();
+    fs::create_dir_all(&paths.videos_dir).expect("create Videos fixture");
+    let history = HistoryStore::new(paths.history_db());
+    let request = VideoRequest::new("example/video", "Deletion fixture").expect("request");
+    let fixtures = [
+        ("job-delete-keep", "keep.mp4", false),
+        ("job-delete-file", "delete.mp4", true),
+    ];
+    for (job_id, file_name, _) in fixtures {
+        let job = VideoJob::from_api(&completed_job(
+            job_id,
+            &format!("https://cdn.workflow.invalid/{file_name}"),
+        ))
+        .expect("completed job");
+        history.create_job(&request, &job).expect("seed history");
+        let output = paths.videos_dir.join(file_name);
+        fs::write(&output, b"generated video bytes").expect("seed saved video");
+        history
+            .mark_downloaded(&job, &output)
+            .expect("mark output downloaded");
+    }
+
+    let executor = WorkflowExecutor::scripted(std::iter::empty());
+    let mut service =
+        spawn_service_with_executor(paths.clone(), config(Duration::from_secs(30)), executor)
+            .expect("spawn service");
+    assert!(matches!(
+        next_event(&mut service).await,
+        ServiceEvent::Ready { .. }
+    ));
+
+    for (index, (job_id, file_name, delete_output)) in fixtures.into_iter().enumerate() {
+        let op_id = 80 + index as u64;
+        service
+            .commands
+            .send(ServiceCommand::DeleteGeneration {
+                op_id,
+                key: ProviderJobKey::new(ProviderId::openrouter(), job_id).expect("job key"),
+                delete_output,
+            })
+            .await
+            .expect("send deletion command");
+        let deleted = event_matching(&mut service, |event| {
+            matches!(event, ServiceEvent::GenerationDeleted { op_id: value, .. } if *value == op_id)
+        })
+        .await;
+        assert!(matches!(
+            deleted,
+            ServiceEvent::GenerationDeleted { output_deleted, .. }
+                if output_deleted == delete_output
+        ));
+        assert!(
+            history
+                .get(job_id)
+                .expect("query deleted history")
+                .is_none()
+        );
+        assert_eq!(paths.videos_dir.join(file_name).exists(), !delete_output);
+    }
+
+    shutdown(&mut service).await;
+}
+
+#[tokio::test]
 async fn invalid_fal_draft_fails_before_upload_review_or_paid_post() {
     let (root, paths) = fixture_paths();
     let media_path = root.path().join("reference.png");
@@ -531,6 +597,7 @@ async fn invalid_fal_draft_fails_before_upload_review_or_paid_post() {
             op_id: 9,
             draft,
             revision: 1,
+            staging_provider_id: None,
         })
         .await
         .expect("prepare invalid fal draft");
@@ -562,6 +629,132 @@ async fn invalid_fal_draft_fails_before_upload_review_or_paid_post() {
             .requests()
             .iter()
             .all(|request| request.method == Method::GET)
+    );
+    shutdown(&mut service).await;
+}
+
+#[tokio::test]
+async fn openrouter_local_media_without_explicit_stager_fails_before_prepare_network() {
+    let (root, paths) = fixture_paths();
+    let media_path = root.path().join("reference.png");
+    fs::write(&media_path, b"\x89PNG\r\n\x1a\nworkflow fixture").expect("write local reference");
+    let executor = WorkflowExecutor::scripted([Reply::Json(
+        StatusCode::OK,
+        json!({"data": {"label": "fixture"}}),
+    )]);
+    let mut service = spawn_service_with_executor(paths, config(Duration::ZERO), executor.clone())
+        .expect("spawn service");
+    connect_fixture_key(&mut service, 80).await;
+    let baseline_requests = executor.requests().len();
+
+    let mut draft = GenerationDraft::new(
+        ProviderId::openrouter(),
+        "black-forest-labs/flux-3-video",
+        "No implicit staging fixture",
+    )
+    .expect("draft");
+    draft
+        .media
+        .push(DraftMedia::local(media_path, MediaRole::Reference));
+    service
+        .commands
+        .send(ServiceCommand::PrepareGeneration {
+            op_id: 81,
+            draft,
+            revision: 1,
+            staging_provider_id: None,
+        })
+        .await
+        .expect("prepare local OpenRouter draft");
+
+    loop {
+        match next_event(&mut service).await {
+            ServiceEvent::PreparationStarted { op_id: 81, .. }
+            | ServiceEvent::MediaUploadStarted { op_id: 81, .. } => {
+                panic!("missing explicit stager reached preparation")
+            }
+            ServiceEvent::ReviewReady { op_id: 81, .. } => {
+                panic!("missing explicit stager reached Review")
+            }
+            ServiceEvent::Error {
+                op_id: 81,
+                scope: ServiceScope::Preparation,
+                message,
+                ..
+            } => {
+                assert!(message.contains("explicitly selected upload service"));
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        executor.requests().len(),
+        baseline_requests,
+        "rejecting implicit cross-provider staging must perform no request"
+    );
+    shutdown(&mut service).await;
+}
+
+#[tokio::test]
+async fn openrouter_explicit_fal_stager_without_fal_key_fails_before_prepare_network() {
+    let (root, paths) = fixture_paths();
+    let media_path = root.path().join("reference.png");
+    fs::write(&media_path, b"\x89PNG\r\n\x1a\nworkflow fixture").expect("write local reference");
+    let executor = WorkflowExecutor::scripted([Reply::Json(
+        StatusCode::OK,
+        json!({"data": {"label": "fixture"}}),
+    )]);
+    let mut service = spawn_service_with_executor(paths, config(Duration::ZERO), executor.clone())
+        .expect("spawn service");
+    connect_fixture_key(&mut service, 82).await;
+    let baseline_requests = executor.requests().len();
+
+    let mut draft = GenerationDraft::new(
+        ProviderId::openrouter(),
+        "black-forest-labs/flux-3-video",
+        "Missing fal credential fixture",
+    )
+    .expect("draft");
+    draft
+        .media
+        .push(DraftMedia::local(media_path, MediaRole::Reference));
+    service
+        .commands
+        .send(ServiceCommand::PrepareGeneration {
+            op_id: 83,
+            draft,
+            revision: 1,
+            staging_provider_id: Some(ProviderId::fal()),
+        })
+        .await
+        .expect("prepare local OpenRouter draft with fal stager");
+
+    loop {
+        match next_event(&mut service).await {
+            ServiceEvent::PreparationStarted { op_id: 83, .. }
+            | ServiceEvent::MediaUploadStarted { op_id: 83, .. } => {
+                panic!("missing fal credential reached preparation")
+            }
+            ServiceEvent::ReviewReady { op_id: 83, .. } => {
+                panic!("missing fal credential reached Review")
+            }
+            ServiceEvent::Error {
+                op_id: 83,
+                scope: ServiceScope::Preparation,
+                message,
+                ..
+            } => {
+                assert!(message.contains("Connect fal.ai"));
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        executor.requests().len(),
+        baseline_requests,
+        "missing staging credentials must be rejected before provider transport"
     );
     shutdown(&mut service).await;
 }
@@ -1166,6 +1359,7 @@ async fn pre_submit_marker_survives_ambiguity_and_blocks_same_draft_after_restar
             op_id: 44,
             draft: distinct,
             revision: 2,
+            staging_provider_id: None,
         })
         .await
         .expect("prepare distinct draft");
@@ -1200,6 +1394,7 @@ async fn pre_submit_marker_survives_ambiguity_and_blocks_same_draft_after_restar
             op_id: 45,
             draft: same.clone(),
             revision: 99,
+            staging_provider_id: None,
         })
         .await
         .expect("prepare blocked draft");
@@ -1236,6 +1431,7 @@ async fn pre_submit_marker_survives_ambiguity_and_blocks_same_draft_after_restar
             op_id: 47,
             draft: same,
             revision: 100,
+            staging_provider_id: None,
         })
         .await
         .expect("prepare acknowledged draft");
@@ -1431,6 +1627,7 @@ async fn prepared_review_is_fresh_one_time_and_submits_exactly_once() {
             op_id: 50,
             draft,
             revision: 1,
+            staging_provider_id: None,
         })
         .await
         .expect("send prepare command");
@@ -1548,6 +1745,7 @@ async fn draft_edit_invalidates_review_and_autosaves_without_posting() {
             op_id: 60,
             draft: original.clone(),
             revision: 1,
+            staging_provider_id: None,
         })
         .await
         .expect("prepare original");
@@ -1809,6 +2007,7 @@ async fn active_api_key_never_crosses_quote_prepare_or_direct_generate_boundarie
             op_id: 71,
             draft: prepare_draft,
             revision: 1,
+            staging_provider_id: None,
         })
         .await
         .expect("send unsafe preparation");
@@ -1949,6 +2148,7 @@ async fn credential_changes_invalidate_a_review_before_any_paid_post() {
             op_id: 64,
             draft: draft.clone(),
             revision: 1,
+            staging_provider_id: None,
         })
         .await
         .expect("prepare first review");
@@ -2008,6 +2208,7 @@ async fn credential_changes_invalidate_a_review_before_any_paid_post() {
             op_id: 661,
             draft,
             revision: 2,
+            staging_provider_id: None,
         })
         .await
         .expect("prepare second review");
@@ -2067,6 +2268,132 @@ async fn credential_changes_invalidate_a_review_before_any_paid_post() {
 }
 
 #[tokio::test]
+async fn fal_credential_change_invalidates_openrouter_review_that_reused_fal_staging() {
+    let (root, paths) = fixture_paths();
+    let media_path = root.path().join("reference.png");
+    let media_bytes = b"\x89PNG\r\n\x1a\nworkflow cached staging fixture";
+    fs::write(&media_path, media_bytes).expect("write local reference");
+    let (source_sha256, byte_length) = media_sha256(&media_path)
+        .await
+        .expect("hash local reference");
+    let created_at = chrono::Utc::now();
+    GuiStateStore::new(paths.gui_state_db())
+        .save_upload_receipt(&StoredUploadReceipt {
+            provider_id: ProviderId::fal(),
+            source_sha256,
+            source_path: media_path.clone(),
+            remote_url: "https://v3.fal.media/files/fixture/reference.png".into(),
+            content_type: "image/png".into(),
+            byte_length,
+            created_at,
+            expires_at: created_at + chrono::Duration::hours(24),
+        })
+        .expect("seed reusable fal staging receipt");
+
+    let executor = WorkflowExecutor::scripted([
+        Reply::Json(StatusCode::OK, json!({"data": {"label": "fixture"}})),
+        Reply::Json(StatusCode::OK, json!({"models": []})),
+        Reply::Json(StatusCode::OK, fixture_json("catalog.json")),
+    ]);
+    let mut service = spawn_service_with_executor(paths, config(Duration::ZERO), executor.clone())
+        .expect("spawn service");
+    connect_fixture_key(&mut service, 84).await;
+    service
+        .commands
+        .send(ServiceCommand::ConnectApiKey {
+            op_id: 85,
+            provider_id: ProviderId::fal(),
+            key: SecretString::from("fal-test-placeholder".to_owned()),
+            persist_on_success: false,
+        })
+        .await
+        .expect("connect fal fixture key");
+    event_matching(&mut service, |event| {
+        matches!(event, ServiceEvent::ApiKeyConnected { op_id: 85, provider_id, .. } if *provider_id == ProviderId::fal())
+    })
+    .await;
+
+    let mut draft = GenerationDraft::new(
+        ProviderId::openrouter(),
+        "black-forest-labs/flux-3-video",
+        "Cross-provider credential invalidation fixture",
+    )
+    .expect("draft");
+    draft
+        .media
+        .push(DraftMedia::local(media_path, MediaRole::Reference));
+    service
+        .commands
+        .send(ServiceCommand::PrepareGeneration {
+            op_id: 86,
+            draft,
+            revision: 1,
+            staging_provider_id: Some(ProviderId::fal()),
+        })
+        .await
+        .expect("prepare OpenRouter draft through fal stager");
+    let review = event_matching(&mut service, |event| {
+        matches!(event, ServiceEvent::ReviewReady { op_id: 86, .. })
+    })
+    .await;
+    let ServiceEvent::ReviewReady { prepared_id, .. } = review else {
+        unreachable!()
+    };
+
+    service
+        .commands
+        .send(ServiceCommand::ForgetApiKey {
+            op_id: 87,
+            provider_id: ProviderId::fal(),
+        })
+        .await
+        .expect("forget fal staging credential");
+    event_matching(&mut service, |event| {
+        matches!(event, ServiceEvent::ApiKeyForgotten { op_id: 87, provider_id, .. } if *provider_id == ProviderId::fal())
+    })
+    .await;
+    assert!(matches!(
+        event_matching(&mut service, |event| matches!(
+            event,
+            ServiceEvent::PreparedInvalidated { op_id: 87, .. }
+        ))
+        .await,
+        ServiceEvent::PreparedInvalidated {
+            prepared_id: Some(value),
+            ..
+        } if value == prepared_id
+    ));
+
+    service
+        .commands
+        .send(ServiceCommand::SubmitPrepared {
+            op_id: 88,
+            prepared_id,
+        })
+        .await
+        .expect("attempt invalidated cross-provider Review");
+    assert!(matches!(
+        event_matching(&mut service, |event| matches!(
+            event,
+            ServiceEvent::Error { op_id: 88, .. }
+        ))
+        .await,
+        ServiceEvent::Error {
+            scope: ServiceScope::Preparation,
+            ..
+        }
+    ));
+    assert!(
+        executor
+            .requests()
+            .iter()
+            .all(|request| request.method != Method::POST),
+        "staging credential invalidation must leave no submit-ready token"
+    );
+    shutdown(&mut service).await;
+}
+
+#[tokio::test]
 async fn credential_swap_during_held_preparation_never_publishes_a_review() {
     let (_root, paths) = fixture_paths();
     let quote_started = Arc::new(Notify::new());
@@ -2096,6 +2423,7 @@ async fn credential_swap_during_held_preparation_never_publishes_a_review() {
             op_id: 73,
             draft,
             revision: 1,
+            staging_provider_id: None,
         })
         .await
         .expect("start held preparation");
@@ -2193,6 +2521,7 @@ async fn edit_during_preparation_discards_the_stale_review_token() {
             op_id: 64,
             draft: original.clone(),
             revision: 10,
+            staging_provider_id: None,
         })
         .await
         .expect("start preparation");
