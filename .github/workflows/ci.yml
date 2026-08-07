@@ -336,5 +336,7 @@ jobs:
       - name: Require an actual visible application window
         run: |
           chmod +x appimage-under-test/Video-Harness-*.AppImage
-          packaging/smoke-appimage-gui.sh \
-            appimage-under-test/Video-Harness-*.AppImage
+          bash .github/scripts/run-with-annotation.sh \
+            "Clean AppImage runtime (${{ matrix.arch }})" \
+            packaging/smoke-appimage-gui.sh \
+              appimage-under-test/Video-Harness-*.AppImage
