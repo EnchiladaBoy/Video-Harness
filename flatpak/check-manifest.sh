@@ -77,6 +77,9 @@ if command -v appstreamcli >/dev/null 2>&1; then
 fi
 if command -v flatpak-builder >/dev/null 2>&1; then
     flatpak-builder --show-manifest "${MANIFEST}" >/dev/null
+elif command -v flatpak >/dev/null 2>&1 \
+    && flatpak --user info org.flatpak.Builder >/dev/null 2>&1; then
+    flatpak run org.flatpak.Builder --show-manifest "${MANIFEST}" >/dev/null
 fi
 
 generated_sources="$(mktemp)"

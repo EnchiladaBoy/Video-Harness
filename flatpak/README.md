@@ -4,8 +4,9 @@ The manifest packages the Tauri/Svelte desktop application as
 `io.github.EnchiladaBoy.VideoHarness` against GNOME 50. Cargo dependencies are
 pinned by `desktop/src-tauri/Cargo.lock` and materialized by
 `cargo-sources.json`, so the Rust build runs with Cargo networking disabled.
-The Svelte bundle is built from `ui/package-lock.json` before Flatpak Builder
-starts and is then embedded into the Tauri executable.
+The Svelte bundle is built from `ui/package-lock.json` before Flathub's
+official Builder environment starts and is then embedded into the Tauri
+executable.
 
 After changing dependencies, regenerate and verify the source list:
 
@@ -18,6 +19,7 @@ Install the build inputs from Flathub:
 
 ```bash
 flatpak install --user flathub \
+  org.flatpak.Builder//stable \
   org.gnome.Platform//50 \
   org.gnome.Sdk//50 \
   org.freedesktop.Sdk.Extension.rust-stable//25.08 \
@@ -29,7 +31,8 @@ Then build an unsigned local repository and smoke-test it:
 ```bash
 npm --prefix ui ci
 npm --prefix ui run build
-flatpak-builder --user --force-clean --default-branch=stable \
+flatpak run org.flatpak.Builder \
+  --user --force-clean --default-branch=stable \
   --repo=flatpak-repo \
   flatpak-build flatpak/io.github.EnchiladaBoy.VideoHarness.yml
 flatpak --user remote-add --if-not-exists --no-gpg-verify \

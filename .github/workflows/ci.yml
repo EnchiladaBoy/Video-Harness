@@ -254,20 +254,22 @@ jobs:
         working-directory: ui
         run: npm ci && npm run build
 
-      - name: Install Flatpak tooling
+      - name: Install Flatpak host client
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder
+          sudo apt-get install -y --no-install-recommends flatpak
           flatpak --user remote-add --if-not-exists flathub \
             https://dl.flathub.org/repo/flathub.flatpakrepo
 
-      - name: Install pinned SDK, runtime, and codecs
+      - name: Install official builder, pinned SDK, runtime, and codecs
         run: |
           flatpak --user install -y flathub \
+            org.flatpak.Builder//stable \
             org.gnome.Platform//50 \
             org.gnome.Sdk//50 \
             org.freedesktop.Sdk.Extension.rust-stable//25.08 \
             org.freedesktop.Platform.codecs-extra//25.08-extra
+          flatpak --user info --show-commit org.flatpak.Builder
 
       - name: Validate manifest
         run: flatpak/check-manifest.sh
@@ -276,7 +278,8 @@ jobs:
         run: |
           bash .github/scripts/run-with-annotation.sh \
             "Flatpak build (${{ matrix.arch }})" \
-            flatpak-builder --user --force-clean --arch=${{ matrix.arch }} \
+            flatpak run org.flatpak.Builder \
+              --user --force-clean --arch=${{ matrix.arch }} \
               --default-branch=stable \
               --repo=flatpak-repo flatpak-build \
               flatpak/io.github.EnchiladaBoy.VideoHarness.yml
