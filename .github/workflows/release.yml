@@ -88,7 +88,15 @@ jobs:
               --jq '.workflow_runs
                 | sort_by(.run_number)
                 | last // empty
-                | "\(.id)\t\(.head_sha)\t\(.status)\t\(.conclusion // \"pending\")\t\(.updated_at)\t\(.html_url)"')"
+                | [
+                    .id,
+                    .head_sha,
+                    .status,
+                    (.conclusion // "pending"),
+                    .updated_at,
+                    .html_url
+                  ]
+                | @tsv')"
             if [[ -z "${run_record}" ]]; then
               echo "Waiting for a CI push run for ${TAG_COMMIT}..."
               sleep 15

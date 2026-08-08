@@ -77,6 +77,16 @@ fn windows_gui_version_smokes_wait_for_the_real_process_exit() {
 }
 
 #[test]
+fn release_ci_query_uses_a_parseable_tsv_filter() {
+    assert!(RELEASE_WORKFLOW.contains(r#"(.conclusion // "pending")"#));
+    assert!(RELEASE_WORKFLOW.contains("| @tsv"));
+    assert!(
+        !RELEASE_WORKFLOW.contains(r#"(.conclusion // \"pending\")"#),
+        "quotes inside a jq interpolation expression must not be shell-escaped"
+    );
+}
+
+#[test]
 fn desktop_release_surface_stays_unsigned_and_minimal() {
     assert!(WINDOWS_BUNDLE_CONFIG.contains(r#""targets": ["nsis"]"#));
     for retired_windows_setting in [
