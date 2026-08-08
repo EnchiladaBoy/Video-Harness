@@ -110,10 +110,6 @@ jobs:
             runner: windows-2025
             os: windows
             arch: x86_64
-          - platform: macOS x64
-            runner: macos-26-intel
-            os: macos
-            arch: x86_64
           - platform: macOS Apple Silicon
             runner: macos-26
             os: macos
@@ -172,13 +168,13 @@ jobs:
             "Tauri tests (${{ matrix.platform }})" \
             cargo +1.95 test --locked
 
-      - name: Build unsigned Windows installers
+      - name: Build unsigned Windows NSIS installer
         if: matrix.os == 'windows'
         working-directory: desktop
         shell: bash
         run: >-
           ../ui/node_modules/.bin/tauri build
-          --ci --no-sign --bundles nsis,msi -- --locked
+          --ci --no-sign --bundles nsis -- --locked
 
       - name: Verify the bundled Microsoft WebView2 runtime
         if: matrix.os == 'windows'
@@ -187,7 +183,7 @@ jobs:
           ./packaging/verify-webview2-offline-installer.ps1
           -TargetDirectory desktop/src-tauri/target
 
-      - name: Validate and collect Windows installers
+      - name: Validate and collect Windows NSIS installer
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
@@ -222,9 +218,8 @@ jobs:
           }
           Assert-VersionSmoke -Executable $binary -Label "release executable"
           $nsis = @(Get-ChildItem "desktop/src-tauri/target/release/bundle/nsis" -File -Filter "*.exe")
-          $msi = @(Get-ChildItem "desktop/src-tauri/target/release/bundle/msi" -File -Filter "*.msi")
-          if ($nsis.Count -ne 1 -or $msi.Count -ne 1) {
-            throw "expected one NSIS installer and one MSI"
+          if ($nsis.Count -ne 1) {
+            throw "expected exactly one NSIS installer"
           }
 
           # Exercise the packaged install path, not only the raw Cargo output.
@@ -261,30 +256,11 @@ jobs:
             throw "silent NSIS uninstall failed with exit code $($uninstall.ExitCode)"
           }
 
-          # Administrative extraction validates that the MSI can be consumed
-          # and contains the same runnable application without changing the
-          # runner's machine-wide installer state.
-          $msiRoot = Join-Path $env:RUNNER_TEMP "video-harness-msi-smoke"
-          $msiArgs = "/a `"$($msi[0].FullName)`" /qn /norestart TARGETDIR=`"$msiRoot`""
-          $extract = Start-Process -FilePath "msiexec.exe" `
-            -ArgumentList $msiArgs -Wait -PassThru
-          if ($extract.ExitCode -notin @(0, 3010)) {
-            throw "MSI administrative extraction failed with exit code $($extract.ExitCode)"
-          }
-          $msiBinary = @(Get-ChildItem $msiRoot -Recurse -File `
-            -Filter "video-harness.exe")
-          if ($msiBinary.Count -ne 1) {
-            throw "MSI extraction did not produce one app executable"
-          }
-          Assert-VersionSmoke -Executable $msiBinary[0].FullName `
-            -Label "MSI-packaged executable"
-
           $destination = Join-Path $env:RUNNER_TEMP "desktop-smoke-windows-x86_64"
           New-Item -ItemType Directory -Force $destination | Out-Null
           Copy-Item -LiteralPath $nsis[0].FullName -Destination $destination
-          Copy-Item -LiteralPath $msi[0].FullName -Destination $destination
 
-      - name: Upload unsigned Windows installer smoke artifacts
+      - name: Upload unsigned Windows installer smoke artifact
         if: matrix.os == 'windows'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -301,7 +277,7 @@ jobs:
           ../ui/node_modules/.bin/tauri build
           --ci --no-sign --bundles app,dmg -- --locked
 
-      - name: Validate and collect macOS bundles
+      - name: Validate macOS app and collect DMG
         if: matrix.os == 'macos'
         shell: bash
         run: |
@@ -314,6 +290,7 @@ jobs:
           dmg_path="${images[0]}"
           executable="${app_path}/Contents/MacOS/video-harness"
           [[ -x "${executable}" ]]
+          [[ "$(lipo -archs "${executable}")" == arm64 ]]
           "${executable}" --version
           hdiutil verify "${dmg_path}"
 
@@ -339,6 +316,7 @@ jobs:
           mounted_apps=("${mount_dir}"/*.app)
           [[ "${#mounted_apps[@]}" -eq 1 && -d "${mounted_apps[0]}" ]]
           mounted_executable="${mounted_apps[0]}/Contents/MacOS/video-harness"
+          [[ "$(lipo -archs "${mounted_executable}")" == arm64 ]]
           "${mounted_executable}" --version
           "${mounted_executable}" >"${smoke_log}" 2>&1 &
           app_pid=$!
@@ -358,11 +336,9 @@ jobs:
 
           destination="${RUNNER_TEMP}/desktop-smoke-macos-${{ matrix.arch }}"
           mkdir -p "${destination}"
-          ditto -c -k --sequesterRsrc --keepParent \
-            "${app_path}" "${destination}/Video-Harness.app.zip"
           cp "${dmg_path}" "${destination}/Video-Harness.dmg"
 
-      - name: Upload unsigned macOS package smoke artifacts
+      - name: Upload unsigned macOS DMG smoke artifact
         if: matrix.os == 'macos'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

@@ -37,16 +37,17 @@ fal.ai model.
 ## Install
 
 The 0.7.1 packages below can be downloaded from the
-[latest release](https://github.com/EnchiladaBoy/Video-Harness/releases/latest)
-after the documented signing and hardware release gates are provisioned.
+[latest release](https://github.com/EnchiladaBoy/Video-Harness/releases/latest).
+They are intentionally unsigned community builds. Before opening one, verify
+its SHA-256 checksum and GitHub build-provenance attestation as described in
+[the release runbook](.github/RELEASING.md).
 
 | Platform | Package | Supported baseline |
 | --- | --- | --- |
 | Linux x86_64 | `Video-Harness-0.7.1-linux-x86_64.AppImage` | glibc-based desktop Linux |
 | Linux ARM64 | `Video-Harness-0.7.1-linux-aarch64.AppImage` | glibc-based desktop Linux |
-| Windows x64 | signed setup `.exe` or `.msi` | Windows 10 22H2 or Windows 11 |
-| macOS Intel | signed and notarized x86_64 `.dmg` | macOS 12 or newer |
-| macOS Apple Silicon | signed and notarized aarch64 `.dmg` | macOS 12 or newer |
+| Windows x64 | unsigned NSIS setup `.exe` | Windows 10 22H2 or Windows 11 |
+| macOS Apple Silicon | unsigned aarch64 `.dmg` | macOS 12 or newer |
 
 On Linux, make the AppImage executable and run it:
 
@@ -58,17 +59,24 @@ chmod +x Video-Harness-0.7.1-linux-x86_64.AppImage
 If FUSE is unavailable, add `--appimage-extract-and-run`. Alpine/musl and
 unconfigured environments such as NixOS are not supported.
 
-On Windows, the normal setup executable installs for the current user without
-administrator access and includes the offline WebView2 runtime. The MSI is for
-managed deployments. Windows N editions need Microsoft's Media Feature Pack
-for common H.264/AAC playback.
+On Windows, the setup executable installs for the current user without
+administrator access and includes the offline WebView2 runtime. Because it is
+not Authenticode-signed, Microsoft Defender SmartScreen may warn that the
+publisher is unknown. Verify the checksum and provenance first, then use
+SmartScreen's per-app **More info → Run anyway** option only if both checks
+pass. Windows N editions need Microsoft's Media Feature Pack for common
+H.264/AAC playback.
 
-On macOS, choose the DMG that matches **About This Mac**, open it, and drag
-Video Harness to Applications. Direct-download releases require a Developer
-ID signature and a stapled Apple notarization ticket.
+On an Apple Silicon Mac, open the DMG and drag Video Harness to Applications.
+The app is neither code-signed nor notarized, so Gatekeeper will block its
+first launch. Verify the checksum and provenance first, try to open the app,
+then allow this app with **System Settings → Privacy & Security → Open Anyway**
+if both checks pass. Video Harness does not support Intel Macs. Do not disable
+Gatekeeper globally or remove quarantine metadata from the download.
 
-Detailed platform paths, packaging, signing, notarization, and release checks
-are in [packaging/PLATFORM-RELEASES.md](packaging/PLATFORM-RELEASES.md).
+Detailed platform paths, packaging, security-warning guidance, and release
+checks are in
+[packaging/PLATFORM-RELEASES.md](packaging/PLATFORM-RELEASES.md).
 
 ## Spending and recovery safeguards
 
@@ -169,17 +177,15 @@ The verified parity matrix and removal policy are in
 
 ## Release status
 
-CI compiles and tests Linux x86_64/ARM64, Windows x64, macOS Intel, and macOS
-Apple Silicon, and builds unsigned installer smoke artifacts. Tagged releases
-add mandatory Authenticode signing for Windows and Developer ID signing,
-notarization, and stapling for macOS; publication fails closed if any signing
-input or verification is missing. Linux AppImages are unsigned and receive
-GitHub keyless provenance attestations. Every release includes SHA-256 checksums
-and an SPDX software bill of materials.
+CI compiles and tests Linux x86_64/ARM64, Windows x64, and macOS Apple Silicon.
+Tagged releases publish intentionally unsigned AppImages, an unsigned Windows
+NSIS setup executable, and an unsigned Apple Silicon DMG. Every release includes
+SHA-256 checksums, an SPDX software bill of materials, and GitHub keyless
+build-provenance attestations. Windows SmartScreen and macOS Gatekeeper warnings
+are therefore expected; verify those release records before using the operating
+system's per-app override.
 
-Publishing the first Windows/macOS release remains externally blocked until
-the project provisions a compatible exportable Authenticode PFX (or adds a
-specific hardware/remote `signCommand` integration) and a paid Apple Developer
-account with notarization credentials. Final playback and window tests also
-require real Windows, Intel Mac, and Apple Silicon Mac hardware. See the
+Final playback, credential-store, file-picker, and window checks still require
+real Windows and Apple Silicon Mac hardware. Intel Macs and Windows MSI packages
+are outside the supported release matrix. See the
 [release runbook](.github/RELEASING.md) for the exact checklist.

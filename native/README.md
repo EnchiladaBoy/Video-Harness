@@ -23,8 +23,8 @@ cargo clippy --locked --lib --tests --no-default-features -- -D warnings
 cargo test --locked --lib --tests --no-default-features
 ```
 
-These are the core commands used for Linux, Windows x64, macOS Intel, and
-macOS Apple Silicon checks. Supported packages are produced by the canonical
+These are the core commands used for Linux, Windows x64, and macOS Apple
+Silicon checks. Supported packages are produced by the canonical
 Tauri/Svelte application, not this crate's legacy frontend.
 
 Tests use temporary databases, deterministic transports, and in-memory

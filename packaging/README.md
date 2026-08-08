@@ -1,11 +1,12 @@
 # Release packaging
 
 Video Harness ships the same Tauri/Svelte desktop application on every
-supported platform. Release artifacts are AppImages for Linux, signed NSIS and
-MSI installers for Windows x64, and signed/notarized DMGs for Intel and Apple
-Silicon Macs. Platform paths, local credential stores, build commands, signing
-inputs, and release verification are documented in
-[`PLATFORM-RELEASES.md`](PLATFORM-RELEASES.md).
+supported platform. Release artifacts are unsigned AppImages for Linux x86_64
+and aarch64, an unsigned NSIS setup executable for Windows x64, and an unsigned
+DMG for Apple Silicon Macs. Intel Macs and Windows MSI packages are not in the
+supported release matrix. Platform paths, local credential stores, build
+commands, expected operating-system warnings, and release verification are
+documented in [`PLATFORM-RELEASES.md`](PLATFORM-RELEASES.md).
 
 The Linux packages are unsigned Tauri AppImages: one directly runnable file
 for x86_64 and one for aarch64. They embed the Svelte interface, WebKitGTK/GTK

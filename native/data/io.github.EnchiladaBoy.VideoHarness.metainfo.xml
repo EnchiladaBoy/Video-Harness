@@ -27,7 +27,7 @@
   <releases>
     <release version="0.7.1" date="2026-08-08">
       <description>
-        <p>Makes the Tauri and Svelte desktop app canonical, simplifies creator workflows, strengthens spending and submission safeguards, and prepares signed Windows and macOS packages.</p>
+        <p>Makes the Tauri and Svelte desktop app canonical, simplifies creator workflows, strengthens spending and submission safeguards, and adds prebuilt Linux, Windows, and Apple Silicon macOS packages.</p>
       </description>
     </release>
     <release version="0.7.0" date="2026-08-07">

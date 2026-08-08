@@ -83,7 +83,15 @@ require_text "${PROJECT_DIR}/packaging/README.md" "Video-Harness-${CORE_VERSION}
 require_text "${PROJECT_DIR}/packaging/README.md" "Video-Harness-${CORE_VERSION}-linux-aarch64.AppImage"
 require_text "${PROJECT_DIR}/.github/RELEASING.md" "## Cut v${CORE_VERSION}"
 require_text "${PROJECT_DIR}/.github/RELEASING.md" "check-release-version.sh v${CORE_VERSION}"
-require_text "${PROJECT_DIR}/.github/RELEASING.md" "Video-Harness-v${CORE_VERSION}.spdx.json"
+for RELEASE_ASSET in \
+    "Video-Harness-${CORE_VERSION}-linux-x86_64.AppImage" \
+    "Video-Harness-${CORE_VERSION}-linux-aarch64.AppImage" \
+    "Video-Harness-${CORE_VERSION}-windows-x86_64-setup.exe" \
+    "Video-Harness-${CORE_VERSION}-macos-aarch64.dmg" \
+    "Video-Harness-v${CORE_VERSION}.spdx.json"
+do
+    require_text "${PROJECT_DIR}/.github/RELEASING.md" "${RELEASE_ASSET}"
+done
 
 if [[ -n "${EXPECTED_TAG}" && "${EXPECTED_TAG}" != "v${CORE_VERSION}" ]]; then
     fail "tag ${EXPECTED_TAG} does not match v${CORE_VERSION}"
@@ -97,4 +105,4 @@ desktop-file-validate \
     "${PROJECT_DIR}/native/data/io.github.EnchiladaBoy.VideoHarness.desktop"
 appstreamcli validate --no-net --strict --pedantic "${METAINFO}"
 
-echo "Core, desktop, UI, AppImage, and release metadata agree on ${CORE_VERSION}."
+echo "Core, desktop, UI, package, and release metadata agree on ${CORE_VERSION}."

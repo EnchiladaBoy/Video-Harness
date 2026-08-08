@@ -79,18 +79,9 @@ $resolvedTarget = (Resolve-Path -LiteralPath $TargetDirectory).Path
 $nsisInstaller = Get-SingleWebViewInstaller `
     -Label "NSIS" `
     -Root (Join-Path $resolvedTarget ".tauri/x64")
-$msiInstaller = Get-SingleWebViewInstaller `
-    -Label "MSI" `
-    -Root (Join-Path $resolvedTarget "release/wix/x64/x64")
 
 $nsisHash = (Get-FileHash -LiteralPath $nsisInstaller.FullName -Algorithm SHA256).Hash
-$msiHash = (Get-FileHash -LiteralPath $msiInstaller.FullName -Algorithm SHA256).Hash
-if ($nsisHash -cne $msiHash) {
-    throw "the NSIS and MSI builds embedded different WebView2 offline installers"
-}
-
 Assert-MicrosoftCodeSignature -Installer $nsisInstaller
-Assert-MicrosoftCodeSignature -Installer $msiInstaller
 
 $version = $nsisInstaller.VersionInfo.ProductVersion
 Write-Host "Verified Microsoft WebView2 offline installer: version=$version sha256=$($nsisHash.ToLowerInvariant())"

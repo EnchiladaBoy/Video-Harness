@@ -1,121 +1,107 @@
 # Video Harness release runbook
 
-Releases publish the canonical Tauri/Svelte desktop application for Linux,
-Windows, and macOS. Linux AppImages are unsigned; Windows installers must have
-valid Authenticode signatures, and macOS disk images must contain a hardened,
-Developer ID-signed application and a stapled Apple notarization ticket. The
-workflow refuses to create a partial or unsigned desktop release.
+Releases publish the canonical Tauri/Svelte desktop application as intentionally
+unsigned community binaries. The supported artifacts are Linux AppImages for
+x86_64 and aarch64, one Windows x64 NSIS setup executable, and one Apple Silicon
+macOS DMG. Windows MSI packages and Intel Mac builds are not release targets.
 
-Every release also includes a pinned SPDX JSON software bill of materials,
-SHA-256 checksums, and GitHub keyless build-provenance attestations. Releases
-do not add telemetry, accounts, cloud sync, or an update service.
+Unsigned distribution has a visible usability cost: Microsoft Defender
+SmartScreen normally reports an unknown publisher, and macOS Gatekeeper normally
+blocks the app's first launch. Release notes must say this plainly and direct
+users to checksum and GitHub provenance verification before they use a per-app
+override. Never advise users to disable either operating-system safeguard
+globally or strip quarantine metadata.
+
+Every release includes a pinned SPDX JSON software bill of materials, SHA-256
+checksums, and GitHub keyless build-provenance attestations. Releases do not add
+telemetry, accounts, cloud sync, or an update service.
 
 ## Release policy
 
-- Build Linux x86_64 and aarch64, Windows x86_64, and macOS x86_64 and Apple
-  Silicon on native GitHub-hosted runners.
+- Build Linux x86_64 and aarch64, Windows x64, and macOS Apple Silicon on native
+  GitHub-hosted runners.
+- Publish only the two AppImages, Windows NSIS setup executable, Apple Silicon
+  DMG, SPDX software bill of materials, and checksum manifest listed below.
 - Pin npm, Cargo, GitHub Actions, and release-tool inputs. A build must not
   modify a lockfile. AppImage build executables and plugin scripts must pass
   the reviewed hashes in `packaging/prepare-tauri-appimage-tools.sh` before
-  Tauri can execute them. Before any Windows package is executed or uploaded,
-  require the two bundled WebView2 offline-runtime copies to match and pass
-  Microsoft's Authenticode publisher, code-signing, and timestamp checks.
-- Require an annotated release tag whose commit is contained in
-  `main`, the exact commit's full push CI run to have succeeded or been rerun
-  within seven days, and every version-bearing file to match the tag. Repeat
-  RustSec and npm advisory checks during the release workflow so a newly
-  disclosed issue cannot hide behind an older green run.
-- Never publish an unsigned Windows or macOS artifact. Signing, timestamping,
-  notarization, stapling, and local verification are mandatory workflow gates.
+  Tauri can execute them. Before the Windows package is executed or uploaded,
+  require the bundled WebView2 offline runtime to pass Microsoft's Authenticode
+  publisher, code-signing-purpose, and timestamp checks.
+- Require an annotated `v*` release tag whose commit is contained in `main`, the
+  exact commit's full push CI run to have succeeded or been rerun within seven
+  days, and every version-bearing file to match the tag. Repeat RustSec and npm
+  advisory checks during the release workflow so a newly disclosed issue cannot
+  hide behind an older green run.
+- Build and attest the release packages in GitHub Actions. The packages
+  themselves remain unsigned; do not describe them as signed, notarized, or
+  verified by Microsoft or Apple.
 - Never replace an existing GitHub release. Correct a bad release with a new
   version.
 
-## Protected release secrets
+The workflow publishes automatically only after an explicit annotated tag
+passes all exact-CI, version, advisory, package, checksum, SBOM, and provenance
+gates. It needs no code-signing certificate, Apple Developer membership,
+notarization credential, protected environment, or manual deployment approval.
+The repository's normal `GITHUB_TOKEN` is sufficient for release publication
+and keyless attestations.
 
-Enable GitHub's Dependency Graph under **Settings → Security and analysis**.
-The pull-request dependency-review job deliberately fails closed when that
-repository feature is unavailable; it must be green before a dependency update
-is merged.
+An active repository tag ruleset for `v*` that prevents deletion and force
+updates is recommended hardening, but it is not a release prerequisite. Never
+move or reuse a published release tag even when repository settings permit it.
 
-Create a protected GitHub Actions environment named `release`, restrict it to
-the `v*` tag pattern, require maintainer review, and configure these as that
-environment's secrets before pushing a tag. The first approval starts the
-native signing jobs, which validate that their required secrets are present;
-private-key values are exposed solely to those jobs. A second approval remains
-blocked until all signed artifacts are ready for real-hardware review.
-
-- `WINDOWS_CERTIFICATE`: base64-encoded password-protected, exportable
-  Authenticode PFX. Hardware-backed or remote modern OV/EV certificates need a
-  separately implemented and reviewed Tauri `signCommand` path.
-- `WINDOWS_CERTIFICATE_PASSWORD`: the PFX password.
-- `APPLE_CERTIFICATE`: base64-encoded Developer ID Application `.p12`.
-- `APPLE_CERTIFICATE_PASSWORD`: the `.p12` password.
-- `APPLE_SIGNING_IDENTITY`: the complete Developer ID Application identity.
-- `APPLE_API_ISSUER`: App Store Connect API issuer ID.
-- `APPLE_API_KEY`: App Store Connect API key ID.
-- `APPLE_API_KEY_CONTENT`: base64-encoded private `.p8` key.
-
-The runners import credentials into temporary current-user certificate stores
-or keychains and delete those stores and decoded files in an `always()` cleanup
-step. No certificate thumbprint, password, private key, or notarization token is
-committed or uploaded as an artifact.
-
-Protect the same `v*` release tag pattern against deletion or force-updates.
-The workflow binds every checkout to the initially verified tag object and
-commit and rechecks that binding immediately before publication, but repository
-tag protection is the authoritative control against a later tag move.
+Enable GitHub's Dependency Graph under **Settings → Security and analysis** so
+the pull-request dependency-review job can assess dependency changes.
 
 ## Cut v0.7.1
 
-1. Confirm the complete CI run on `main` is green, including unsigned NSIS/MSI
-   and both unsigned macOS package smokes, both AppImage builds and runtime
-   smokes, and Apple Silicon tests.
-2. Download the unsigned CI package-smoke artifacts and complete the real
-   hardware checks from `packaging/PLATFORM-RELEASES.md` on Windows 10/11,
-   Intel Mac, and Apple Silicon Mac. Record that evidence before approving the
-   protected `release` environment; hosted process-launch smokes are not a
-   substitute for playback, native picker, keyring, and non-ASCII path checks.
-3. Confirm all protected release secrets above are present and the Windows
-   certificate and Apple Developer membership are valid.
-4. Run `packaging/check-release-version.sh v0.7.1` with `appstreamcli` and
+1. Confirm the complete push CI run for the exact `main` commit is green,
+   including Windows x64, both Linux AppImage architectures, Apple Silicon
+   macOS, package smokes, dependency audits, and frontend tests.
+2. Download the unsigned package-smoke artifacts and complete the real-hardware
+   checks from `packaging/PLATFORM-RELEASES.md` on Windows 10/11 x64 and an Apple
+   Silicon Mac. Record playback, native picker, credential-store, non-ASCII
+   path, redirected/cross-volume Videos or Movies folder, and visible-window
+   results. Intel Mac testing is not required or supported.
+3. Run `packaging/check-release-version.sh v0.7.1` with `appstreamcli` and
    `desktop-file-validate` installed.
-5. Create a signed annotated source tag when a maintainer signing identity is
-   available, then push it:
+4. Create an unsigned annotated source tag and push it. Do not use a lightweight
+   tag. The explicit configuration override below also works for maintainers
+   whose Git configuration normally signs tags:
 
    ```bash
-   git tag -s v0.7.1 -m "Video Harness 0.7.1"
+   git -c tag.gpgSign=false tag -a v0.7.1 -m "Video Harness 0.7.1"
    git push origin v0.7.1
    ```
 
-   An unsigned annotated tag is accepted only when the protected `v*` tag rule
-   and protected `release` environment are active; the workflow rejects an
-   invalid or unverifiable signature rather than treating it as unsigned.
-
-6. The release workflow builds and verifies exactly these installers, uploads
-   them as short-lived workflow artifacts, and waits at the second protected
-   environment approval before publication:
+5. The release workflow validates the tag and exact push CI run, rebuilds the
+   packages, verifies their structure and launch behavior, generates checksums,
+   SBOM, and keyless provenance, then automatically publishes exactly:
 
    - `Video-Harness-0.7.1-linux-x86_64.AppImage`
    - `Video-Harness-0.7.1-linux-aarch64.AppImage`
    - `Video-Harness-0.7.1-windows-x86_64-setup.exe`
-   - `Video-Harness-0.7.1-windows-x86_64.msi`
-   - `Video-Harness-0.7.1-macos-x86_64.dmg`
    - `Video-Harness-0.7.1-macos-aarch64.dmg`
    - `Video-Harness-v0.7.1.spdx.json`
    - `SHA256SUMS`
 
-7. While the publication job is waiting, download the signed workflow artifacts
-   and repeat the platform checks from `packaging/PLATFORM-RELEASES.md` on real
-   Windows 10/11, Intel Mac, and Apple Silicon Mac hardware. Include the
-   checked-in H.264/AAC fixture, file selection, credential storage, non-ASCII
-   paths, and a redirected or cross-volume Videos/Movies folder. Approve the
-   final protected-environment deployment only after those checks pass.
-8. After publication, download all release assets and run
-   `sha256sum --check SHA256SUMS`. Verify GitHub's provenance attestations
-   before installing anything.
+6. Download each published package and `SHA256SUMS`. Compute each package's
+   SHA-256 value and compare it with the manifest. Then verify its GitHub
+   attestation, substituting each asset name in turn:
+
+   ```bash
+   gh attestation verify Video-Harness-0.7.1-linux-x86_64.AppImage \
+     --repo EnchiladaBoy/Video-Harness
+   ```
+
+7. Confirm the release notes prominently identify the packages as unsigned,
+   describe the expected SmartScreen and Gatekeeper warnings, and link to the
+   per-app instructions in `packaging/PLATFORM-RELEASES.md`. Do not announce the
+   release if a checksum, provenance verification, package smoke, or supported
+   real-hardware check fails.
 
 The AppImages target glibc-based desktop Linux; Alpine/musl and unconfigured
 NixOS are not supported. Windows N editions require Microsoft's Media Feature
-Pack for H.264/AAC playback. Standard hosted runners install or mount and launch
-the packaged application, but final playback, native picker/keyring, and window
-interaction remain mandatory real-hardware release checks.
+Pack for H.264/AAC playback. Hosted runners install or mount and launch each
+package, but playback, native picker/keyring, and window interaction remain
+real-hardware checks on supported Windows x64 and Apple Silicon Mac systems.
