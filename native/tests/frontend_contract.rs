@@ -17,6 +17,21 @@ fn legacy_binary_is_explicit_and_cannot_shadow_the_canonical_name() {
 }
 
 #[test]
+fn native_archive_installer_is_explicitly_linux_only() {
+    let installer = include_str!("../install.sh");
+    assert!(
+        installer.contains("native/install.sh is Linux-only"),
+        "the legacy archive installer must fail clearly outside Linux"
+    );
+
+    let installer_tests = include_str!("installer.rs");
+    assert!(
+        installer_tests.contains("#![cfg(target_os = \"linux\")]"),
+        "GNU/XDG installer tests must not run against macOS packaging"
+    );
+}
+
+#[test]
 fn deprecation_policy_names_the_canonical_frontend_and_removal_target() {
     assert!(LEGACY_POLICY.contains("Svelte interface hosted by Tauri is the canonical"));
     assert!(LEGACY_POLICY.contains("**0.8.0:** planned removal point"));

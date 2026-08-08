@@ -34,6 +34,8 @@ fail() {
     exit 1
 }
 
+[[ "$(uname -s)" == Linux ]] || fail "native/install.sh is Linux-only; use the supported Tauri installer for this platform"
+
 link_target() {
     local link_path="$1"
     if [[ -L "${link_path}" ]]; then
