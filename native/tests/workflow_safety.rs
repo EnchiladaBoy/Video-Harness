@@ -1692,6 +1692,13 @@ async fn accepted_job_id_survives_local_history_failure() {
         unreachable!()
     };
     let recovered_path = path.clone();
+    assert_eq!(
+        recovered_path,
+        recovered_path
+            .canonicalize()
+            .expect("canonical completed output"),
+        "the first completion event must use the same canonical path as restart recovery"
+    );
     assert_eq!(record.remote_id(), "job-history-failure");
     assert_eq!(record.created_at, accepted_at);
     assert_eq!(

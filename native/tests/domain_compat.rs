@@ -460,8 +460,14 @@ fn gui_drafts_persist_paths_not_contents_and_stage_in_storyboard_order() {
     draft.validate().expect("valid draft");
 
     let serialized = serde_json::to_string(&draft).expect("serialize draft");
-    assert!(serialized.contains(local.to_string_lossy().as_ref()));
     assert!(!serialized.contains("not copied into the draft"));
+    let restored: GenerationDraft =
+        serde_json::from_str(&serialized).expect("deserialize persisted draft");
+    assert_eq!(
+        restored.media[0],
+        DraftMedia::local(local.clone(), MediaRole::StartFrame),
+        "persisted local paths must survive JSON escaping on every platform"
+    );
 
     let request = draft
         .to_video_request(&[

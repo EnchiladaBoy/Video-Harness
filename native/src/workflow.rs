@@ -4309,6 +4309,33 @@ async fn monitor_job(
         TaskFailure::provider(ServiceScope::Generation, error, Some(job.id.clone()))
             .with_remote_continues(false)
     })?;
+    // Normalize the just-created file before any event or durable record sees
+    // it. macOS commonly exposes /var through /private/var; retaining the
+    // lexical download path here while recovery canonicalizes it later makes
+    // the same local artifact appear to move after restart. This validation
+    // also rechecks that a racing replacement is still a regular file inside
+    // the configured Videos directory.
+    let saved = {
+        let saved_path = saved;
+        let videos_dir = paths.videos_dir.clone();
+        let output_failure = |message: String| TaskFailure {
+            provider_id: provider_id.clone(),
+            scope: ServiceScope::Generation,
+            message,
+            recoverable: true,
+            job_id: Some(job.id.clone()),
+            kind: TaskFailureKind::RemoteFinished,
+        };
+        tokio::task::spawn_blocking(move || validated_local_output(&saved_path, &videos_dir))
+            .await
+            .map_err(|_| {
+                output_failure(
+                    "The downloaded video could not be verified because its local task stopped."
+                        .into(),
+                )
+            })?
+            .map_err(output_failure)?
+    };
     // Save the completed local artifact before the final compatible-history
     // write. This closes the crash/failure window where the file existed but
     // the only recovery row still described a job that needed downloading.
