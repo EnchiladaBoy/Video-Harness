@@ -354,6 +354,26 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          trap {
+            $message = $_.Exception.Message.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Host "::error title=Windows release validation::$message"
+            exit 1
+          }
+          function Assert-VersionSmoke {
+            param(
+              [Parameter(Mandatory = $true)] [string] $Executable,
+              [Parameter(Mandatory = $true)] [string] $Label
+            )
+            $process = Start-Process -FilePath $Executable `
+              -ArgumentList @("--version") -PassThru
+            if (-not $process.WaitForExit(30000)) {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              throw "$Label version smoke timed out after 30 seconds"
+            }
+            if ($process.ExitCode -ne 0) {
+              throw "$Label version smoke failed with exit code $($process.ExitCode)"
+            }
+          }
           $binary = Get-Item `
             "desktop/src-tauri/target/release/video-harness.exe"
           $nsis = @(Get-ChildItem `
@@ -365,10 +385,8 @@ jobs:
           if ($nsis.Count -ne 1 -or $msi.Count -ne 1) {
             throw "expected one signed NSIS installer and one signed MSI"
           }
-          & $binary.FullName --version
-          if ($LASTEXITCODE -ne 0) {
-            throw "signed release executable version smoke failed"
-          }
+          Assert-VersionSmoke -Executable $binary.FullName `
+            -Label "signed release executable"
           foreach ($file in @($binary) + $nsis + $msi) {
             $signature = Get-AuthenticodeSignature -FilePath $file.FullName
             if ($signature.Status -ne "Valid") {

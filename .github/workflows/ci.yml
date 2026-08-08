@@ -192,14 +192,35 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          trap {
+            $message = $_.Exception.Message.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Host "::error title=Windows package validation::$message"
+            exit 1
+          }
+          function Assert-VersionSmoke {
+            param(
+              [Parameter(Mandatory = $true)] [string] $Executable,
+              [Parameter(Mandatory = $true)] [string] $Label
+            )
+            # PowerShell does not reliably wait for Windows GUI-subsystem
+            # executables when they are invoked with `&`. Start the process
+            # explicitly so its real exit code, rather than a stale or null
+            # $LASTEXITCODE, controls the smoke check.
+            $process = Start-Process -FilePath $Executable `
+              -ArgumentList @("--version") -PassThru
+            if (-not $process.WaitForExit(30000)) {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              throw "$Label version smoke timed out after 30 seconds"
+            }
+            if ($process.ExitCode -ne 0) {
+              throw "$Label version smoke failed with exit code $($process.ExitCode)"
+            }
+          }
           $binary = "desktop/src-tauri/target/release/video-harness.exe"
           if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
             throw "release executable was not built"
           }
-          & $binary --version
-          if ($LASTEXITCODE -ne 0) {
-            throw "release executable version smoke failed"
-          }
+          Assert-VersionSmoke -Executable $binary -Label "release executable"
           $nsis = @(Get-ChildItem "desktop/src-tauri/target/release/bundle/nsis" -File -Filter "*.exe")
           $msi = @(Get-ChildItem "desktop/src-tauri/target/release/bundle/msi" -File -Filter "*.msi")
           if ($nsis.Count -ne 1 -or $msi.Count -ne 1) {
@@ -221,10 +242,8 @@ jobs:
           if ($installed.Count -ne 1) {
             throw "silent NSIS install did not produce one app executable"
           }
-          & $installed[0].FullName --version
-          if ($LASTEXITCODE -ne 0) {
-            throw "installed NSIS executable version smoke failed"
-          }
+          Assert-VersionSmoke -Executable $installed[0].FullName `
+            -Label "installed NSIS executable"
           $launched = Start-Process -FilePath $installed[0].FullName -PassThru
           Start-Sleep -Seconds 5
           if ($launched.HasExited) {
@@ -257,10 +276,8 @@ jobs:
           if ($msiBinary.Count -ne 1) {
             throw "MSI extraction did not produce one app executable"
           }
-          & $msiBinary[0].FullName --version
-          if ($LASTEXITCODE -ne 0) {
-            throw "MSI-packaged executable version smoke failed"
-          }
+          Assert-VersionSmoke -Executable $msiBinary[0].FullName `
+            -Label "MSI-packaged executable"
 
           $destination = Join-Path $env:RUNNER_TEMP "desktop-smoke-windows-x86_64"
           New-Item -ItemType Directory -Force $destination | Out-Null
