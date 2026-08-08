@@ -13,9 +13,9 @@
   --surface-hover: #1c2737;
   --text: #f2f5f3;
   --text-muted: #a4b0bb;
-  --text-faint: #70808f;
-  --border: #283444;
-  --border-strong: #39495c;
+  --text-faint: #8393a2;
+  --border: #334255;
+  --border-strong: #465a70;
   --accent: #68e0d0;
   --accent-strong: #38c8b7;
   --accent-ink: #071b1a;
@@ -457,7 +457,7 @@ textarea {
 
 textarea::placeholder,
 input::placeholder {
-  color: #526171;
+  color: #8292a1;
 }
 
 .prompt-footnote {
@@ -756,6 +756,14 @@ input::placeholder {
   font-size: 0.68rem;
 }
 
+.media-item__name .media-item__url {
+  overflow: hidden;
+  color: var(--text-muted);
+  font: 0.62rem/1.35 var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .compact-field select {
   max-width: 9rem;
   height: 2.25rem;
@@ -846,6 +854,41 @@ input::placeholder {
   border-top: 1px solid var(--border);
 }
 
+.advanced-settings {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgb(255 255 255 / 0.018);
+}
+
+.advanced-settings summary {
+  padding: 0.75rem;
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  font-weight: 680;
+  cursor: pointer;
+}
+
+.advanced-settings summary small {
+  color: var(--text-faint);
+  font-weight: 500;
+}
+
+.advanced-settings textarea {
+  min-height: 8rem;
+  margin: 0 0.75rem;
+  width: calc(100% - 1.5rem);
+  padding: 0.75rem;
+  font: 0.72rem/1.5 var(--font-mono);
+}
+
+.advanced-settings > p {
+  margin: 0;
+  padding: 0.65rem 0.75rem 0.75rem;
+  color: var(--text-faint);
+  font-size: 0.65rem;
+  line-height: 1.45;
+}
+
 .field--wide {
   grid-column: 1 / -1;
 }
@@ -899,6 +942,10 @@ input::placeholder {
 
 .jobs-heading {
   align-items: center;
+}
+
+.jobs-heading:focus {
+  outline: none;
 }
 
 .job-summary {
@@ -1601,6 +1648,44 @@ dialog::backdrop {
   margin-top: 0;
 }
 
+.dialog-error,
+.submission-state {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  margin-top: 1rem;
+  padding: 0.8rem;
+  border: 1px solid rgb(255 133 139 / 0.32);
+  border-radius: var(--radius-md);
+  color: #ffd0d3;
+  background: rgb(255 133 139 / 0.07);
+}
+
+.submission-state {
+  border-color: rgb(104 224 208 / 0.27);
+  color: #b7f1e9;
+  background: rgb(104 224 208 / 0.06);
+}
+
+.dialog-error > svg,
+.submission-state > svg {
+  flex: 0 0 auto;
+  margin-top: 0.1rem;
+}
+
+.dialog-error p,
+.submission-state p {
+  display: grid;
+  gap: 0.2rem;
+  margin: 0;
+}
+
+.dialog-error span,
+.submission-state span {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+}
+
 .disclosure-list {
   display: grid;
   gap: 0.45rem;
@@ -1774,6 +1859,15 @@ dialog::backdrop {
   white-space: nowrap;
 }
 
+.review-media span > small {
+  display: block;
+  overflow: hidden;
+  margin-top: 0.12rem;
+  font: 0.6rem/1.35 var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .review-media small {
   color: var(--text-faint);
 }
@@ -1940,6 +2034,10 @@ dialog::backdrop {
     padding-bottom: 7rem;
   }
 
+  .toast {
+    bottom: 5.25rem;
+  }
+
   .compose-layout,
   .jobs-layout {
     grid-template-columns: 1fr;
@@ -2050,12 +2148,9 @@ dialog::backdrop {
   }
 
   .media-item__actions {
-    grid-column: 3;
-    grid-row: 1;
-  }
-
-  .media-item__actions .icon-button:not(.icon-button--danger) {
-    display: none;
+    grid-column: 2 / -1;
+    grid-row: 3;
+    justify-content: flex-end;
   }
 
   .jobs-layout {

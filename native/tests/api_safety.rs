@@ -5,16 +5,20 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION};
+use reqwest::header::{
+    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION,
+};
 use reqwest::{Method, StatusCode};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tempfile::tempdir;
+use tokio::sync::Notify;
 use url::Url;
 use video_harness::api::{
-    ApiErrorKind, ClientOptions, HttpExecutor, HttpRequest, HttpResponse, OpenRouterClient,
-    TransportError,
+    ApiErrorKind, ClientOptions, HttpExecutor, HttpRequest, HttpResponse, MAX_VIDEO_DOWNLOAD_BYTES,
+    OpenRouterClient, TransportError,
 };
+use video_harness::config::partial_path;
 use video_harness::domain::{MediaKind, VideoRequest};
 
 const BASE_URL: &str = "https://api.fixture.invalid/api/v1";
@@ -31,6 +35,13 @@ struct CapturedRequest {
 enum Reply {
     Json(StatusCode, Value),
     Bytes(StatusCode, HeaderMap, Vec<u8>),
+    WaitBytes {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Vec<u8>,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    },
     TransportError,
 }
 
@@ -81,6 +92,22 @@ impl HttpExecutor for ScriptedExecutor {
                 headers,
                 Bytes::from(body),
             )),
+            Reply::WaitBytes {
+                status,
+                headers,
+                body,
+                started,
+                release,
+            } => {
+                started.notify_one();
+                release.notified().await;
+                Ok(HttpResponse::from_bytes(
+                    status,
+                    request.url,
+                    headers,
+                    Bytes::from(body),
+                ))
+            }
             Reply::TransportError => Err(TransportError),
         }
     }
@@ -371,6 +398,92 @@ async fn malformed_successful_submission_is_uncertain_and_performs_one_post() {
 }
 
 #[tokio::test]
+async fn accepted_job_requires_string_identity_bound_to_its_polling_locator() {
+    for payload in [
+        json!({
+            "id": 42,
+            "status": "pending",
+            "polling_url": "/api/v1/videos/42"
+        }),
+        json!({
+            "id": "job-a",
+            "status": "pending",
+            "polling_url": 42
+        }),
+        json!({
+            "id": "job-a",
+            "status": "pending",
+            "polling_url": "/api/v1/videos/job-b"
+        }),
+    ] {
+        let executor = ScriptedExecutor::with_replies([Reply::Json(StatusCode::OK, payload)]);
+        let client = client(executor.clone(), 0);
+        let request = VideoRequest::new("black-forest-labs/flux-3-video", "Identity fixture")
+            .expect("fixture request");
+
+        let error = client
+            .submit(&request)
+            .await
+            .expect_err("malformed accepted identity must be uncertain");
+
+        assert_eq!(error.kind, ApiErrorKind::SubmissionUncertain);
+        assert_eq!(executor.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn poll_response_must_match_both_the_requested_job_and_reported_locator() {
+    for payload in [
+        json!({
+            "id": "job-b",
+            "status": "pending",
+            "polling_url": "/api/v1/videos/job-b"
+        }),
+        json!({
+            "id": "job-a",
+            "status": "pending",
+            "polling_url": "/api/v1/videos/job-b"
+        }),
+    ] {
+        let executor = ScriptedExecutor::with_replies([Reply::Json(StatusCode::OK, payload)]);
+        let client = client(executor.clone(), 0);
+
+        let error = client
+            .poll("job-a")
+            .await
+            .expect_err("cross-job poll response must be rejected");
+
+        assert_eq!(error.kind, ApiErrorKind::ResponseFormat);
+        assert_eq!(executor.requests().len(), 1);
+        assert_eq!(executor.requests()[0].url.path(), "/api/v1/videos/job-a");
+    }
+}
+
+#[tokio::test]
+async fn poll_accepts_an_omitted_redundant_locator_and_restores_the_canonical_one() {
+    for payload in [
+        json!({"id": "job-a", "status": "pending"}),
+        json!({"id": "job-a", "status": "pending", "polling_url": null}),
+    ] {
+        let executor = ScriptedExecutor::with_replies([Reply::Json(StatusCode::OK, payload)]);
+        let client = client(executor.clone(), 0);
+
+        let job = client
+            .poll("job-a")
+            .await
+            .expect("the requested URL and response id bind the job identity");
+
+        assert_eq!(job.id, "job-a");
+        assert_eq!(
+            job.polling_url,
+            "https://api.fixture.invalid/api/v1/videos/job-a"
+        );
+        assert_eq!(executor.requests().len(), 1);
+        assert_eq!(executor.requests()[0].url.path(), "/api/v1/videos/job-a");
+    }
+}
+
+#[tokio::test]
 async fn safe_get_retries_but_never_adds_catalog_authorization() {
     let executor = ScriptedExecutor::with_replies([
         Reply::TransportError,
@@ -509,6 +622,105 @@ async fn unsafe_or_existing_download_targets_are_rejected_before_transport() {
     assert_eq!(error.kind, ApiErrorKind::Download);
     assert_eq!(fs::read(&destination).expect("existing bytes"), b"keep me");
     assert!(executor.requests().is_empty());
+}
+
+#[tokio::test]
+async fn download_rejects_oversized_content_before_creating_a_partial_file() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&(MAX_VIDEO_DOWNLOAD_BYTES + 1).to_string())
+            .expect("oversized content length"),
+    );
+    let executor = ScriptedExecutor::with_replies([Reply::Bytes(
+        StatusCode::OK,
+        headers,
+        b"unused fixture bytes".to_vec(),
+    )]);
+    let client = client(executor, 0);
+    let directory = tempdir().expect("temporary directory");
+    let destination = directory.path().join("oversized.mp4");
+
+    let error = client
+        .download(
+            &Url::parse("https://cdn.fixture.invalid/oversized.mp4").expect("fixture URL"),
+            &destination,
+            None,
+        )
+        .await
+        .expect_err("oversized download must fail closed");
+
+    assert_eq!(error.kind, ApiErrorKind::Download);
+    assert!(!destination.exists());
+    assert!(!partial_path(&destination).exists());
+}
+
+#[tokio::test]
+async fn download_rejects_non_success_responses_before_creating_a_partial_file() {
+    for status in [StatusCode::MULTIPLE_CHOICES, StatusCode::NOT_MODIFIED] {
+        let executor = ScriptedExecutor::with_replies([Reply::Bytes(
+            status,
+            HeaderMap::new(),
+            b"not a video".to_vec(),
+        )]);
+        let client = client(executor, 0);
+        let directory = tempdir().expect("temporary directory");
+        let destination = directory
+            .path()
+            .join(format!("status-{}.mp4", status.as_u16()));
+
+        let error = client
+            .download(
+                &Url::parse("https://cdn.fixture.invalid/not-video").expect("fixture URL"),
+                &destination,
+                None,
+            )
+            .await
+            .expect_err("a non-success response must not be saved as video");
+
+        assert_eq!(error.status_code, Some(status.as_u16()));
+        assert!(!destination.exists());
+        assert!(!partial_path(&destination).exists());
+    }
+}
+
+#[tokio::test]
+async fn failed_download_never_removes_a_partial_file_owned_by_a_peer() {
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let executor = ScriptedExecutor::with_replies([Reply::WaitBytes {
+        status: StatusCode::OK,
+        headers: HeaderMap::new(),
+        body: b"new video".to_vec(),
+        started: started.clone(),
+        release: release.clone(),
+    }]);
+    let client = client(executor, 0);
+    let directory = tempdir().expect("temporary directory");
+    let destination = directory.path().join("racing.mp4");
+    let partial = partial_path(&destination);
+    let download_url = Url::parse("https://cdn.fixture.invalid/racing.mp4").expect("fixture URL");
+    let download_destination = destination.clone();
+    let download = tokio::spawn(async move {
+        client
+            .download(&download_url, &download_destination, None)
+            .await
+    });
+
+    started.notified().await;
+    fs::write(&partial, b"peer download").expect("create peer-owned partial");
+    release.notify_one();
+
+    let error = download
+        .await
+        .expect("download task")
+        .expect_err("partial collision must fail");
+    assert_eq!(error.kind, ApiErrorKind::Download);
+    assert_eq!(
+        fs::read(&partial).expect("peer partial remains"),
+        b"peer download"
+    );
+    assert!(!destination.exists());
 }
 
 #[tokio::test]

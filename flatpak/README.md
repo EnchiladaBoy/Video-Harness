@@ -1,9 +1,9 @@
 # Optional Flatpak packaging
 
 Official releases are unsigned portable AppImages. The retained Flatpak
-manifest is an optional developer/community packaging target; it is not built
-or published by the stable release workflow and requires no project signing
-key.
+manifest is an optional developer/community packaging target. Ordinary CI
+builds it from a clean checkout, but the stable release workflow does not
+publish it and it requires no project signing key.
 
 The manifest packages the Tauri/Svelte desktop application as
 `io.github.EnchiladaBoy.VideoHarness` against GNOME 50. Cargo dependencies are
@@ -11,11 +11,14 @@ pinned by `desktop/src-tauri/Cargo.lock` and materialized by
 `cargo-sources.json`, so the Rust build runs with Cargo networking disabled.
 The Svelte bundle is built from `ui/package-lock.json` before Flathub's
 official Builder environment starts and is then embedded into the Tauri
-executable.
+executable. `prepare-ui.sh` also records a digest of every nonignored UI input;
+`check-manifest.sh` rejects a missing or stale bundle instead of silently
+packaging whatever happens to be in the ignored `ui/dist` directory.
 
 After changing dependencies, regenerate and verify the source list:
 
 ```bash
+flatpak/prepare-ui.sh
 flatpak/generate-cargo-sources.sh
 flatpak/check-manifest.sh
 ```
@@ -34,8 +37,7 @@ flatpak install --user flathub \
 Then build an unsigned local repository and smoke-test it:
 
 ```bash
-npm --prefix ui ci
-npm --prefix ui run build
+flatpak/prepare-ui.sh
 flatpak run org.flatpak.Builder \
   --user --install-deps-from=flathub \
   --force-clean --default-branch=stable \

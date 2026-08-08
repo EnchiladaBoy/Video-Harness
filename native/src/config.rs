@@ -16,7 +16,7 @@ use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::atomic::replace_file;
-use crate::domain::{OPENROUTER_PROVIDER_ID, ProviderId};
+use crate::domain::{OPENROUTER_PROVIDER_ID, ProviderId, json_contains_credential_field};
 
 pub const APP_NAME: &str = "openrouter-video-studio";
 pub const DEFAULT_VIDEO_SUFFIX: &str = ".mp4";
@@ -85,7 +85,7 @@ pub fn load_model_settings(path: &Path) -> Result<ModelSettingsMap, ConfigError>
         Err(error) => return Err(ConfigError::SettingsIo(error)),
     };
     let value: Value = serde_json::from_slice(&contents)?;
-    if contains_credential_field(&value) {
+    if json_contains_credential_field(&value) {
         return Err(ConfigError::CredentialInSettings);
     }
     let object = value.as_object().ok_or(ConfigError::InvalidSettings)?;
@@ -104,7 +104,7 @@ pub fn save_model_settings(
     if model_id.trim().is_empty() || !settings.is_object() {
         return Err(ConfigError::InvalidSettings);
     }
-    if contains_credential_field(&settings) {
+    if json_contains_credential_field(&settings) {
         return Err(ConfigError::CredentialInSettings);
     }
     let mut all = load_model_settings(path)?;
@@ -114,31 +114,6 @@ pub fn save_model_settings(
     }
     write_json_atomic(path, &all)?;
     Ok(())
-}
-
-fn contains_credential_field(value: &Value) -> bool {
-    match value {
-        Value::Object(object) => object.iter().any(|(key, value)| {
-            let normalized = key
-                .chars()
-                .filter(|character| character.is_ascii_alphanumeric())
-                .flat_map(char::to_lowercase)
-                .collect::<String>();
-            matches!(
-                normalized.as_str(),
-                "apikey"
-                    | "authorization"
-                    | "accesstoken"
-                    | "authtoken"
-                    | "bearertoken"
-                    | "password"
-                    | "secret"
-                    | "secretkey"
-            ) || contains_credential_field(value)
-        }),
-        Value::Array(values) => values.iter().any(contains_credential_field),
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
-    }
 }
 
 pub fn load_app_settings(path: &Path) -> Result<AppSettings, ConfigError> {

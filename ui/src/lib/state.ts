@@ -17,8 +17,23 @@ function cloneDraft(draft: AppSnapshot['draft']): AppSnapshot['draft'] {
  * state. A locally edited draft is the exception: catalog refreshes must not
  * paint an older backend draft over text that is still waiting for autosave.
  */
-export function reconcileSnapshot(current: AppSnapshot, incoming: AppSnapshot): AppSnapshot {
+export function reconcileSnapshot(
+  current: AppSnapshot,
+  incoming: AppSnapshot,
+  options: { preserveSelection?: boolean } = {}
+): AppSnapshot {
   const next = structuredClone(incoming);
+  const preserveSelection = options.preserveSelection ?? true;
+  const selectedJobId = preserveSelection
+    ? current.selectedJobId && next.jobs.some((job) => job.id === current.selectedJobId)
+      ? current.selectedJobId
+      : next.selectedJobId && next.jobs.some((job) => job.id === next.selectedJobId)
+        ? next.selectedJobId
+        : next.jobs[0]?.id
+    : next.selectedJobId && next.jobs.some((job) => job.id === next.selectedJobId)
+      ? next.selectedJobId
+      : next.jobs[0]?.id;
+  next.selectedJobId = selectedJobId;
   if (current.draftSaved || draftsMatch(current.draft, next.draft)) return next;
 
   return {
@@ -38,7 +53,10 @@ export function applyUiEvent(snapshot: AppSnapshot, event: UiEvent): AppSnapshot
         ...snapshot,
         providers: snapshot.providers.map((provider) =>
           provider.id === event.provider.id ? event.provider : provider
-        )
+        ),
+        models: event.provider.connected
+          ? snapshot.models
+          : snapshot.models.filter((model) => model.providerId !== event.provider.id)
       };
     case 'review_ready':
       return { ...snapshot, preparedReview: event.review };
@@ -67,6 +85,8 @@ export function applyUiEvent(snapshot: AppSnapshot, event: UiEvent): AppSnapshot
     }
     case 'draft_saved':
       return { ...snapshot, draftSaved: event.revision === snapshot.draft.revision };
+    case 'close_requested':
+      return snapshot;
     case 'operation_failed':
       return event.operation === 'submission'
         ? { ...snapshot, preparedReview: undefined }
@@ -85,9 +105,22 @@ export function applySequencedEvent(
     return { snapshot, seq: currentSeq, gap: false };
   }
 
+  if (envelope.seq !== currentSeq + 1) {
+    return { snapshot, seq: currentSeq, gap: true };
+  }
+
   return {
     snapshot: applyUiEvent(snapshot, envelope.event),
     seq: envelope.seq,
-    gap: envelope.seq !== currentSeq + 1
+    gap: false
   };
+}
+
+/** Lifecycle requests are edge-triggered and are not represented in a
+ * snapshot, so callers must handle them even when sequence recovery drops the
+ * corresponding state event. */
+export function requiresImmediateHandling(
+  event: UiEvent
+): event is Extract<UiEvent, { type: 'close_requested' }> {
+  return event.type === 'close_requested';
 }

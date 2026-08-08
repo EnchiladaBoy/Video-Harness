@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use chrono::{TimeDelta, Utc};
 use rusqlite::Connection;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -188,6 +189,38 @@ fn create_reopen_and_complete_preserves_original_request() {
     assert_eq!(updated.cost, Some(Decimal::new(68, 2)));
     assert_eq!(updated.output_path.as_deref(), Some(output.as_path()));
     assert_eq!(updated.request.as_ref(), Some(&original));
+}
+
+#[test]
+fn sidecar_history_restoration_preserves_acceptance_time_and_output() {
+    let directory = tempdir().expect("temporary directory");
+    let store = HistoryStore::new(directory.path().join("history.sqlite3"));
+    let accepted_at = Utc::now() - TimeDelta::hours(6);
+    let output = directory.path().join("Videos/recovered.mp4");
+    let completed = job("job-recovered", "completed", Some("0.42"));
+
+    let restored = store
+        .restore_provider_job(
+            &ProviderId::openrouter(),
+            &completed,
+            Some(&output),
+            accepted_at,
+        )
+        .expect("restore compatible history from sidecar");
+
+    assert_eq!(restored.created_at, accepted_at);
+    assert_eq!(restored.output_path.as_deref(), Some(output.as_path()));
+    assert_eq!(
+        store
+            .get_provider(
+                &ProviderJobKey::new(ProviderId::openrouter(), "job-recovered")
+                    .expect("restored key")
+            )
+            .expect("read restored history")
+            .expect("restored row")
+            .created_at,
+        accepted_at
+    );
 }
 
 #[test]

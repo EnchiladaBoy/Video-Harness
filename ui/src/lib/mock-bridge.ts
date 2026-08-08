@@ -1,4 +1,5 @@
 import { applyUiEvent } from './state';
+import { modelById } from './types';
 import type {
   AppSnapshot,
   BridgeSubscription,
@@ -50,10 +51,16 @@ export function demoSnapshot(): AppSnapshot {
         name: 'FLUX 3 Video — Cinematic Image-to-Video, Audio & Extended Motion Preview',
         description:
           'A cinematic model for expressive camera motion, strong prompt adherence, and image-guided scenes.',
-        capabilities: { images: true, video: false, audioReferences: false, generatedAudio: true },
+        capabilities: { images: true, video: false, audioReferences: false, generatedAudio: true, seed: true },
         durationOptions: ['5 seconds', '8 seconds', '10 seconds'],
         resolutionOptions: ['720p', '1080p'],
         aspectRatioOptions: ['16:9', '9:16', '1:1'],
+        sizeOptions: ['1280x720'],
+        supportedImageRoles: ['reference', 'start_frame', 'end_frame'],
+        mediaConstraints: [{ kind: 'image', required: false, maxItems: 4 }],
+        maxMediaItems: 4,
+        audioRequiresVisual: false,
+        framesExclusiveWithReferences: true,
         priceHint: 'From about $0.32'
       },
       {
@@ -61,10 +68,19 @@ export function demoSnapshot(): AppSnapshot {
         providerId: 'openrouter',
         name: 'Veo 3.1 Fast',
         description: 'Fast iteration with generated sound and polished natural motion.',
-        capabilities: { images: true, video: true, audioReferences: false, generatedAudio: true },
+        capabilities: { images: true, video: true, audioReferences: false, generatedAudio: true, seed: true },
         durationOptions: ['4 seconds', '6 seconds', '8 seconds'],
         resolutionOptions: ['720p', '1080p'],
         aspectRatioOptions: ['16:9', '9:16'],
+        sizeOptions: [],
+        supportedImageRoles: ['reference', 'start_frame', 'end_frame'],
+        mediaConstraints: [
+          { kind: 'image', required: false, maxItems: 4 },
+          { kind: 'video', required: false, maxItems: 1 }
+        ],
+        maxMediaItems: 5,
+        audioRequiresVisual: false,
+        framesExclusiveWithReferences: true,
         priceHint: 'From about $0.40'
       },
       {
@@ -72,10 +88,16 @@ export function demoSnapshot(): AppSnapshot {
         providerId: 'fal',
         name: 'Kling 2.1 Master Image-to-Video',
         description: 'High-fidelity image animation with deliberate camera direction.',
-        capabilities: { images: true, video: false, audioReferences: false, generatedAudio: false },
+        capabilities: { images: true, video: false, audioReferences: false, generatedAudio: false, seed: false },
         durationOptions: ['5 seconds', '10 seconds'],
         resolutionOptions: ['720p', '1080p'],
         aspectRatioOptions: ['Use source', '16:9', '9:16', '1:1'],
+        sizeOptions: [],
+        supportedImageRoles: ['start_frame'],
+        mediaConstraints: [{ kind: 'image', required: true, minItems: 1, maxItems: 1 }],
+        maxMediaItems: 1,
+        audioRequiresVisual: false,
+        framesExclusiveWithReferences: false,
         priceHint: 'From about $0.28'
       },
       {
@@ -83,10 +105,20 @@ export function demoSnapshot(): AppSnapshot {
         providerId: 'fal',
         name: 'Wan 2.2 A14B Video-to-Video — Creative Restyle (High Quality)',
         description: 'Restyle a source clip while retaining broad composition and motion.',
-        capabilities: { images: true, video: true, audioReferences: true, generatedAudio: false },
+        capabilities: { images: true, video: true, audioReferences: true, generatedAudio: false, seed: true },
         durationOptions: ['Use source', '5 seconds'],
         resolutionOptions: ['480p', '720p'],
         aspectRatioOptions: ['Use source'],
+        sizeOptions: [],
+        supportedImageRoles: ['reference'],
+        mediaConstraints: [
+          { kind: 'image', required: false, maxItems: 4 },
+          { kind: 'video', required: true, minItems: 1, maxItems: 1 },
+          { kind: 'audio', required: false, maxItems: 1 }
+        ],
+        maxMediaItems: 6,
+        audioRequiresVisual: true,
+        framesExclusiveWithReferences: false,
         priceHint: 'Usage based'
       }
     ],
@@ -111,8 +143,10 @@ export function demoSnapshot(): AppSnapshot {
         duration: '8 seconds',
         resolution: '1080p',
         aspectRatio: '16:9',
+        size: '',
         generatedAudio: 'on',
-        seed: ''
+        seed: '',
+        advancedJson: ''
       }
     },
     jobs: [
@@ -129,7 +163,10 @@ export function demoSnapshot(): AppSnapshot {
         elapsedSeconds: 184,
         nextPollSeconds: 18,
         hasLocalOutput: false,
-        deletable: false
+        deletable: false,
+        monitorState: 'active',
+        canResume: false,
+        canPause: true
       },
       {
         id: 'job-fal-38c2a011',
@@ -145,7 +182,10 @@ export function demoSnapshot(): AppSnapshot {
         outputFileName: 'wildflowers-summer-storm.mp4',
         hasLocalOutput: true,
         providerJobId: 'fal-request-38c2a011-long-but-fully-visible',
-        deletable: true
+        deletable: true,
+        monitorState: 'terminal',
+        canResume: false,
+        canPause: false
       },
       {
         id: 'job-or-paused-1290',
@@ -160,7 +200,10 @@ export function demoSnapshot(): AppSnapshot {
         elapsedSeconds: 92,
         remoteContinues: true,
         hasLocalOutput: false,
-        deletable: false
+        deletable: false,
+        monitorState: 'paused',
+        canResume: true,
+        canPause: false
       }
     ],
     selectedJobId: 'job-or-8ca9f214',
@@ -208,11 +251,21 @@ class BrowserDemoBridge implements VideoHarnessBridge {
 
   async openSession(onEvent: (envelope: UiEventEnvelope) => void) {
     this.listeners.add(onEvent);
-    return { seq: this.sequence, snapshot: structuredClone(this.snapshot) };
+    return {
+      seq: this.sequence,
+      snapshot: structuredClone(this.snapshot),
+      preparing: false,
+      submitting: false
+    };
   }
 
   async getSnapshot() {
-    return { seq: this.sequence, snapshot: structuredClone(this.snapshot) };
+    return {
+      seq: this.sequence,
+      snapshot: structuredClone(this.snapshot),
+      preparing: false,
+      submitting: false
+    };
   }
 
   async watchFileDrops(_onDrop: (event: FileDropEvent) => void): Promise<BridgeSubscription> {
@@ -280,7 +333,8 @@ class BrowserDemoBridge implements VideoHarnessBridge {
       kind,
       role,
       source: 'remote',
-      detail: parsed.hostname
+      detail: parsed.hostname,
+      displayUrl: `${parsed.origin}${parsed.pathname}`
     };
   }
 
@@ -290,7 +344,7 @@ class BrowserDemoBridge implements VideoHarnessBridge {
   ): Promise<void> {
     await wait(720);
     const provider = this.snapshot.providers.find((item) => item.id === draft.providerId);
-    const model = this.snapshot.models.find((item) => item.id === draft.modelId);
+    const model = modelById(this.snapshot, draft.providerId, draft.modelId);
     if (!provider?.connected) throw new Error(`Connect ${provider?.name ?? 'the provider'} before Review.`);
     if (!model) throw new Error('Choose an available model before Review.');
     if (
@@ -339,7 +393,10 @@ class BrowserDemoBridge implements VideoHarnessBridge {
       elapsedSeconds: 0,
       nextPollSeconds: 4,
       hasLocalOutput: false,
-      deletable: false
+      deletable: false,
+      monitorState: 'active',
+      canResume: false,
+      canPause: true
     };
     this.emit({ type: 'job_added', job });
     this.emit({ type: 'notice', tone: 'good', message: 'The pretend projector is rolling—no credits used.' });
@@ -368,7 +425,10 @@ class BrowserDemoBridge implements VideoHarnessBridge {
           elapsedSeconds: 6,
           outputFileName: 'demo-cloud-cinema.mp4',
           hasLocalOutput: true,
-          deletable: true
+          deletable: true,
+          monitorState: 'terminal',
+          canResume: false,
+          canPause: false
         }
       });
     }, 6_000);
@@ -383,6 +443,18 @@ class BrowserDemoBridge implements VideoHarnessBridge {
     this.emit({ type: 'draft_saved', revision: draft.revision });
   }
 
+  async acknowledgeCloseRequest(_requestId: number): Promise<void> {
+    return undefined;
+  }
+
+  async cancelCloseRequest(_requestId: number): Promise<void> {
+    return undefined;
+  }
+
+  async saveDraftAndClose(draft: GenerationDraft, _requestId: number): Promise<void> {
+    await this.saveDraft(draft);
+  }
+
   async pauseJob(jobId: string): Promise<void> {
     const job = this.snapshot.jobs.find((item) => item.id === jobId);
     if (!job) return;
@@ -393,7 +465,10 @@ class BrowserDemoBridge implements VideoHarnessBridge {
         status: 'paused',
         statusLabel: 'Monitoring paused',
         detail: 'The pretend provider keeps working while local updates take a nap.',
-        remoteContinues: true
+        remoteContinues: true,
+        monitorState: 'paused',
+        canResume: true,
+        canPause: false
       }
     });
   }
@@ -409,7 +484,10 @@ class BrowserDemoBridge implements VideoHarnessBridge {
         statusLabel: 'Back on watch',
         detail: 'Tiny Cloud Cinema is checking again.',
         remoteContinues: undefined,
-        nextPollSeconds: 8
+        nextPollSeconds: 8,
+        monitorState: 'active',
+        canResume: false,
+        canPause: true
       }
     });
   }

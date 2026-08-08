@@ -20,9 +20,33 @@ use tokio::sync::mpsc;
 
 use crate::api::DownloadProgress;
 use crate::domain::{
-    CostQuote, DraftMedia, GenerationDraft, JobLocator, MediaKind, MediaSource, ProviderDescriptor,
-    ProviderId, StagedMedia, UploadReceipt, VideoArtifact, VideoCatalog, VideoJob, VideoRequest,
+    CostQuote, DraftMedia, FAL_PROVIDER_ID, GenerationDraft, JobLocator, MediaKind, MediaSource,
+    OPENROUTER_PROVIDER_ID, ProviderDescriptor, ProviderId, StagedMedia, UploadReceipt,
+    VideoArtifact, VideoCatalog, VideoJob, VideoRequest,
 };
+
+/// Conservative cross-provider fallback limits for one video request. A
+/// provider schema may advertise a higher model-specific maximum where the
+/// adapter explicitly supports it.
+pub const MAX_MEDIA_INPUTS_TOTAL: usize = 12;
+pub const MAX_IMAGE_INPUTS: usize = 9;
+pub const MAX_VIDEO_INPUTS: usize = 3;
+pub const MAX_AUDIO_INPUTS: usize = 3;
+
+/// Whether audio input for this provider/model must be accompanied by at
+/// least one image, frame image, or video input.
+pub fn audio_input_requires_visual(provider_id: &ProviderId, model_id: &str) -> bool {
+    match provider_id.as_str() {
+        OPENROUTER_PROVIDER_ID => true,
+        FAL_PROVIDER_ID => is_seedance_2_model_id(model_id),
+        _ => false,
+    }
+}
+
+pub(crate) fn is_seedance_2_model_id(model_id: &str) -> bool {
+    let model_id = model_id.to_ascii_lowercase();
+    model_id.starts_with("bytedance/seedance-2.0") || model_id.contains("/seedance-2.0/")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderErrorKind {
@@ -445,5 +469,42 @@ impl ProviderRegistry {
             .keys()
             .cloned()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reusable_media_limits_match_adapter_policy() {
+        assert_eq!(MAX_MEDIA_INPUTS_TOTAL, 12);
+        assert_eq!(MAX_IMAGE_INPUTS, 9);
+        assert_eq!(MAX_VIDEO_INPUTS, 3);
+        assert_eq!(MAX_AUDIO_INPUTS, 3);
+    }
+
+    #[test]
+    fn audio_visual_companion_policy_is_provider_and_model_specific() {
+        assert!(audio_input_requires_visual(
+            &ProviderId::openrouter(),
+            "any/audio-capable-model"
+        ));
+        assert!(audio_input_requires_visual(
+            &ProviderId::fal(),
+            "bytedance/seedance-2.0/reference-to-video"
+        ));
+        assert!(audio_input_requires_visual(
+            &ProviderId::fal(),
+            "FAL-AI/SEEDANCE-2.0/REFERENCE-TO-VIDEO"
+        ));
+        assert!(!audio_input_requires_visual(
+            &ProviderId::fal(),
+            "fal-ai/kling-video"
+        ));
+        assert!(!audio_input_requires_visual(
+            &ProviderId::new("future-provider").expect("provider id"),
+            "future-model"
+        ));
     }
 }

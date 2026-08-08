@@ -7,6 +7,7 @@ MANIFEST="${SCRIPT_DIR}/io.github.EnchiladaBoy.VideoHarness.yml"
 NATIVE_CARGO_TOML="${PROJECT_DIR}/native/Cargo.toml"
 DESKTOP_CARGO_TOML="${PROJECT_DIR}/desktop/src-tauri/Cargo.toml"
 METAINFO="${PROJECT_DIR}/native/data/io.github.EnchiladaBoy.VideoHarness.metainfo.xml"
+UI_STAMP="${PROJECT_DIR}/ui/dist/.source-sha256"
 
 fail() {
     echo "Flatpak check failed: $*" >&2
@@ -68,18 +69,32 @@ core_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${NATIVE_CARGO_TOML}" | 
     || fail "desktop and core Cargo versions differ (${package_version} != ${core_version})"
 grep -Fq -- "<release version=\"${package_version}\"" "${METAINFO}" \
     || fail "Cargo and AppStream versions differ (${package_version})"
+grep -Fq -- '<id>io.github.EnchiladaBoy.VideoHarness</id>' "${METAINFO}" \
+    || fail "the installed AppStream identity changed"
 
-if command -v desktop-file-validate >/dev/null 2>&1; then
-    desktop-file-validate "${PROJECT_DIR}/native/data/io.github.EnchiladaBoy.VideoHarness.desktop"
-fi
-if command -v appstreamcli >/dev/null 2>&1; then
-    appstreamcli validate --no-net "${METAINFO}"
-fi
+[[ -f "${PROJECT_DIR}/ui/dist/index.html" && -f "${UI_STAMP}" ]] \
+    || fail "the locked UI bundle is absent; run flatpak/prepare-ui.sh"
+expected_ui_hash="$("${SCRIPT_DIR}/hash-ui-source.sh")"
+actual_ui_hash="$(tr -d '\r\n' <"${UI_STAMP}")"
+[[ "${actual_ui_hash}" == "${expected_ui_hash}" ]] \
+    || fail "ui/dist is stale; run flatpak/prepare-ui.sh"
+
+command -v desktop-file-validate >/dev/null 2>&1 \
+    || fail "desktop-file-validate is required"
+command -v appstreamcli >/dev/null 2>&1 \
+    || fail "appstreamcli is required"
+desktop-file-validate "${PROJECT_DIR}/native/data/io.github.EnchiladaBoy.VideoHarness.desktop"
+# The legacy mixed-case component ID is the installed application identity.
+# AppStream reports that known compatibility choice as a pedantic hint.
+appstreamcli validate --no-net --strict --pedantic "${METAINFO}"
+
 if command -v flatpak-builder >/dev/null 2>&1; then
     flatpak-builder --show-manifest "${MANIFEST}" >/dev/null
 elif command -v flatpak >/dev/null 2>&1 \
     && flatpak --user info org.flatpak.Builder >/dev/null 2>&1; then
     flatpak run org.flatpak.Builder --show-manifest "${MANIFEST}" >/dev/null
+else
+    fail "flatpak-builder or the org.flatpak.Builder Flatpak is required"
 fi
 
 generated_sources="$(mktemp)"

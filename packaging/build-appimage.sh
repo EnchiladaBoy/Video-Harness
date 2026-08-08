@@ -125,6 +125,7 @@ do
             exit 1
         }
 done
+"${SCRIPT_DIR}/smoke-appimage-media.sh" "${EXTRACT_ROOT}/squashfs-root"
 
 mv -f -- "${OUTPUT_TEMP}" "${OUTPUT_APPIMAGE}"
 

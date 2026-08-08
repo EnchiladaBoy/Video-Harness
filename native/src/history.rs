@@ -225,6 +225,29 @@ impl HistoryStore {
         job: &VideoJob,
         request: Option<&VideoRequest>,
     ) -> Result<JobRecord, HistoryError> {
+        self.import_provider_job_at(provider_id, job, request, Utc::now())
+    }
+
+    /// Rebuild a missing compatible-history row from durable GUI recovery
+    /// state without changing the provider acceptance time.
+    pub fn restore_provider_job(
+        &self,
+        provider_id: &ProviderId,
+        job: &VideoJob,
+        output_path: Option<&Path>,
+        accepted_at: DateTime<Utc>,
+    ) -> Result<JobRecord, HistoryError> {
+        self.import_provider_job_at(provider_id, job, None, accepted_at)?;
+        self.update_provider_job(provider_id, job, output_path)
+    }
+
+    fn import_provider_job_at(
+        &self,
+        provider_id: &ProviderId,
+        job: &VideoJob,
+        request: Option<&VideoRequest>,
+        accepted_at: DateTime<Utc>,
+    ) -> Result<JobRecord, HistoryError> {
         if let Some(request) = request {
             return self.create_provider_job(provider_id, request, job);
         }
@@ -238,7 +261,7 @@ impl HistoryStore {
         let locator = import_locator(provider_id, job)?;
         let locator_json = serde_json::to_string(&locator)?;
         let polling_url = polling_url_for_locator(&locator);
-        let now = Utc::now().to_rfc3339();
+        let now = accepted_at.to_rfc3339();
         let cost = job.cost().map(|value| value.to_string());
         let currency = currency_for_job(job);
         let mut connection = self.ready_connection()?;

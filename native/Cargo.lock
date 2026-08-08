@@ -2843,6 +2843,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "rust_decimal",
+ "rustix",
  "secrecy",
  "serde",
  "serde_json",

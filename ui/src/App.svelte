@@ -1,26 +1,41 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { createBridge } from './lib/bridge';
   import { physicalPointToCss, pointInRect } from './lib/geometry';
   import { demoSnapshot } from './lib/mock-bridge';
-  import { applySequencedEvent, reconcileSnapshot } from './lib/state';
+  import {
+    constrainMediaAppend,
+    imageRoleOptions,
+    modelSupportsImages,
+    normalizeDraftForModel,
+    reviewReadinessIssue
+  } from './lib/readiness';
+  import {
+    applySequencedEvent,
+    reconcileSnapshot,
+    requiresImmediateHandling
+  } from './lib/state';
   import CloudCinema from './lib/components/CloudCinema.svelte';
   import Icon from './lib/components/Icon.svelte';
   import type {
     AppSnapshot,
     FileDropEvent,
     GenerationDraft,
-    JobStatus,
+    JobSummary,
     MediaItem,
     MediaKind,
     MediaRole,
+    ModelSummary,
+    OpenSessionResult,
     ProviderId,
     UiEventEnvelope,
+    VideoHarnessBridge,
     WorkspaceView
   } from './lib/types';
-  import { isActiveJob } from './lib/types';
+  import { isActivelyMonitored, modelById } from './lib/types';
 
-  const bridge = createBridge();
+  let { bridge: bridgeOverride }: { bridge?: VideoHarnessBridge } = $props();
+  const bridge = untrack(() => bridgeOverride ?? createBridge());
 
   function emptySnapshot(): AppSnapshot {
     return {
@@ -36,8 +51,10 @@
           duration: '',
           resolution: '',
           aspectRatio: '',
+          size: '',
           generatedAudio: 'provider_default',
-          seed: ''
+          seed: '',
+          advancedJson: ''
         }
       },
       jobs: [],
@@ -57,6 +74,7 @@
   let isPreparing = $state(false);
   let isSubmitting = $state(false);
   let mediaBusy = $state(false);
+  let remoteBusy = $state(false);
   let dropActive = $state(false);
   let showRemoteForm = $state(false);
   let remoteUrl = $state('');
@@ -68,10 +86,13 @@
   let liveMessage = $state('');
   let providerKeys = $state<Record<ProviderId, string>>({ openrouter: '', fal: '' });
   let providerRemember = $state<Record<ProviderId, boolean>>({ openrouter: true, fal: true });
-  let providerBusy = $state<ProviderId | null>(null);
-  let holdBusy = $state<string | null>(null);
+  let providerBusy = $state<Record<ProviderId, boolean>>({ openrouter: false, fal: false });
+  let holdBusy = $state<Record<string, boolean>>({});
+  type MonitorAction = 'pause' | 'resume';
+  let monitorBusy = $state<Record<string, MonitorAction | undefined>>({});
   let confirmedSafetyHolds = $state<Record<string, boolean>>({});
   let playbackUrl = $state('');
+  let playbackReleaseError = $state('');
   let playbackGrantId = '';
   let playbackBusy = $state(false);
   let playbackEpoch = 0;
@@ -80,69 +101,81 @@
   let jobIdentifierElement = $state<HTMLElement>();
   let outputBusy = $state(false);
   let deleteBusy = $state(false);
+  let deleteError = $state('');
+  let reviewError = $state('');
+  let closeBusy = $state(false);
+  let closeCancelBusy = $state(false);
+  let closeCancelFailed = $state(false);
+  let closeCommitted = $state(false);
+  let closeErrorTitle = $state('');
+  let closeError = $state('');
+  let closeWaitMessage = $state('');
+  let closeRequestedAfterSubmission = $state(false);
+  let activeCloseRequestId: number | undefined;
+  const closeAcknowledgements = new Map<number, Promise<void>>();
   let copiedJobId = $state('');
   let reviewDialog: HTMLDialogElement;
   let uploadDialog: HTMLDialogElement;
   let deleteDialog: HTMLDialogElement;
+  let closeDialog: HTMLDialogElement;
   let dropZone = $state<HTMLDivElement>();
+  let jobsHeadingElement = $state<HTMLElement>();
   let saveTimer: number | undefined;
   let noticeTimer: number | undefined;
   let copyTimer: number | undefined;
+  let announceTimer: number | undefined;
+  let latestDraft = $state<GenerationDraft>();
+  let saveQueue: Promise<void> = Promise.resolve();
+  let pendingSave: { revision: number; promise: Promise<void> } | undefined;
+  let selectionEpoch = 0;
+  let monitorTimers: Record<string, number> = {};
 
   let providerModels = $derived(
     snapshot.models.filter((model) => model.providerId === snapshot.draft.providerId)
   );
   let selectedModel = $derived(
-    providerModels.find((model) => model.id === snapshot.draft.modelId)
+    modelById(snapshot, snapshot.draft.providerId, snapshot.draft.modelId)
   );
-  let selectedProvider = $derived(
-    snapshot.providers.find((provider) => provider.id === snapshot.draft.providerId)
-  );
-  let falProvider = $derived(snapshot.providers.find((provider) => provider.id === 'fal'));
   let selectedJob = $derived(snapshot.jobs.find((job) => job.id === snapshot.selectedJobId));
   let selectedJobIdentifier = $derived(selectedJob?.providerJobId ?? selectedJob?.id ?? '');
-  let activeJobCount = $derived(snapshot.jobs.filter((job) => isActiveJob(job.status)).length);
+  let activeJobCount = $derived(snapshot.jobs.filter(isActivelyMonitored).length);
   let requiresOpenRouterUpload = $derived(
     snapshot.draft.providerId === 'openrouter' &&
       snapshot.draft.media.some((item) => item.source === 'local')
   );
-  let hasCompatibleMedia = $derived(
-    !snapshot.draft.media.some(
-      (item) =>
-        (item.kind === 'image' && !selectedModel?.capabilities.images) ||
-        (item.kind === 'video' && !selectedModel?.capabilities.video) ||
-        (item.kind === 'audio' && !selectedModel?.capabilities.audioReferences)
-    )
-  );
+  let readinessIssue = $derived(reviewReadinessIssue(snapshot, ready));
   let canReview = $derived(
-    ready &&
-      !isPreparing &&
-      snapshot.draft.prompt.trim().length > 0 &&
-      Boolean(selectedModel) &&
-      Boolean(selectedProvider?.connected) &&
-      (!requiresOpenRouterUpload || Boolean(falProvider?.connected)) &&
-      hasCompatibleMedia
+    ready && !isPreparing && !isSubmitting && readinessIssue === undefined
   );
-  let filteredJobs = $derived.by(() => {
-    const query = jobSearch.trim().toLowerCase();
+  function matchingJobs(
+    search: string,
+    filter: 'all' | 'active' | 'attention' | 'completed'
+  ): JobSummary[] {
+    const query = search.trim().toLowerCase();
     return snapshot.jobs.filter((job) => {
       const matchesText =
         !query ||
         job.prompt.toLowerCase().includes(query) ||
         job.modelName.toLowerCase().includes(query) ||
-        job.id.toLowerCase().includes(query);
+        job.providerName.toLowerCase().includes(query) ||
+        job.statusLabel.toLowerCase().includes(query) ||
+        job.id.toLowerCase().includes(query) ||
+        job.providerJobId?.toLowerCase().includes(query);
       const matchesFilter =
-        jobFilter === 'all' ||
-        (jobFilter === 'active' && isActiveJob(job.status)) ||
-        (jobFilter === 'attention' && (job.status === 'attention' || job.status === 'paused')) ||
-        (jobFilter === 'completed' && job.status === 'completed');
+        filter === 'all' ||
+        (filter === 'active' && isActivelyMonitored(job)) ||
+        (filter === 'attention' && (job.status === 'attention' || job.status === 'paused')) ||
+        (filter === 'completed' && job.status === 'completed');
       return matchesText && matchesFilter;
     });
-  });
+  }
+
+  let filteredJobs = $derived(matchingJobs(jobSearch, jobFilter));
 
   function announce(message: string): void {
     liveMessage = '';
-    window.setTimeout(() => (liveMessage = message), 20);
+    if (announceTimer) window.clearTimeout(announceTimer);
+    announceTimer = window.setTimeout(() => (liveMessage = message), 20);
   }
 
   function showNotice(
@@ -150,7 +183,6 @@
     tone: 'neutral' | 'good' | 'warning' | 'danger' = 'neutral'
   ): void {
     notice = { message, tone };
-    announce(message);
     if (noticeTimer) window.clearTimeout(noticeTimer);
     noticeTimer = window.setTimeout(() => (notice = null), tone === 'danger' ? 8_000 : 4_500);
   }
@@ -159,6 +191,9 @@
     const replay = bufferedEvents.sort((left, right) => left.seq - right.seq);
     bufferedEvents = [];
     for (const envelope of replay) {
+      if (requiresImmediateHandling(envelope.event)) {
+        handleCloseRequest(envelope.event.requestId);
+      }
       if (!acceptingEvents) bufferedEvents.push(envelope);
       else if (envelope.seq > sequence) consumeEvent(envelope);
     }
@@ -170,40 +205,71 @@
     resyncInFlight = (async () => {
       try {
         const current = await bridge.getSnapshot();
-        snapshot = reconcileSnapshot(snapshot, current.snapshot);
+        const previous = $state.snapshot(snapshot);
+        snapshot = reconcileSnapshot(snapshot, current.snapshot, { preserveSelection: false });
         sequence = current.seq;
+        reconcileTransientState(previous, snapshot, { operations: current });
       } catch (error) {
         showNotice(errorMessage(error), 'danger');
       } finally {
+        // A replay can itself expose a second gap. Release this promise before
+        // replaying so that gap starts a fresh authoritative snapshot request.
+        resyncInFlight = undefined;
         acceptingEvents = true;
         replayBufferedEvents();
-        resyncInFlight = undefined;
+        if (activeCloseRequestId !== undefined && !closeCommitted) {
+          handleCloseRequest(activeCloseRequestId);
+        }
       }
     })();
     return resyncInFlight;
   }
 
   function consumeEvent(envelope: UiEventEnvelope): void {
+    if (envelope.seq <= sequence) return;
+    const previous = $state.snapshot(snapshot);
     const result = applySequencedEvent(snapshot, sequence, envelope);
     snapshot = result.snapshot;
     sequence = result.seq;
-    if (result.gap) void resyncSnapshot();
+    if (result.gap) {
+      void resyncSnapshot();
+      return;
+    }
 
     const event = envelope.event;
     if (event.type === 'snapshot_changed') {
-      if (!event.snapshot.preparedReview) reviewDialog?.close();
+      // Catalog, history, and safety-state snapshots are routine background
+      // updates. They do not authoritatively end an in-flight Review or paid
+      // submission, and loading history must not navigate away from Create.
+      reconcileTransientState(previous, snapshot, { detectAddedJob: false });
     } else if (event.type === 'review_ready') {
       isPreparing = false;
+      if (event.review.revision !== snapshot.draft.revision) {
+        snapshot = { ...snapshot, preparedReview: undefined };
+        void bridge
+          .invalidatePrepared(snapshot.draft.revision)
+          .catch((error) => showNotice(errorMessage(error), 'danger'));
+        showNotice('That Review belonged to an older edit. Prepare the latest scene instead.', 'warning');
+        return;
+      }
+      reviewError = '';
       announce('Review ready. Nothing paid happens until you press Generate.');
       window.setTimeout(() => reviewDialog?.showModal(), 0);
     } else if (event.type === 'job_added') {
       isSubmitting = false;
+      reviewError = '';
       reviewDialog?.close();
+      jobSearch = '';
+      jobFilter = 'all';
       activeView = 'jobs';
       announce('The provider accepted your request. Tiny Cloud Cinema is keeping watch.');
+      void focusJobsHeading();
+      resumeDeferredClose();
     } else if (event.type === 'review_invalidated') {
       isPreparing = false;
+      isSubmitting = false;
       reviewDialog?.close();
+      resumeDeferredClose();
     } else if (event.type === 'operation_failed') {
       if (event.operation === 'preparation') isPreparing = false;
       else {
@@ -211,18 +277,139 @@
         reviewDialog?.close();
       }
       showNotice(event.message, 'danger');
-    } else if (event.type === 'job_updated' && event.job.status === 'completed') {
-      announce('Your video is ready to watch.');
+      resumeDeferredClose();
+    } else if (event.type === 'job_updated') {
+      settleMonitorBusy(event.job);
+      if (event.job.status === 'completed') announce('Your video is ready to watch.');
     } else if (event.type === 'job_removed') {
+      clearMonitorBusy(event.jobId);
       deleteDialog?.close();
+      deleteError = '';
+      void ensureVisibleJobSelection();
+    } else if (event.type === 'draft_saved') {
+      if (latestDraft?.revision === event.revision && snapshot.draft.revision === event.revision) {
+        latestDraft = undefined;
+      }
     } else if (event.type === 'notice') {
+      if (closeDialog?.open && (closeBusy || closeCommitted)) {
+        closeWaitMessage = event.message;
+      }
       showNotice(event.message, event.tone);
+    } else if (event.type === 'close_requested') {
+      handleCloseRequest(event.requestId);
     }
   }
 
   function receiveEvent(envelope: UiEventEnvelope): void {
+    if (requiresImmediateHandling(envelope.event)) {
+      const canActImmediately = acceptingEvents && envelope.seq === sequence + 1;
+      handleCloseRequest(envelope.event.requestId, canActImmediately);
+    }
     if (!acceptingEvents) bufferedEvents.push(envelope);
     else consumeEvent(envelope);
+  }
+
+  function acknowledgeCloseRequest(requestId: number): Promise<void> {
+    const existing = closeAcknowledgements.get(requestId);
+    if (existing) return existing;
+    const operation = bridge.acknowledgeCloseRequest(requestId);
+    closeAcknowledgements.set(requestId, operation);
+    void operation.then(
+      () => undefined,
+      () => {
+        if (closeAcknowledgements.get(requestId) === operation) {
+          closeAcknowledgements.delete(requestId);
+        }
+      }
+    );
+    return operation;
+  }
+
+  function handleCloseRequest(requestId: number, allowSave = true): void {
+    void acknowledgeCloseRequest(requestId).catch(() => undefined);
+    if (closeCommitted) return;
+    // Native request IDs increase for each completed/cancelled close cycle.
+    // Keep the newest edge even while an older cancellation promise is still
+    // settling; otherwise its acknowledged watchdog would have no UI owner.
+    if (activeCloseRequestId === undefined || requestId >= activeCloseRequestId) {
+      activeCloseRequestId = requestId;
+    }
+    if (activeCloseRequestId !== requestId || !allowSave || !ready) return;
+    void beginCloseSave();
+  }
+
+  function reconcileTransientState(
+    previous: AppSnapshot,
+    current: AppSnapshot,
+    options: {
+      detectAddedJob?: boolean;
+      operations?: Pick<OpenSessionResult, 'preparing' | 'submitting'>;
+    } = {}
+  ): void {
+    const review = current.preparedReview;
+    const reviewIsCurrent = Boolean(review && review.revision === current.draft.revision);
+    if (options.operations) {
+      isPreparing = options.operations.preparing;
+      isSubmitting = options.operations.submitting;
+      if (isPreparing || !reviewIsCurrent) {
+        reviewError = '';
+        reviewDialog?.close();
+      } else if (review) {
+        const reviewChanged = previous.preparedReview?.preparedId !== review.preparedId;
+        if (reviewChanged && !isPreparing && !isSubmitting) {
+          announce('Review restored after refreshing the desktop session.');
+          window.setTimeout(() => {
+            if (!reviewDialog?.open) reviewDialog?.showModal();
+          }, 0);
+        }
+      }
+    } else if (
+      previous.preparedReview &&
+      !reviewIsCurrent &&
+      !isSubmitting
+    ) {
+      reviewError = '';
+      reviewDialog?.close();
+    }
+
+    const previousIds = new Set(previous.jobs.map((job) => job.id));
+    const addedJob =
+      options.detectAddedJob === false
+        ? undefined
+        : current.jobs.find((job) => !previousIds.has(job.id));
+    if (addedJob) {
+      isSubmitting = false;
+      jobSearch = '';
+      jobFilter = 'all';
+      activeView = 'jobs';
+      announce('A render was recovered after refreshing the desktop session.');
+      void focusJobsHeading();
+    }
+
+    if (
+      deleteDialog?.open &&
+      previous.selectedJobId &&
+      !current.jobs.some((job) => job.id === previous.selectedJobId)
+    ) {
+      deleteBusy = false;
+      deleteError = '';
+      deleteDialog.close();
+    }
+
+    for (const jobId of Object.keys(monitorBusy)) {
+      const after = current.jobs.find((job) => job.id === jobId);
+      if (!after) {
+        clearMonitorBusy(jobId);
+      } else {
+        settleMonitorBusy(after);
+      }
+    }
+    void ensureVisibleJobSelection();
+  }
+
+  async function focusJobsHeading(): Promise<void> {
+    await tick();
+    jobsHeadingElement?.focus();
   }
 
   onMount(() => {
@@ -233,28 +420,60 @@
       .openSession(receiveEvent)
       .then((session) => {
         if (disposed) return;
-        snapshot = reconcileSnapshot(snapshot, session.snapshot);
+        const previous = $state.snapshot(snapshot);
+        snapshot = reconcileSnapshot(snapshot, session.snapshot, { preserveSelection: false });
         sequence = session.seq;
         acceptingEvents = true;
-        replayBufferedEvents();
         ready = true;
+        reconcileTransientState(previous, snapshot, {
+          detectAddedJob: false,
+          operations: session
+        });
+        replayBufferedEvents();
+        if (activeCloseRequestId !== undefined && !closeCommitted) {
+          handleCloseRequest(activeCloseRequestId);
+        }
       })
       .catch((error) => {
         sessionFailed = errorMessage(error);
         ready = false;
+        if (activeCloseRequestId !== undefined) {
+          closeErrorTitle = 'The draft could not be loaded safely.';
+          closeError =
+            'Video Harness acknowledged the close request but stayed open. Choose Keep working to cancel it.';
+          window.setTimeout(() => closeDialog?.showModal(), 0);
+        }
       });
 
-    void bridge.watchFileDrops(handleNativeDrop).then((subscription) => {
-      if (disposed) subscription.close();
-      else dropSubscription = subscription;
-    });
+    void bridge
+      .watchFileDrops(handleNativeDrop)
+      .then((subscription) => {
+        if (disposed) subscription.close();
+        else dropSubscription = subscription;
+      })
+      .catch((error) => {
+        if (!disposed) {
+          showNotice(`File dropping is unavailable. ${errorMessage(error)} Use Choose files instead.`, 'warning');
+        }
+      });
+
+    const flushForLifecycle = () => {
+      if (!snapshot.draftSaved) void flushLatestDraft(false).catch(() => undefined);
+    };
+    window.addEventListener('pagehide', flushForLifecycle);
+    window.addEventListener('blur', flushForLifecycle);
 
     return () => {
       disposed = true;
       dropSubscription?.close();
-      if (saveTimer) window.clearTimeout(saveTimer);
+      window.removeEventListener('pagehide', flushForLifecycle);
+      window.removeEventListener('blur', flushForLifecycle);
+      if (!snapshot.draftSaved) void flushLatestDraft(false).catch(() => undefined);
+      else if (saveTimer) window.clearTimeout(saveTimer);
       if (noticeTimer) window.clearTimeout(noticeTimer);
       if (copyTimer) window.clearTimeout(copyTimer);
+      if (announceTimer) window.clearTimeout(announceTimer);
+      for (const timer of Object.values(monitorTimers)) window.clearTimeout(timer);
       playbackEpoch += 1;
       void releasePlayback();
     };
@@ -273,11 +492,141 @@
     }
   }
 
+  function queueDraftSave(draft: GenerationDraft, reportErrors = true): Promise<void> {
+    if (pendingSave?.revision === draft.revision) return pendingSave.promise;
+    const payload = cloneDraft(draft);
+    const operation = saveQueue.then(() => bridge.saveDraft(payload));
+    saveQueue = operation.then(
+      () => undefined,
+      () => undefined
+    );
+    pendingSave = { revision: payload.revision, promise: operation };
+    void operation.then(
+      () => {
+        if (pendingSave?.promise === operation) pendingSave = undefined;
+      },
+      (error) => {
+        if (pendingSave?.promise === operation) pendingSave = undefined;
+        if (reportErrors) showNotice(errorMessage(error), 'danger');
+      }
+    );
+    return operation;
+  }
+
   function scheduleDraftSave(draft: GenerationDraft): void {
+    latestDraft = cloneDraft(draft);
     if (saveTimer) window.clearTimeout(saveTimer);
     saveTimer = window.setTimeout(() => {
-      void bridge.saveDraft(draft).catch((error) => showNotice(errorMessage(error), 'danger'));
+      saveTimer = undefined;
+      void queueDraftSave(draft).catch(() => undefined);
     }, 650);
+  }
+
+  function flushLatestDraft(reportErrors = true): Promise<void> {
+    if (saveTimer) {
+      window.clearTimeout(saveTimer);
+      saveTimer = undefined;
+    }
+    const draft = latestDraft ?? draftSnapshot();
+    if (snapshot.draftSaved && !latestDraft) return saveQueue;
+    return queueDraftSave(draft, reportErrors);
+  }
+
+  async function beginCloseSave(): Promise<void> {
+    if (closeCommitted || closeCancelBusy) return;
+    const requestId = activeCloseRequestId;
+    if (requestId === undefined) return;
+    if (isSubmitting) {
+      closeRequestedAfterSubmission = true;
+      announce('Close requested. Waiting for the paid submission outcome first.');
+      return;
+    }
+    uploadDialog?.close();
+    deleteDialog?.close();
+    reviewDialog?.close();
+    if (!closeDialog?.open) closeDialog?.showModal();
+    if (closeBusy) return;
+    closeBusy = true;
+    closeCancelFailed = false;
+    closeErrorTitle = '';
+    closeError = '';
+    closeWaitMessage = '';
+    if (saveTimer) {
+      window.clearTimeout(saveTimer);
+      saveTimer = undefined;
+    }
+    const closingDraft = cloneDraft(latestDraft ?? draftSnapshot());
+    try {
+      try {
+        await acknowledgeCloseRequest(requestId);
+      } catch {
+        closeErrorTitle = 'The close request could not be confirmed.';
+        closeError =
+          'Video Harness stayed open. Retry save and close, or choose Keep working.';
+        return;
+      }
+      await saveQueue;
+      await bridge.saveDraftAndClose(closingDraft, requestId);
+      if (bridge.mode === 'browser-demo') {
+        closeBusy = false;
+        activeCloseRequestId = undefined;
+        closeAcknowledgements.delete(requestId);
+        closeDialog.close();
+        showNotice('Demo draft saved. The browser tab stays open in demo mode.', 'good');
+      } else {
+        closeCommitted = true;
+      }
+    } catch (error) {
+      closeErrorTitle = 'The draft wasn’t saved, so the app stayed open.';
+      closeError = errorMessage(error);
+    } finally {
+      if (!closeCommitted) closeBusy = false;
+    }
+  }
+
+  async function cancelCloseRequest(): Promise<void> {
+    if (closeBusy || closeCancelBusy || closeCommitted) return;
+    const requestId = activeCloseRequestId;
+    if (requestId === undefined) {
+      closeDialog.close();
+      return;
+    }
+    closeCancelBusy = true;
+    closeCancelFailed = false;
+    closeErrorTitle = '';
+    closeError = '';
+    try {
+      await bridge.cancelCloseRequest(requestId);
+      closeAcknowledgements.delete(requestId);
+      closeRequestedAfterSubmission = false;
+      closeWaitMessage = '';
+      if (activeCloseRequestId === requestId) {
+        activeCloseRequestId = undefined;
+        closeDialog.close();
+      }
+    } catch {
+      if (activeCloseRequestId === requestId) {
+        closeCancelFailed = true;
+        closeErrorTitle = 'The close request is still active.';
+        closeError =
+          'Video Harness could not safely cancel it. Retry Keep working, or save and close.';
+      }
+    } finally {
+      closeCancelBusy = false;
+      if (
+        activeCloseRequestId !== undefined &&
+        activeCloseRequestId !== requestId &&
+        !closeCommitted
+      ) {
+        handleCloseRequest(activeCloseRequestId);
+      }
+    }
+  }
+
+  function resumeDeferredClose(): void {
+    if (!closeRequestedAfterSubmission || isSubmitting) return;
+    closeRequestedAfterSubmission = false;
+    window.setTimeout(() => void beginCloseSave(), 0);
   }
 
   function draftSnapshot(): GenerationDraft {
@@ -287,6 +636,14 @@
     return $state.snapshot(snapshot.draft);
   }
 
+  function cloneDraft(draft: GenerationDraft): GenerationDraft {
+    return {
+      ...draft,
+      media: draft.media.map((item) => ({ ...item })),
+      settings: { ...draft.settings }
+    };
+  }
+
   function editDraft(change: (draft: GenerationDraft) => void): void {
     const hadReview = Boolean(snapshot.preparedReview);
     const hadActivePreparation = isPreparing;
@@ -294,10 +651,13 @@
     change(draft);
     draft.revision += 1;
     snapshot = { ...snapshot, draft, preparedReview: undefined, draftSaved: false };
+    latestDraft = cloneDraft(draft);
     if (hadReview || hadActivePreparation) {
       isPreparing = false;
       reviewDialog?.close();
-      void bridge.invalidatePrepared(draft.revision);
+      void bridge
+        .invalidatePrepared(draft.revision)
+        .catch((error) => showNotice(errorMessage(error), 'danger'));
     }
     scheduleDraftSave(draft);
   }
@@ -307,31 +667,91 @@
     editDraft((draft) => {
       draft.providerId = providerId;
       draft.modelId = firstModel?.id ?? '';
-      if (firstModel) {
-        draft.settings.duration = firstModel.durationOptions[0] ?? '';
-        draft.settings.resolution = firstModel.resolutionOptions[0] ?? '';
-        draft.settings.aspectRatio = firstModel.aspectRatioOptions[0] ?? '';
-      }
+      normalizeDraftForModel(draft, firstModel, { chooseDefaults: true, clearAdvanced: true });
     });
+    normalizeRemoteControls(firstModel);
   }
 
   function changeModel(modelId: string): void {
     const model = providerModels.find((item) => item.id === modelId);
     editDraft((draft) => {
       draft.modelId = modelId;
-      if (model) {
-        draft.settings.duration = model.durationOptions[0] ?? '';
-        draft.settings.resolution = model.resolutionOptions[0] ?? '';
-        draft.settings.aspectRatio = model.aspectRatioOptions[0] ?? '';
-        if (!model.capabilities.generatedAudio) draft.settings.generatedAudio = 'provider_default';
+      normalizeDraftForModel(draft, model, { chooseDefaults: true, clearAdvanced: true });
+    });
+    normalizeRemoteControls(model);
+  }
+
+  function normalizeRemoteControls(model: ModelSummary | undefined): void {
+    const supportsCurrent =
+      !model ||
+      (remoteKind === 'image' && modelSupportsImages(model)) ||
+      (remoteKind === 'video' && model.capabilities.video) ||
+      (remoteKind === 'audio' && model.capabilities.audioReferences);
+    if (!supportsCurrent && model) {
+      remoteKind = modelSupportsImages(model)
+        ? 'image'
+        : model.capabilities.video
+          ? 'video'
+          : model.capabilities.audioReferences
+            ? 'audio'
+            : 'image';
+    }
+    if (remoteKind === 'video') remoteRole = 'video_reference';
+    else if (remoteKind === 'audio') remoteRole = 'audio_reference';
+    else {
+      const roles = imageRoleOptions(model);
+      if (!roles.some((option) => option.value === remoteRole)) {
+        remoteRole = roles[0]?.value ?? 'reference';
+      }
+    }
+  }
+
+  function changeResolution(value: string): void {
+    editDraft((draft) => {
+      draft.settings.resolution = value;
+      if (value) draft.settings.size = '';
+    });
+  }
+
+  function changeAspectRatio(value: string): void {
+    editDraft((draft) => {
+      draft.settings.aspectRatio = value;
+      if (value) draft.settings.size = '';
+    });
+  }
+
+  function changeOutputSize(value: string): void {
+    editDraft((draft) => {
+      draft.settings.size = value;
+      if (value) {
+        draft.settings.resolution = '';
+        draft.settings.aspectRatio = '';
       }
     });
   }
 
-  function appendMedia(items: MediaItem[]): void {
-    if (items.length === 0) return;
-    editDraft((draft) => draft.media.push(...items));
-    showNotice(`${items.length} ${items.length === 1 ? 'reference' : 'references'} tucked in.`, 'good');
+  function appendMedia(items: MediaItem[]): number {
+    if (items.length === 0) return 0;
+    const { accepted, skipped } = constrainMediaAppend(
+      snapshot.draft.media,
+      items,
+      selectedModel
+    );
+    if (accepted.length > 0) editDraft((draft) => draft.media.push(...accepted));
+    if (skipped > 0) {
+      showNotice(
+        accepted.length > 0
+          ? `${accepted.length} added; ${skipped} skipped to stay within this model’s media limits.`
+          : 'No references were added because this model or draft has no room for them.',
+        'warning'
+      );
+    } else {
+      showNotice(
+        `${accepted.length} ${accepted.length === 1 ? 'reference' : 'references'} tucked in.`,
+        'good'
+      );
+    }
+    return accepted.length;
   }
 
   async function chooseMedia(): Promise<void> {
@@ -388,6 +808,8 @@
   }
 
   async function addRemoteReference(): Promise<void> {
+    if (remoteBusy) return;
+    remoteBusy = true;
     try {
       const role =
         remoteKind === 'video'
@@ -396,11 +818,14 @@
             ? 'audio_reference'
             : remoteRole;
       const item = await bridge.addRemoteMedia(remoteUrl.trim(), remoteKind, role);
-      appendMedia([item]);
-      remoteUrl = '';
-      showRemoteForm = false;
+      if (appendMedia([item]) > 0) {
+        remoteUrl = '';
+        showRemoteForm = false;
+      }
     } catch (error) {
       showNotice(errorMessage(error), 'danger');
+    } finally {
+      remoteBusy = false;
     }
   }
 
@@ -435,6 +860,7 @@
   async function prepareReview(localMediaUploadConfirmed: boolean): Promise<void> {
     uploadDialog?.close();
     isPreparing = true;
+    reviewError = '';
     announce('Preparing your Review and a fresh price estimate.');
     if (saveTimer) {
       window.clearTimeout(saveTimer);
@@ -445,7 +871,7 @@
       // Wait for the exact revision to be durably acknowledged before
       // preparation. A delayed SaveDraft must never arrive behind
       // PrepareGeneration and cancel its active work.
-      await bridge.saveDraft(reviewedDraft);
+      await queueDraftSave(reviewedDraft, false);
       if (snapshot.draft.revision !== reviewedDraft.revision) {
         isPreparing = false;
         showNotice('The scene changed while saving. Review the latest take instead.', 'warning');
@@ -462,69 +888,137 @@
     const review = snapshot.preparedReview;
     if (!review || isSubmitting) return;
     isSubmitting = true;
+    reviewError = '';
     try {
       await bridge.submitPrepared(review.preparedId);
     } catch (error) {
       isSubmitting = false;
-      showNotice(errorMessage(error), 'danger');
+      reviewError = errorMessage(error);
+      resumeDeferredClose();
     }
   }
 
+  function closeReview(): void {
+    if (isSubmitting) {
+      reviewError = 'The paid request is already being submitted. Keep this window open until its outcome is known.';
+      return;
+    }
+    reviewError = '';
+    reviewDialog.close();
+  }
+
   async function connectProvider(providerId: ProviderId): Promise<void> {
+    if (providerBusy[providerId]) return;
     const key = providerKeys[providerId].trim();
     if (!key) {
       showNotice('Paste a key first.', 'warning');
       return;
     }
     providerKeys[providerId] = '';
-    providerBusy = providerId;
+    providerBusy[providerId] = true;
     try {
       await bridge.connectProvider(providerId, key, providerRemember[providerId]);
     } catch (error) {
       showNotice(errorMessage(error), 'danger');
     } finally {
-      providerBusy = null;
+      providerBusy[providerId] = false;
     }
   }
 
   async function forgetProvider(providerId: ProviderId): Promise<void> {
-    providerBusy = providerId;
+    if (providerBusy[providerId]) return;
+    providerBusy[providerId] = true;
     try {
       await bridge.forgetProvider(providerId);
     } catch (error) {
       showNotice(errorMessage(error), 'danger');
     } finally {
-      providerBusy = null;
+      providerBusy[providerId] = false;
     }
   }
 
   async function acknowledgeSafetyHold(handle: string): Promise<void> {
-    if (!confirmedSafetyHolds[handle]) return;
-    holdBusy = handle;
+    if (!confirmedSafetyHolds[handle] || holdBusy[handle]) return;
+    holdBusy[handle] = true;
     try {
       await bridge.acknowledgeSafetyHold(handle);
       showNotice('Dashboard check sent. You can Review this exact request once the hold clears.', 'good');
     } catch (error) {
       showNotice(errorMessage(error), 'danger');
     } finally {
-      holdBusy = null;
+      holdBusy[handle] = false;
     }
   }
 
-  async function selectJob(jobId: string): Promise<void> {
+  async function selectJob(jobId: string | undefined): Promise<void> {
+    const requestEpoch = ++selectionEpoch;
     if (snapshot.selectedJobId !== jobId) {
       playbackEpoch += 1;
       await releasePlayback();
     }
+    if (requestEpoch !== selectionEpoch) return;
     snapshot = { ...snapshot, selectedJobId: jobId };
   }
 
+  function ensureVisibleJobSelection(
+    search = jobSearch,
+    filter: 'all' | 'active' | 'attention' | 'completed' = jobFilter
+  ): Promise<void> {
+    const visible = matchingJobs(search, filter);
+    const selectedIsVisible = visible.some((job) => job.id === snapshot.selectedJobId);
+    return selectedIsVisible ? Promise.resolve() : selectJob(visible[0]?.id);
+  }
+
+  function updateJobSearch(value: string): void {
+    jobSearch = value;
+    void ensureVisibleJobSelection(value, jobFilter);
+  }
+
+  function updateJobFilter(value: 'all' | 'active' | 'attention' | 'completed'): void {
+    jobFilter = value;
+    void ensureVisibleJobSelection(jobSearch, value);
+  }
+
+  function canResumeMonitoring(job: JobSummary): boolean {
+    return job.canResume ?? job.status === 'paused';
+  }
+
+  function canPauseMonitoring(job: JobSummary): boolean {
+    return job.canPause ?? isActivelyMonitored(job);
+  }
+
+  function clearMonitorBusy(jobId: string): void {
+    delete monitorBusy[jobId];
+    if (monitorTimers[jobId]) window.clearTimeout(monitorTimers[jobId]);
+    delete monitorTimers[jobId];
+  }
+
+  function settleMonitorBusy(job: JobSummary): void {
+    const action = monitorBusy[job.id];
+    if (!action) return;
+    const terminal = job.monitorState === 'terminal';
+    const reachedTarget =
+      action === 'pause'
+        ? canResumeMonitoring(job)
+        : job.monitorState === 'active' && canPauseMonitoring(job);
+    if (terminal || reachedTarget) clearMonitorBusy(job.id);
+  }
+
   async function toggleJobMonitoring(): Promise<void> {
-    if (!selectedJob) return;
+    const job = selectedJob;
+    if (!job || monitorBusy[job.id]) return;
+    const resume = canResumeMonitoring(job);
+    if (!resume && !canPauseMonitoring(job)) return;
+    monitorBusy[job.id] = resume ? 'resume' : 'pause';
+    monitorTimers[job.id] = window.setTimeout(() => {
+      clearMonitorBusy(job.id);
+      showNotice('The monitoring change is taking longer than expected. Check the latest job status.', 'warning');
+    }, 15_000);
     try {
-      if (selectedJob.status === 'paused') await bridge.resumeJob(selectedJob.id);
-      else await bridge.pauseJob(selectedJob.id);
+      if (resume) await bridge.resumeJob(job.id);
+      else await bridge.pauseJob(job.id);
     } catch (error) {
+      clearMonitorBusy(job.id);
       showNotice(errorMessage(error), 'danger');
     }
   }
@@ -539,12 +1033,14 @@
   }
 
   async function releaseGrant(grantId: string): Promise<boolean> {
+    playbackReleaseError = '';
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
         await bridge.releasePlayback(grantId);
         return true;
       } catch (error) {
         if (attempt === 4) {
+          playbackReleaseError = errorMessage(error);
           showNotice(
             `${errorMessage(error)} The private playback cache will be cleaned on the next launch.`,
             'warning'
@@ -579,7 +1075,7 @@
 
   async function loadPlayback(): Promise<boolean> {
     const job = selectedJob;
-    if (!job || job.status !== 'completed' || playbackBusy) return false;
+    if (!job || job.status !== 'completed' || !job.hasLocalOutput || playbackBusy) return false;
     const requestEpoch = playbackEpoch;
     playbackBusy = true;
     try {
@@ -622,7 +1118,7 @@
   }
 
   async function openSelectedOutput(): Promise<void> {
-    if (!selectedJob || selectedJob.status !== 'completed' || outputBusy) return;
+    if (!selectedJob || selectedJob.status !== 'completed' || !selectedJob.hasLocalOutput || outputBusy) return;
     outputBusy = true;
     try {
       await bridge.openOutput(selectedJob.id);
@@ -685,6 +1181,7 @@
 
   function askToDeleteRender(): void {
     if (!selectedJob?.deletable) return;
+    deleteError = '';
     deleteDialog.showModal();
   }
 
@@ -694,7 +1191,10 @@
     deleteBusy = true;
     try {
       playbackEpoch += 1;
-      if (!(await releasePlayback())) return;
+      if (!(await releasePlayback())) {
+        deleteError = playbackReleaseError || 'The in-app video could not be stopped safely.';
+        return;
+      }
       await bridge.deleteRender(job.id, deleteOutput);
       deleteDialog.close();
       announce('Render removed from your reel.');
@@ -703,7 +1203,7 @@
         'good'
       );
     } catch (error) {
-      showNotice(errorMessage(error), 'danger');
+      deleteError = errorMessage(error);
     } finally {
       deleteBusy = false;
     }
@@ -720,10 +1220,12 @@
     return labels[role];
   }
 
-  function statusTone(status: JobStatus): string {
-    if (status === 'completed') return 'good';
-    if (status === 'attention') return 'danger';
-    if (status === 'paused') return 'warning';
+  function statusTone(job: JobSummary): string {
+    if (job.status === 'completed') return 'good';
+    if (job.status === 'attention') return 'danger';
+    if (job.monitorState === 'paused' || job.monitorState === 'recoverable' || job.status === 'paused') {
+      return 'warning';
+    }
     return 'active';
   }
 
@@ -737,24 +1239,9 @@
   }
 
   function compatibilityMessage(): string {
-    if (!selectedProvider?.connected) return `Connect ${selectedProvider?.name ?? 'a provider'} backstage.`;
-    if (!snapshot.draft.prompt.trim()) return 'Add your idea above.';
-    if (!selectedModel) return 'Pick a model.';
-    const unsupported = snapshot.draft.media.filter(
-      (item) =>
-        (item.kind === 'image' && !selectedModel?.capabilities.images) ||
-        (item.kind === 'video' && !selectedModel?.capabilities.video) ||
-        (item.kind === 'audio' && !selectedModel?.capabilities.audioReferences)
-    );
-    if (unsupported.length > 0) {
-      return unsupported.length === 1
-        ? 'This model can’t use this reference.'
-        : `This model can’t use these ${unsupported.length} references.`;
-    }
-    if (requiresOpenRouterUpload && !falProvider?.connected) {
-      return 'Connect fal.ai backstage to carry these files to OpenRouter.';
-    }
-    return 'All set for Review.';
+    if (isSubmitting) return 'Submitting the paid request once…';
+    if (isPreparing) return 'Preparing a fresh Review…';
+    return readinessIssue ?? 'All set for Review.';
   }
 </script>
 
@@ -833,6 +1320,7 @@
               placeholder="A tiny night train rolls through clouds, its windows glowing like fireflies…"
               bind:value={snapshot.draft.prompt}
               oninput={(event) => editDraft((draft) => (draft.prompt = event.currentTarget.value))}
+              onblur={() => void flushLatestDraft().catch(() => undefined)}
             ></textarea>
             <div class="prompt-footnote">
               <p>Motion, light, framing, pace—the little things make the shot.</p>
@@ -871,13 +1359,13 @@
             </div>
 
             <div class="reference-tools">
-              <button class="text-button" aria-expanded={showRemoteForm} onclick={() => (showRemoteForm = !showRemoteForm)}>
+              <button class="text-button" aria-expanded={showRemoteForm} aria-controls="remote-reference-form" onclick={() => (showRemoteForm = !showRemoteForm)}>
                 <span aria-hidden="true">＋</span> Or add a public link
               </button>
             </div>
 
             {#if showRemoteForm}
-              <form class="remote-form" onsubmit={(event) => { event.preventDefault(); void addRemoteReference(); }}>
+              <form id="remote-reference-form" class="remote-form" aria-busy={remoteBusy} onsubmit={(event) => { event.preventDefault(); void addRemoteReference(); }}>
                 <label class="field field--wide">
                   <span>Public HTTPS URL</span>
                   <input bind:value={remoteUrl} required type="url" pattern="https://.*" placeholder="https://example.com/reference.mp4" />
@@ -885,32 +1373,37 @@
                 <label class="field">
                   <span>Media type</span>
                   <select bind:value={remoteKind} onchange={() => {
-                    remoteRole = remoteKind === 'video' ? 'video_reference' : remoteKind === 'audio' ? 'audio_reference' : 'reference';
+                    remoteRole = remoteKind === 'video'
+                      ? 'video_reference'
+                      : remoteKind === 'audio'
+                        ? 'audio_reference'
+                        : imageRoleOptions(selectedModel)[0]?.value ?? 'reference';
                   }}>
-                    <option value="image">Image</option>
-                    <option value="video">Video</option>
-                    <option value="audio">Audio</option>
+                    <option value="image" disabled={selectedModel ? !modelSupportsImages(selectedModel) : false}>Image</option>
+                    <option value="video" disabled={selectedModel ? !selectedModel.capabilities.video : false}>Video</option>
+                    <option value="audio" disabled={selectedModel ? !selectedModel.capabilities.audioReferences : false}>Audio</option>
                   </select>
                 </label>
                 {#if remoteKind === 'image'}
                   <label class="field">
                     <span>Role</span>
                     <select bind:value={remoteRole}>
-                      <option value="reference">Reference</option>
-                      <option value="start_frame">Start frame</option>
-                      <option value="end_frame">End frame</option>
+                      {#each imageRoleOptions(selectedModel) as option (option.value)}
+                        <option value={option.value}>{option.label}</option>
+                      {/each}
                     </select>
                   </label>
                 {:else}
                   <div class="fixed-role"><span>Role</span><strong>{remoteKind === 'video' ? 'Video reference' : 'Audio reference'}</strong></div>
                 {/if}
-                <button class="button button--secondary" type="submit">Add URL</button>
+                <button class="button button--secondary" disabled={remoteBusy} type="submit">{remoteBusy ? 'Adding…' : 'Add URL'}</button>
               </form>
             {/if}
 
             {#if snapshot.draft.media.length > 0}
               <ol class="media-list" aria-label="Ordered reference media">
                 {#each snapshot.draft.media as item, index (item.handle)}
+                  {@const supportedRoles = imageRoleOptions(selectedModel)}
                   <li class="media-item">
                     <div class={`media-thumb media-thumb--${item.kind}`}>
                       {#if item.previewUrl}<img src={item.previewUrl} alt="" />{:else}<Icon name={item.kind} size={21} />{/if}
@@ -918,14 +1411,18 @@
                     <div class="media-item__name">
                       <strong title={item.displayName}>{item.displayName}</strong>
                       <span>{item.detail} · {item.source === 'local' ? 'Local' : 'HTTPS'}</span>
+                      {#if item.displayUrl}<small class="media-item__url" title={item.displayUrl}>{item.displayUrl}</small>{/if}
                     </div>
                     {#if item.kind === 'image'}
                       <label class="compact-field">
                         <span class="sr-only">Role for {item.displayName}</span>
                         <select value={item.role} onchange={(event) => changeMediaRole(item.handle, event.currentTarget.value as MediaRole)}>
-                          <option value="reference">Reference</option>
-                          <option value="start_frame">Start frame</option>
-                          <option value="end_frame">End frame</option>
+                          {#if !supportedRoles.some((option) => option.value === item.role)}
+                            <option value={item.role}>Unsupported · {mediaRoleLabel(item.role)}</option>
+                          {/if}
+                          {#each supportedRoles as option (option.value)}
+                            <option value={option.value}>{option.label}</option>
+                          {/each}
                         </select>
                       </label>
                     {:else}
@@ -945,7 +1442,7 @@
 
         <aside class="compose-inspector" aria-label="Provider and generation settings">
           <section class="card inspector-card">
-            <div class="inspector-title"><span class="step-label">03 / THE CAMERA</span><span class="live-catalog">Live models</span></div>
+            <div class="inspector-title"><span class="step-label">03 / THE CAMERA</span><span class="live-catalog">Model catalog</span></div>
             <label class="field">
               <span>Provider</span>
               <select value={snapshot.draft.providerId} onchange={(event) => changeProvider(event.currentTarget.value as ProviderId)}>
@@ -958,7 +1455,7 @@
             <label class="field model-field">
               <span>Model</span>
               <select title={selectedModel?.name} value={snapshot.draft.modelId} onchange={(event) => changeModel(event.currentTarget.value)}>
-                {#if providerModels.length === 0}<option value="">Loading models…</option>{/if}
+                {#if providerModels.length === 0}<option value="">{ready ? 'No models available' : 'Loading models…'}</option>{/if}
                 {#each providerModels as model (model.id)}<option value={model.id}>{model.name}</option>{/each}
               </select>
             </label>
@@ -967,7 +1464,7 @@
               <div class="model-note">
                 <p>{selectedModel.description}</p>
                 <div class="capabilities" aria-label="Model capabilities">
-                  {#if selectedModel.capabilities.images}<span>Image</span>{/if}
+                  {#if modelSupportsImages(selectedModel)}<span>Image</span>{/if}
                   {#if selectedModel.capabilities.video}<span>Video</span>{/if}
                   {#if selectedModel.capabilities.audioReferences}<span>Audio ref</span>{/if}
                   {#if selectedModel.capabilities.generatedAudio}<span>Soundtrack</span>{/if}
@@ -976,11 +1473,20 @@
             {/if}
 
             <div class="settings-grid">
-              <label class="field"><span>Duration</span><select value={snapshot.draft.settings.duration} onchange={(event) => editDraft((draft) => (draft.settings.duration = event.currentTarget.value))}><option value="">Provider default</option>{#each selectedModel?.durationOptions ?? [] as option}<option>{option}</option>{/each}</select></label>
-              <label class="field"><span>Resolution</span><select value={snapshot.draft.settings.resolution} onchange={(event) => editDraft((draft) => (draft.settings.resolution = event.currentTarget.value))}><option value="">Provider default</option>{#each selectedModel?.resolutionOptions ?? [] as option}<option>{option}</option>{/each}</select></label>
-              <label class="field"><span>Aspect ratio</span><select value={snapshot.draft.settings.aspectRatio} onchange={(event) => editDraft((draft) => (draft.settings.aspectRatio = event.currentTarget.value))}><option value="">Provider default</option>{#each selectedModel?.aspectRatioOptions ?? [] as option}<option>{option}</option>{/each}</select></label>
-              <label class="field"><span>Generated audio</span><select disabled={!selectedModel?.capabilities.generatedAudio} value={snapshot.draft.settings.generatedAudio} onchange={(event) => editDraft((draft) => (draft.settings.generatedAudio = event.currentTarget.value as GenerationDraft['settings']['generatedAudio']))}><option value="provider_default">Provider default</option><option value="on">On</option><option value="off">Off</option></select></label>
-              <label class="field field--wide"><span>Seed <small>optional</small></span><input inputmode="numeric" placeholder="Random" value={snapshot.draft.settings.seed} oninput={(event) => editDraft((draft) => (draft.settings.seed = event.currentTarget.value))} /></label>
+              <label class="field"><span>Duration</span><select value={snapshot.draft.settings.duration} onchange={(event) => editDraft((draft) => (draft.settings.duration = event.currentTarget.value))}><option value="">Provider default</option>{#if snapshot.draft.settings.duration && !selectedModel?.durationOptions.includes(snapshot.draft.settings.duration)}<option value={snapshot.draft.settings.duration}>Unsupported · {snapshot.draft.settings.duration}</option>{/if}{#each selectedModel?.durationOptions ?? [] as option}<option value={option}>{option}</option>{/each}</select></label>
+              <label class="field"><span>Resolution</span><select value={snapshot.draft.settings.resolution} onchange={(event) => changeResolution(event.currentTarget.value)}><option value="">Provider default</option>{#if snapshot.draft.settings.resolution && !selectedModel?.resolutionOptions.includes(snapshot.draft.settings.resolution)}<option value={snapshot.draft.settings.resolution}>Unsupported · {snapshot.draft.settings.resolution}</option>{/if}{#each selectedModel?.resolutionOptions ?? [] as option}<option value={option}>{option}</option>{/each}</select></label>
+              <label class="field"><span>Aspect ratio</span><select value={snapshot.draft.settings.aspectRatio} onchange={(event) => changeAspectRatio(event.currentTarget.value)}><option value="">Provider default</option>{#if snapshot.draft.settings.aspectRatio && !selectedModel?.aspectRatioOptions.includes(snapshot.draft.settings.aspectRatio)}<option value={snapshot.draft.settings.aspectRatio}>Unsupported · {snapshot.draft.settings.aspectRatio}</option>{/if}{#each selectedModel?.aspectRatioOptions ?? [] as option}<option value={option}>{option}</option>{/each}</select></label>
+              {#if (selectedModel?.sizeOptions?.length ?? 0) > 0 || snapshot.draft.settings.size}
+                <label class="field"><span>Output size</span><select value={snapshot.draft.settings.size} onchange={(event) => changeOutputSize(event.currentTarget.value)}><option value="">Provider default</option>{#if snapshot.draft.settings.size && !selectedModel?.sizeOptions?.includes(snapshot.draft.settings.size)}<option value={snapshot.draft.settings.size}>Unsupported · {snapshot.draft.settings.size}</option>{/if}{#each selectedModel?.sizeOptions ?? [] as option}<option value={option}>{option}</option>{/each}</select></label>
+              {/if}
+              <label class="field"><span>Generated audio</span><select disabled={!selectedModel || (!selectedModel.capabilities.generatedAudio && snapshot.draft.settings.generatedAudio === 'provider_default')} value={snapshot.draft.settings.generatedAudio} onchange={(event) => editDraft((draft) => (draft.settings.generatedAudio = event.currentTarget.value as GenerationDraft['settings']['generatedAudio']))}><option value="provider_default">Provider default</option><option value="on" disabled={!selectedModel?.capabilities.generatedAudio}>On</option><option value="off" disabled={!selectedModel?.capabilities.generatedAudio}>Off</option></select></label>
+              <label class="field field--wide"><span>Seed <small>{selectedModel?.capabilities.seed === false ? 'not supported' : 'optional'}</small></span><input inputmode="numeric" maxlength="20" disabled={selectedModel?.capabilities.seed === false && !snapshot.draft.settings.seed} placeholder="Random" value={snapshot.draft.settings.seed} oninput={(event) => editDraft((draft) => (draft.settings.seed = event.currentTarget.value))} onblur={() => void flushLatestDraft().catch(() => undefined)} /></label>
+              <details class="advanced-settings field--wide">
+                <summary>Extra model settings <small>JSON · optional</small></summary>
+                <label class="sr-only" for="advanced-json">Extra model settings JSON</label>
+                <textarea id="advanced-json" rows="5" maxlength="100000" spellcheck="false" placeholder={'{\n  "guidance_scale": 5\n}'} value={snapshot.draft.settings.advancedJson} oninput={(event) => editDraft((draft) => (draft.settings.advancedJson = event.currentTarget.value))} onblur={() => void flushLatestDraft().catch(() => undefined)}></textarea>
+                <p>Advanced values are sent to the selected model. Review shows the exact saved object before payment.</p>
+              </details>
             </div>
           </section>
 
@@ -999,7 +1505,7 @@
     </main>
   {:else if activeView === 'jobs'}
     <main class="workspace jobs-page">
-      <section class="page-heading jobs-heading">
+      <section class="page-heading jobs-heading" bind:this={jobsHeadingElement} tabindex="-1">
         <div><p class="eyebrow">Screening room</p><h1>Your films, taking shape.</h1><p>Watch each render grow, then play the finished cut.</p></div>
         <div class="job-summary"><strong>{activeJobCount}</strong><span>active {activeJobCount === 1 ? 'render' : 'renders'}</span></div>
       </section>
@@ -1007,17 +1513,17 @@
       <div class="jobs-layout">
         <aside class="jobs-sidebar" aria-label="Generation jobs">
           <div class="jobs-tools">
-            <label class="search-field"><span class="sr-only">Search renders</span><Icon name="search" size={17} /><input bind:value={jobSearch} type="search" placeholder="Search renders" /></label>
+            <label class="search-field"><span class="sr-only">Search renders</span><Icon name="search" size={17} /><input value={jobSearch} oninput={(event) => updateJobSearch(event.currentTarget.value)} type="search" placeholder="Search renders" /></label>
             <label class="sr-only" for="job-filter">Filter jobs</label>
-            <select id="job-filter" class="filter-select" bind:value={jobFilter}><option value="all">All</option><option value="active">Active</option><option value="attention">Needs attention</option><option value="completed">Completed</option></select>
+            <select id="job-filter" class="filter-select" value={jobFilter} onchange={(event) => updateJobFilter(event.currentTarget.value as typeof jobFilter)}><option value="all">All</option><option value="active">Active</option><option value="attention">Needs attention</option><option value="completed">Completed</option></select>
           </div>
           {#if filteredJobs.length === 0}
-            <div class="sidebar-empty"><Icon name="film" size={25} /><p>Nothing matches this reel.</p></div>
+            <div class="sidebar-empty"><Icon name="film" size={25} /><p>{snapshot.jobs.length === 0 ? 'No renders yet. Review a shot to begin.' : 'Nothing matches this reel.'}</p></div>
           {:else}
             <div class="job-list">
               {#each filteredJobs as job (job.id)}
-                <button class:selected={snapshot.selectedJobId === job.id} class="job-row" onclick={() => void selectJob(job.id)}>
-                  <span class={`status-orb status-orb--${statusTone(job.status)}`} aria-hidden="true"></span>
+                <button class:selected={snapshot.selectedJobId === job.id} class="job-row" aria-current={snapshot.selectedJobId === job.id ? 'true' : undefined} onclick={() => void selectJob(job.id)}>
+                  <span class={`status-orb status-orb--${statusTone(job)}`} aria-hidden="true"></span>
                   <span class="job-row__copy"><strong>{job.prompt}</strong><small>{job.providerName} · {job.modelName}</small><span>{job.statusLabel}</span></span>
                   <time datetime={job.createdAt}>{formatDate(job.createdAt)}</time>
                   <Icon name="chevron" size={16} />
@@ -1030,10 +1536,10 @@
         <section class="job-detail" aria-live="off">
           {#if selectedJob}
             <div class="detail-header">
-              <div><span class={`status-pill status-pill--${statusTone(selectedJob.status)}`}>{selectedJob.statusLabel}</span><h2>{selectedJob.prompt}</h2><p>{selectedJob.providerName} · {selectedJob.modelName}</p></div>
+              <div><span class={`status-pill status-pill--${statusTone(selectedJob)}`}>{selectedJob.statusLabel}</span><h2>{selectedJob.prompt}</h2><p>{selectedJob.providerName} · {selectedJob.modelName}</p></div>
               <div class="detail-actions">
-                {#if !selectedJob.deletable && selectedJob.status !== 'completed'}<button class="button button--secondary" onclick={() => void toggleJobMonitoring()}><Icon name={selectedJob.status === 'paused' ? 'play' : 'pause'} size={16} /> {selectedJob.status === 'paused' ? 'Resume updates' : 'Pause updates'}</button>{/if}
-                {#if selectedJob.status === 'completed'}
+                {#if canPauseMonitoring(selectedJob) || canResumeMonitoring(selectedJob)}<button class="button button--secondary" disabled={Boolean(monitorBusy[selectedJob.id])} onclick={() => void toggleJobMonitoring()}><Icon name={canResumeMonitoring(selectedJob) ? 'play' : 'pause'} size={16} /> {monitorBusy[selectedJob.id] ? 'Updating…' : canResumeMonitoring(selectedJob) ? 'Resume updates' : 'Pause updates'}</button>{/if}
+                {#if selectedJob.status === 'completed' && selectedJob.hasLocalOutput}
                   <button class="button button--primary" disabled={outputBusy || playbackBusy} onclick={() => void playSelectedOutput()}><Icon name="play" size={16} /> {playbackBusy ? 'Loading…' : 'Play here'}</button>
                   <button class="button button--secondary" disabled={outputBusy || playbackBusy} onclick={() => void openSelectedOutput()}><Icon name="external" size={16} /> {outputBusy ? 'Opening…' : 'Open in player'}</button>
                 {/if}
@@ -1041,7 +1547,7 @@
               </div>
             </div>
 
-            {#if selectedJob.status === 'completed'}
+            {#if selectedJob.status === 'completed' && selectedJob.hasLocalOutput}
               <section class="player-card" aria-labelledby="player-heading">
                 <div class="player-card__heading"><div><p class="micro-label">Finished film</p><h3 id="player-heading">{selectedJob.outputFileName ?? 'Generated video'}</h3></div><button class="text-button" disabled={playbackBusy} onclick={() => void playSelectedOutput()}>{playbackBusy ? 'Loading…' : playbackUrl ? 'Play again' : 'Load & play'}</button></div>
                 {#if selectedJob.captionsUrl}
@@ -1055,7 +1561,7 @@
                 <div class="player-meta"><span><Icon name="check" size={15} /> Saved in your Videos folder</span>{#if !selectedJob.captionsUrl}<span>This model didn’t include captions.</span>{/if}</div>
               </section>
             {:else}
-              <CloudCinema active={isActiveJob(selectedJob.status)} paused={selectedJob.status === 'paused'} provider={selectedJob.providerName} status={selectedJob.statusLabel} detail={selectedJob.detail} jobId={selectedJob.id} elapsedSeconds={selectedJob.elapsedSeconds} nextPollSeconds={selectedJob.nextPollSeconds} />
+              <CloudCinema active={isActivelyMonitored(selectedJob)} paused={selectedJob.monitorState === 'paused' || selectedJob.status === 'paused'} provider={selectedJob.providerName} status={selectedJob.statusLabel} detail={selectedJob.detail} jobId={selectedJob.id} elapsedSeconds={selectedJob.elapsedSeconds} nextPollSeconds={selectedJob.nextPollSeconds} />
             {/if}
 
             <div class="detail-grid">
@@ -1092,7 +1598,7 @@
             <form class="credential-form" onsubmit={(event) => { event.preventDefault(); void connectProvider(provider.id); }}>
               <label class="field field--wide"><span>{provider.connected ? 'Replace API key' : 'API key'}</span><input bind:value={providerKeys[provider.id]} type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder={provider.id === 'openrouter' ? 'sk-or-v1-…' : 'fal_key_…'} /></label>
               <label class="check-row"><input bind:checked={providerRemember[provider.id]} type="checkbox" /><span><strong>Remember this key</strong><small>Uses your system keyring when available; otherwise this session only.</small></span></label>
-              <div class="provider-actions"><button class="button button--primary" disabled={providerBusy === provider.id} type="submit">{providerBusy === provider.id ? 'Checking…' : provider.connected ? 'Replace key' : `Connect ${provider.name}`}</button>{#if provider.connected}<button class="button button--danger" disabled={providerBusy === provider.id} type="button" onclick={() => void forgetProvider(provider.id)}>Forget key</button>{/if}</div>
+              <div class="provider-actions"><button class="button button--primary" disabled={providerBusy[provider.id]} type="submit">{providerBusy[provider.id] ? 'Checking…' : provider.connected ? 'Replace key' : `Connect ${provider.name}`}</button>{#if provider.connected}<button class="button button--danger" disabled={providerBusy[provider.id]} type="button" onclick={() => void forgetProvider(provider.id)}>Forget key</button>{/if}</div>
             </form>
           </section>
         {/each}
@@ -1105,7 +1611,7 @@
               <article class="card safety-hold">
                 <div><p class="micro-label">{hold.providerName} · {formatDate(hold.recordedAt)}</p><h3>We don’t know whether the provider accepted this request.</h3><p>{hold.message}</p></div>
                 <label class="check-row"><input type="checkbox" bind:checked={confirmedSafetyHolds[hold.handle]} /><span><strong>I checked the {hold.providerName} dashboard</strong><small>I understand that clearing this hold permits this exact paid request again.</small></span></label>
-                <button class="button button--danger" type="button" disabled={!confirmedSafetyHolds[hold.handle] || holdBusy === hold.handle} onclick={() => void acknowledgeSafetyHold(hold.handle)}>{holdBusy === hold.handle ? 'Clearing hold…' : 'Dashboard checked — clear hold'}</button>
+                <button class="button button--danger" type="button" disabled={!confirmedSafetyHolds[hold.handle] || holdBusy[hold.handle]} onclick={() => void acknowledgeSafetyHold(hold.handle)}>{holdBusy[hold.handle] ? 'Clearing hold…' : 'Dashboard checked — clear hold'}</button>
               </article>
             {/each}
           </div>
@@ -1122,6 +1628,7 @@
   <div class="dialog-body delete-dialog__body">
     <p>It’ll disappear from Video Harness. {selectedJob?.providerName ?? 'The provider'} keeps its own copy and job record.</p>
     {#if selectedJob?.hasLocalOutput}<div class="delete-file-note"><Icon name="video" size={18} /><span><strong>{selectedJob.outputFileName ?? 'Saved generated video'}</strong><small>You choose whether this saved file stays in your Videos folder.</small></span></div>{/if}
+    {#if deleteError}<div class="dialog-error" role="alert"><Icon name="warning" size={17} /><p>{deleteError}</p></div>{/if}
   </div>
   <div class="dialog-actions delete-dialog__actions">
     <button class="button button--secondary" disabled={deleteBusy} onclick={() => deleteDialog.close()}>Never mind</button>
@@ -1141,22 +1648,35 @@
   <div class="dialog-actions"><button class="button button--secondary" onclick={() => uploadDialog.close()}>Keep files local</button><button class="button button--primary" onclick={() => void prepareReview(true)}>Upload for Review</button></div>
 </dialog>
 
-<dialog class="sheet-dialog review-dialog" bind:this={reviewDialog} aria-labelledby="review-title">
+<dialog class="sheet-dialog review-dialog" bind:this={reviewDialog} aria-labelledby="review-title" aria-describedby={isSubmitting ? 'submission-state' : undefined} oncancel={(event) => { event.preventDefault(); closeReview(); }}>
   {#if snapshot.preparedReview}
     {@const review = snapshot.preparedReview}
     <div class="dialog-accent" aria-hidden="true"></div>
-    <div class="dialog-heading"><div class="dialog-icon"><Icon name="spark" size={22} /></div><div><p class="eyebrow">Final check</p><h2 id="review-title">One last look before the lights go down.</h2></div><button class="icon-button" aria-label="Close Review" onclick={() => reviewDialog.close()}><Icon name="x" size={18} /></button></div>
+    <div class="dialog-heading"><div class="dialog-icon"><Icon name="spark" size={22} /></div><div><p class="eyebrow">Final check</p><h2 id="review-title">One last look before the lights go down.</h2></div><button class="icon-button" aria-label="Close Review" disabled={isSubmitting} onclick={closeReview}><Icon name="x" size={18} /></button></div>
     <div class="review-price"><div><span>Fresh estimate</span><strong>{review.estimatedCost}</strong></div><p>Estimate only — your provider’s final usage is what counts.</p></div>
     <div class="dialog-body review-body">
       {#if review.uploadDisclosure}<div class="review-disclosure"><Icon name="warning" size={18} /><p>{review.uploadDisclosure}</p></div>{/if}
       <section><p class="micro-label">Prompt</p><p class="review-prompt">{review.prompt}</p></section>
-      <div class="review-facts"><div><span>Provider</span><strong>{review.providerName}</strong></div><div><span>Model</span><strong title={review.modelName}>{review.modelName}</strong></div><div><span>Duration</span><strong>{review.settings.duration || 'Provider default'}</strong></div><div><span>Output</span><strong>{review.settings.resolution || 'Provider default'} · {review.settings.aspectRatio || 'Provider default'}</strong></div><div><span>Generated audio</span><strong>{review.settings.generatedAudio === 'on' ? 'On' : review.settings.generatedAudio === 'off' ? 'Off' : 'Provider default'}</strong></div><div><span>Seed</span><strong>{review.settings.seed || 'Random / provider default'}</strong></div></div>
+      <div class="review-facts"><div><span>Provider</span><strong>{review.providerName}</strong></div><div><span>Model</span><strong title={review.modelName}>{review.modelName}</strong></div><div><span>Duration</span><strong>{review.settings.duration || 'Provider default'}</strong></div><div><span>Output</span><strong>{review.settings.resolution || 'Provider default'} · {review.settings.aspectRatio || 'Provider default'}</strong></div>{#if review.settings.size}<div><span>Exact size</span><strong>{review.settings.size}</strong></div>{/if}<div><span>Generated audio</span><strong>{review.settings.generatedAudio === 'on' ? 'On' : review.settings.generatedAudio === 'off' ? 'Off' : 'Provider default'}</strong></div><div><span>Seed</span><strong>{review.settings.seed || 'Random / provider default'}</strong></div></div>
       {#if review.advancedSettingsJson}<section class="review-advanced"><div><p class="micro-label">Extra model settings</p><p>These saved settings are included in this paid request.</p></div><pre>{review.advancedSettingsJson}</pre></section>{/if}
-      {#if review.media.length > 0}<section><p class="micro-label">Reference media</p><ul class="review-media">{#each review.media as item (item.handle)}<li><Icon name={item.kind} size={16} /><span>{item.displayName}</span><small>{mediaRoleLabel(item.role)}</small></li>{/each}</ul></section>{/if}
+      {#if review.media.length > 0}<section><p class="micro-label">Reference media</p><ul class="review-media">{#each review.media as item (item.handle)}<li><Icon name={item.kind} size={16} /><span>{item.displayName}{#if item.displayUrl}<small title={item.displayUrl}>{item.displayUrl}</small>{/if}</span><small>{mediaRoleLabel(item.role)}</small></li>{/each}</ul></section>{/if}
       <p class="review-expiry"><Icon name="clock" size={15} /> Review expires at {formatDate(review.expiresAt)}. Any edit makes a fresh Review.</p>
+      {#if isSubmitting}<div id="submission-state" class="submission-state" role="status"><Icon name="clock" size={18} /><p><strong>Submitting exactly once…</strong><span>This paid request is in flight. Review stays locked until the provider outcome is known.</span>{#if closeRequestedAfterSubmission}<span>Video Harness will save and close after that outcome arrives.</span>{/if}</p></div>{/if}
+      {#if reviewError}<div class="dialog-error" role="alert"><Icon name="warning" size={17} /><p>{reviewError}</p></div>{/if}
     </div>
-    <div class="dialog-actions dialog-actions--paid"><button class="button button--secondary" onclick={() => reviewDialog.close()}>Go back</button><div><span>Exactly one paid provider request</span><button class="button button--paid" disabled={isSubmitting} onclick={() => void submitReview()}>{isSubmitting ? 'Submitting once…' : 'Generate — one paid request'} <Icon name="spark" size={16} /></button></div></div>
+    <div class="dialog-actions dialog-actions--paid"><button class="button button--secondary" disabled={isSubmitting} onclick={closeReview}>Go back</button><div><span>Exactly one paid provider request</span><button class="button button--paid" disabled={isSubmitting} onclick={() => void submitReview()}>{isSubmitting ? 'Submitting once…' : 'Generate — one paid request'} <Icon name="spark" size={16} /></button></div></div>
   {/if}
+</dialog>
+
+<dialog class="sheet-dialog close-dialog" bind:this={closeDialog} aria-labelledby="close-title" aria-describedby="close-description" oncancel={(event) => { event.preventDefault(); void cancelCloseRequest(); }}>
+  <div class="dialog-accent" aria-hidden="true"></div>
+  <div class="dialog-heading"><div class="dialog-icon"><Icon name="check" size={21} /></div><div><p class="eyebrow">Before closing</p><h2 id="close-title">Save this scene safely?</h2></div></div>
+  <div class="dialog-body">
+    <p id="close-description">Video Harness is saving the latest draft on this device before the window closes.</p>
+    {#if closeBusy}<div class="submission-state" role="status"><Icon name="clock" size={18} /><p><strong>{closeCommitted ? 'Draft saved. Finishing background work…' : 'Saving the latest edit…'}</strong><span>{closeCommitted ? 'The close request is committed. Video Harness will exit as soon as in-flight work reaches a safe stopping point.' : 'Keep this window open until the save is confirmed.'}</span>{#if closeWaitMessage}<span>{closeWaitMessage}</span>{/if}</p></div>{/if}
+    {#if closeError}<div class="dialog-error" role="alert"><Icon name="warning" size={17} /><p><strong>{closeErrorTitle || 'Video Harness stayed open.'}</strong><span>{closeError}</span></p></div>{/if}
+  </div>
+  <div class="dialog-actions"><button class="button button--secondary" disabled={closeBusy || closeCancelBusy || closeCommitted} onclick={() => void cancelCloseRequest()}>{closeCancelBusy ? 'Cancelling…' : closeCancelFailed ? 'Retry Keep working' : 'Keep working'}</button><button class="button button--primary" disabled={closeBusy || closeCancelBusy || closeCommitted} onclick={() => void beginCloseSave()}>{closeCommitted ? 'Closing safely…' : closeBusy ? 'Saving…' : closeError ? 'Retry save & close' : 'Save & close'}</button></div>
 </dialog>
 
 {#if notice}

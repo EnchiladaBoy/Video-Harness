@@ -7,6 +7,7 @@ export type MediaRole =
   | 'video_reference'
   | 'audio_reference';
 export type WorkspaceView = 'create' | 'jobs' | 'providers';
+export type JobMonitorState = 'active' | 'paused' | 'recoverable' | 'terminal';
 export type JobStatus =
   | 'preparing'
   | 'queued'
@@ -32,6 +33,19 @@ export interface ModelCapabilities {
   video: boolean;
   audioReferences: boolean;
   generatedAudio: boolean;
+  seed?: boolean;
+}
+
+export interface MediaConstraint {
+  kind: MediaKind;
+  /** Roles that populate this provider-schema binding bucket. */
+  roles?: MediaRole[];
+  required: boolean;
+  /** Unconditional minimum for a required media bucket. */
+  minItems?: number;
+  /** Conditional minimum when an otherwise optional media bucket is used. */
+  minItemsWhenPresent?: number;
+  maxItems?: number;
 }
 
 export interface ModelSummary {
@@ -43,6 +57,17 @@ export interface ModelSummary {
   durationOptions: string[];
   resolutionOptions: string[];
   aspectRatioOptions: string[];
+  sizeOptions?: string[];
+  supportedImageRoles?: MediaRole[];
+  /** Image roles that must each be present, independent of provider binding names. */
+  requiredImageRoles?: MediaRole[];
+  mediaConstraints?: MediaConstraint[];
+  /** Total reference-item limit after all provider binding buckets are combined. */
+  maxMediaItems?: number;
+  /** Audio references must be accompanied by at least one image or video reference. */
+  audioRequiresVisual?: boolean;
+  /** Frame images and general image references populate mutually exclusive request shapes. */
+  framesExclusiveWithReferences?: boolean;
   priceHint: string;
 }
 
@@ -54,14 +79,18 @@ export interface MediaItem {
   source: 'local' | 'remote';
   detail: string;
   previewUrl?: string;
+  /** Safe display form: origin + path only, without query or fragment. */
+  displayUrl?: string;
 }
 
 export interface GenerationSettings {
   duration: string;
   resolution: string;
   aspectRatio: string;
+  size: string;
   generatedAudio: 'provider_default' | 'on' | 'off';
   seed: string;
+  advancedJson: string;
 }
 
 export interface GenerationDraft {
@@ -117,6 +146,9 @@ export interface JobSummary {
   remoteContinues?: boolean;
   providerJobId?: string;
   deletable: boolean;
+  monitorState?: JobMonitorState;
+  canResume?: boolean;
+  canPause?: boolean;
 }
 
 export interface AppSnapshot {
@@ -139,6 +171,7 @@ export type UiEvent =
   | { type: 'job_updated'; job: JobSummary }
   | { type: 'job_removed'; jobId: string }
   | { type: 'draft_saved'; revision: number }
+  | { type: 'close_requested'; requestId: number }
   | {
       type: 'operation_failed';
       operation: 'preparation' | 'submission';
@@ -154,6 +187,9 @@ export interface UiEventEnvelope {
 export interface OpenSessionResult {
   seq: number;
   snapshot: AppSnapshot;
+  /** Authoritative native operation state, including across renderer reloads. */
+  preparing: boolean;
+  submitting: boolean;
 }
 
 export interface PlaybackGrant {
@@ -189,6 +225,9 @@ export interface VideoHarnessBridge {
   submitPrepared(preparedId: number): Promise<void>;
   invalidatePrepared(revision: number): Promise<void>;
   saveDraft(draft: GenerationDraft): Promise<void>;
+  acknowledgeCloseRequest(requestId: number): Promise<void>;
+  cancelCloseRequest(requestId: number): Promise<void>;
+  saveDraftAndClose(draft: GenerationDraft, requestId: number): Promise<void>;
   pauseJob(jobId: string): Promise<void>;
   resumeJob(jobId: string): Promise<void>;
   deleteRender(jobId: string, deleteOutput: boolean): Promise<void>;
@@ -201,10 +240,22 @@ export function isActiveJob(status: JobStatus): boolean {
   return status === 'preparing' || status === 'queued' || status === 'processing' || status === 'downloading';
 }
 
+export function isActivelyMonitored(
+  job: Pick<JobSummary, 'status' | 'monitorState'>
+): boolean {
+  return job.monitorState ? job.monitorState === 'active' : isActiveJob(job.status);
+}
+
 export function providerById(snapshot: AppSnapshot, id: ProviderId): ProviderSummary | undefined {
   return snapshot.providers.find((provider) => provider.id === id);
 }
 
-export function modelById(snapshot: AppSnapshot, id: string): ModelSummary | undefined {
-  return snapshot.models.find((model) => model.id === id);
+export function modelById(
+  snapshot: AppSnapshot,
+  providerId: ProviderId,
+  id: string
+): ModelSummary | undefined {
+  return snapshot.models.find(
+    (model) => model.providerId === providerId && model.id === id
+  );
 }

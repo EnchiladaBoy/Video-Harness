@@ -65,6 +65,74 @@ fn request_payload_trims_text_and_validates_reference_urls_and_dimensions() {
 }
 
 #[test]
+fn provider_options_reject_nested_credentials_at_the_domain_boundary() {
+    for options in [
+        json!({"password": "do-not-store"}),
+        json!({"nested": [{"client_secret": "do-not-store"}]}),
+        json!({"providerApiKey": "do-not-store"}),
+    ] {
+        let mut request = VideoRequest::new("example/video", "test").expect("request");
+        request.adapter_options = Some(options.clone());
+        assert!(
+            request.validate().is_err(),
+            "accepted credential-bearing request options: {options}"
+        );
+
+        let mut draft =
+            GenerationDraft::new(ProviderId::openrouter(), "example/video", "test").expect("draft");
+        draft.adapter_options = Some(options.clone());
+        assert!(
+            draft.validate().is_err(),
+            "accepted credential-bearing draft options: {options}"
+        );
+
+        let payload = json!({
+            "model": "example/video",
+            "prompt": "test",
+            "provider": options,
+        });
+        assert!(
+            VideoRequest::from_payload(&payload).is_err(),
+            "accepted credential-bearing wire options: {payload}"
+        );
+    }
+
+    let mut controls = VideoRequest::new("example/video", "test").expect("request");
+    controls.adapter_options = Some(json!({
+        "max_tokens": 512,
+        "token_count": 7,
+        "nested": [{"route": "preferred"}],
+    }));
+    controls
+        .validate()
+        .expect("ordinary provider controls must remain valid");
+}
+
+#[test]
+fn symbolic_sizes_are_fal_candidates_but_exact_dimensions_remain_the_generic_rule() {
+    let mut openrouter =
+        VideoRequest::new("example/video", "symbolic size fixture").expect("request");
+    openrouter.size = Some("landscape_16_9".into());
+    assert!(openrouter.validate().is_err());
+
+    let mut fal = VideoRequest::for_provider(
+        ProviderId::fal(),
+        "fal-ai/fixture/video",
+        "symbolic size fixture",
+    )
+    .expect("fal request");
+    fal.size = Some("landscape_16_9".into());
+    fal.validate()
+        .expect("fal catalog candidates reach provider validation");
+
+    fal.size = Some("  landscape_16_9".into());
+    assert!(fal.validate().is_err());
+    fal.size = Some("1280x720".into());
+    fal.validate()
+        .expect("exact fal size remains structurally valid");
+}
+
+#[test]
 fn catalog_fixture_maps_capabilities_pricing_and_cache_compatibly() {
     let payload = fixture("catalog.json");
     let fetched_at = chrono::DateTime::parse_from_rfc3339(

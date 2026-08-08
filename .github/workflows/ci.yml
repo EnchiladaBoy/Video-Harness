@@ -21,10 +21,10 @@ jobs:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Install Node.js 24
+      - name: Install Node.js 24.18.0
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
+          node-version: 24.18.0
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
@@ -39,6 +39,10 @@ jobs:
       - name: Run UI tests
         working-directory: ui
         run: npm test
+
+      - name: Audit locked UI dependencies
+        working-directory: ui
+        run: npm audit --audit-level=high
 
       - name: Build desktop UI
         working-directory: ui
@@ -68,6 +72,28 @@ jobs:
         working-directory: native
         run: cargo clippy --locked --lib --tests --no-default-features -- -D warnings
 
+  legacy-gtk:
+    name: Legacy GTK frontend still compiles
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: rust:1.95-trixie
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install GTK build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            gcc \
+            libadwaita-1-dev \
+            libgtk-4-dev \
+            pkg-config
+
+      - name: Compile all default-feature targets
+        working-directory: native
+        run: cargo check --locked --all-targets
+
   future-platform-core:
     name: Desktop shell and core (${{ matrix.platform }})
     strategy:
@@ -87,10 +113,10 @@ jobs:
       - name: Install Rust 1.95
         run: rustup toolchain install 1.95 --profile minimal
 
-      - name: Install Node.js 24
+      - name: Install Node.js 24.18.0
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
+          node-version: 24.18.0
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
@@ -149,10 +175,10 @@ jobs:
           rustup toolchain install 1.95 --profile minimal
           rustup component add --toolchain 1.95 rustfmt clippy
 
-      - name: Install Node.js 24
+      - name: Install Node.js 24.18.0
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
+          node-version: 24.18.0
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
@@ -227,6 +253,84 @@ jobs:
       - name: Smoke-test architecture-neutral installer
         run: packaging/test-installer.sh
 
+  dependency-audit:
+    name: Locked Rust dependency advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: rust:1.95-trixie
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit the native dependency lockfile
+        run: cargo audit --file native/Cargo.lock
+
+      - name: Audit the desktop dependency lockfile
+        run: cargo audit --file desktop/src-tauri/Cargo.lock
+
+  dependency-review:
+    name: New dependency vulnerability and license policy
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          allow-licenses: >-
+            0BSD, Apache-2.0, BSD-2-Clause, BSD-3-Clause, CC0-1.0,
+            CDLA-Permissive-2.0, ISC, LGPL-2.1-or-later, MIT, MIT-0,
+            MPL-2.0, Unicode-3.0, Unlicense, Zlib
+
+  flatpak:
+    name: Flatpak manifest and clean build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Flatpak build and validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            appstream \
+            dbus-daemon \
+            desktop-file-utils \
+            flatpak \
+            flatpak-builder
+          flatpak remote-add --user --if-not-exists flathub \
+            https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      - name: Install Node.js 24.18.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.18.0
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build and validate the locked UI bundle
+        run: flatpak/prepare-ui.sh
+
+      - name: Validate reviewed metadata and generated sources
+        run: |
+          flatpak/check-manifest.sh
+          flatpak/test-permission-checker.sh
+
+      - name: Build the complete Flatpak in a clean directory
+        run: |
+          dbus-run-session -- flatpak-builder \
+            --user \
+            --install-deps-from=flathub \
+            --force-clean \
+            --disable-rofiles-fuse \
+            "${RUNNER_TEMP}/flatpak-build" \
+            flatpak/io.github.EnchiladaBoy.VideoHarness.yml
+
   appimage:
     name: Portable AppImage (${{ matrix.arch }})
     strategy:
@@ -254,6 +358,7 @@ jobs:
             gstreamer1.0-plugins-base \
             gstreamer1.0-plugins-good \
             gstreamer1.0-pulseaudio \
+            gstreamer1.0-tools \
             libayatana-appindicator3-dev \
             libfuse2 \
             librsvg2-dev \
@@ -267,10 +372,10 @@ jobs:
       - name: Install Rust 1.95
         run: rustup toolchain install 1.95 --profile minimal
 
-      - name: Install Node.js 24
+      - name: Install Node.js 24.18.0
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
+          node-version: 24.18.0
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
@@ -332,6 +437,7 @@ jobs:
             libgl1-mesa-dri \
             libgmp10 \
             libgpg-error0 \
+            gstreamer1.0-tools \
             libharfbuzz0b \
             libice6 \
             libjack-jackd2-0 \
@@ -358,9 +464,20 @@ jobs:
           name: appimage-${{ matrix.arch }}
           path: appimage-under-test
 
-      - name: Require an actual visible application window
+      - name: Decode bundled media and require a visible application window
         run: |
           chmod +x appimage-under-test/Video-Harness-*.AppImage
+          appimage_path="$(realpath appimage-under-test/Video-Harness-*.AppImage)"
+          extract_root="${RUNNER_TEMP}/appimage-extracted"
+          mkdir -p -- "${extract_root}"
+          (
+            cd -- "${extract_root}"
+            "${appimage_path}" --appimage-extract >/dev/null
+          )
+          bash .github/scripts/run-with-annotation.sh \
+            "Clean bundled media decode (${{ matrix.arch }})" \
+            packaging/smoke-appimage-media.sh \
+              "${extract_root}/squashfs-root"
           bash .github/scripts/run-with-annotation.sh \
             "Clean AppImage runtime (${{ matrix.arch }})" \
             packaging/smoke-appimage-gui.sh \

@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -15,9 +15,11 @@ use tokio::sync::mpsc;
 use crate::api::{ClientOptions, DownloadProgress, HttpExecutor, OpenRouterClient};
 use crate::config::{
     AppPaths, AppSettings, ConfigError, ModelSettingsMap, load_app_settings, load_model_settings,
-    make_output_path, partial_path, save_app_settings, save_model_settings,
+    make_output_path, save_app_settings, save_model_settings,
 };
-use crate::credentials::{CredentialStatus, CredentialStore};
+use crate::credentials::{
+    CREDENTIAL_OPERATION_TIMEOUT, CredentialStatus, CredentialWorker, CredentialWorkerError,
+};
 use crate::domain::{
     CostQuote, DraftMedia, GenerationDraft, InputReferenceKind, JobLocator, JobStatus, MediaRole,
     MediaSource, ProviderDescriptor, ProviderId, ProviderJobKey, StagedMedia, UploadReceipt,
@@ -368,6 +370,18 @@ pub enum ServiceEvent {
         job: VideoJob,
         record: JobRecord,
     },
+    /// Actor-authoritative acknowledgement that Pause/Cancel commands can now
+    /// address this job through the monitor registry.
+    MonitorStarted {
+        op_id: u64,
+        key: ProviderJobKey,
+    },
+    /// Actor-authoritative acknowledgement that this job has been removed
+    /// from the monitor registry and can be resumed again.
+    MonitorStopped {
+        op_id: u64,
+        key: ProviderJobKey,
+    },
     PollWaiting {
         op_id: u64,
         provider_id: ProviderId,
@@ -436,6 +450,11 @@ pub enum ServiceEvent {
         message: String,
         recoverable: bool,
         job_id: Option<String>,
+        /// `Some(true)` means only local monitoring stopped and the provider
+        /// job may still be running. `Some(false)` means the provider is
+        /// terminal and the failure is local. Errors where this is not
+        /// applicable or cannot be determined use `None`.
+        remote_continues: Option<bool>,
     },
     ShutdownBlocked {
         reason: String,
@@ -458,6 +477,7 @@ struct ActiveOperation {
     task_id: u64,
     op_id: u64,
     cancel: Arc<AtomicBool>,
+    remote_continues: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -507,8 +527,9 @@ struct PreparedMediaAssociation {
 }
 
 struct ProviderSession {
-    store: Arc<Mutex<CredentialStore>>,
+    credentials: Option<CredentialWorker>,
     key: Option<SecretString>,
+    credential_status: CredentialStatus,
 }
 
 pub fn spawn_service(
@@ -549,16 +570,17 @@ async fn run_service(
     let gui_state = GuiStateStore::new(paths.gui_state_db());
     let init_history = history.clone();
     let init_gui_state = gui_state.clone();
-    let initialized = tokio::task::spawn_blocking(move || {
-        init_history
-            .initialize()
-            .map_err(|error| error.to_string())?;
+    let history_initialized = tokio::task::spawn_blocking(move || {
+        init_history.initialize().map_err(|error| error.to_string())
+    });
+    let gui_state_initialized = tokio::task::spawn_blocking(move || {
         init_gui_state
             .initialize()
             .map_err(|error| error.to_string())
-    })
-    .await;
-    match initialized {
+    });
+    let (history_initialized, gui_state_initialized) =
+        tokio::join!(history_initialized, gui_state_initialized);
+    match gui_state_initialized {
         Ok(Ok(())) => {}
         Ok(Err(message)) => {
             emit_error(
@@ -585,33 +607,40 @@ async fn run_service(
             return;
         }
     }
+    let history_initialization_warning = match history_initialized {
+        Ok(Ok(())) => None,
+        Ok(Err(message)) => Some(message),
+        Err(_) => Some("Compatible history database initialization failed".into()),
+    };
 
-    let mut sessions = BTreeMap::new();
-    for provider_id in [ProviderId::openrouter(), ProviderId::fal()] {
-        let use_system_credentials = config.use_system_credentials;
-        let id = provider_id.clone();
-        let (store, key) = tokio::task::spawn_blocking(move || {
-            let mut store = if use_system_credentials {
-                CredentialStore::for_provider(&id)
-            } else {
-                CredentialStore::memory_only_for_provider(&id)
-            };
-            let key = store.get();
-            (store, key)
-        })
-        .await
-        .unwrap_or_else(|_| {
-            let store = CredentialStore::memory_only_for_provider(&provider_id);
-            (store, None)
+    // Construct both workers before awaiting either one so two unresponsive
+    // platform backends cost at most one timeout during startup, not one each.
+    let startup_credentials = [ProviderId::openrouter(), ProviderId::fal()]
+        .into_iter()
+        .map(|provider_id| {
+            let credentials =
+                CredentialWorker::for_provider(&provider_id, config.use_system_credentials).ok();
+            async move {
+                let loaded = match credentials.as_ref() {
+                    Some(worker) => worker.get(CREDENTIAL_OPERATION_TIMEOUT).await,
+                    None => Err(CredentialWorkerError::Unavailable),
+                };
+                let (key, credential_status) = match loaded {
+                    Ok((key, status)) => (key, status),
+                    Err(error) => (None, unavailable_credential_status(error, "loaded")),
+                };
+                (
+                    provider_id,
+                    ProviderSession {
+                        credentials,
+                        key,
+                        credential_status,
+                    },
+                )
+            }
         });
-        sessions.insert(
-            provider_id,
-            ProviderSession {
-                store: Arc::new(Mutex::new(store)),
-                key,
-            },
-        );
-    }
+    let sessions = futures_util::future::join_all(startup_credentials).await;
+    let mut sessions = sessions.into_iter().collect::<BTreeMap<_, _>>();
     let app_settings_path = paths.app_settings();
     let default_provider = tokio::task::spawn_blocking(move || {
         load_app_settings(&app_settings_path)
@@ -628,6 +657,19 @@ async fn run_service(
         providers: provider_states,
         default_provider,
     });
+    if let Some(message) = history_initialization_warning {
+        emit_error(
+            &events,
+            0,
+            None,
+            ServiceScope::History,
+            format!(
+                "Compatible history is unavailable; saved GUI recovery state remains available: {message}"
+            ),
+            true,
+            None,
+        );
+    }
     let startup_state = gui_state.clone();
     if let Ok(Ok(jobs)) = tokio::task::spawn_blocking(move || startup_state.resumable_jobs()).await
     {
@@ -757,17 +799,30 @@ async fn run_service(
                         if submission_task == Some(task_id) {
                             submission_task = None;
                         }
-                        if operations.contains_key(&task_id) {
-                            monitors.insert(key, task_id);
+                        if let Some(operation) = operations.get(&task_id) {
+                            monitors.insert(key.clone(), task_id);
+                            let _ = events.send(ServiceEvent::MonitorStarted {
+                                op_id: operation.op_id,
+                                key,
+                            });
                         }
                     }
                     OperationNotice::Finished { task_id } => {
                         if submission_task == Some(task_id) {
                             submission_task = None;
                         }
+                        let stopped_keys = monitors
+                            .iter()
+                            .filter(|(_, value)| **value == task_id)
+                            .map(|(key, _)| key.clone())
+                            .collect::<Vec<_>>();
                         monitors.retain(|_, value| *value != task_id);
                         if let Some(operation) = operations.remove(&task_id) {
+                            let op_id = operation.op_id;
                             let _ = operation.task.await;
+                            for key in stopped_keys {
+                                let _ = events.send(ServiceEvent::MonitorStopped { op_id, key });
+                            }
                         }
                     }
                 }
@@ -807,17 +862,36 @@ async fn run_service(
                                         continue;
                                     };
                                     let credential_status = if persist_on_success {
-                                        let store = Arc::clone(&session.store);
-                                        let stored_key = key.clone();
-                                        tokio::task::spawn_blocking(move || {
-                                            let mut store = store.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                                            let _ = store.set(stored_key);
-                                            store.status()
-                                        }).await.unwrap_or_else(|_| memory_status())
+                                        let persisted = match session.credentials.as_ref() {
+                                            Some(worker) => worker
+                                                .set(key.clone(), CREDENTIAL_OPERATION_TIMEOUT)
+                                                .await,
+                                            None => Err(CredentialWorkerError::Unavailable),
+                                        };
+                                        match persisted {
+                                            Ok((Ok(_), status)) => status,
+                                            Ok((Err(error), _)) => {
+                                                emit_error(
+                                                    &events,
+                                                    op_id,
+                                                    Some(provider_id.clone()),
+                                                    ServiceScope::Credential,
+                                                    error.to_string(),
+                                                    true,
+                                                    None,
+                                                );
+                                                continue;
+                                            }
+                                            Err(error) => unavailable_credential_status(
+                                                error,
+                                                "confirmed as saved",
+                                            ),
+                                        }
                                     } else {
                                         memory_status()
                                     };
                                     session.key = Some(key);
+                                    session.credential_status = credential_status.clone();
                                     let _ = events.send(ServiceEvent::ApiKeyConnected {
                                         op_id,
                                         provider_id: provider_id.clone(),
@@ -845,13 +919,43 @@ async fn run_service(
                             emit_unknown_provider(&events, op_id, &provider_id, ServiceScope::Credential);
                             continue;
                         };
+                        let deletion = match session.credentials.as_ref() {
+                            Some(worker) => worker.delete(CREDENTIAL_OPERATION_TIMEOUT).await,
+                            None => Err(CredentialWorkerError::Unavailable),
+                        };
+                        let credential_status = match deletion {
+                            Ok((Ok(_), status)) => status,
+                            Ok((Err(error), _)) => {
+                                emit_error(
+                                    &events,
+                                    op_id,
+                                    Some(provider_id.clone()),
+                                    ServiceScope::Credential,
+                                    error.to_string(),
+                                    true,
+                                    None,
+                                );
+                                continue;
+                            }
+                            Err(error) => {
+                                emit_error(
+                                    &events,
+                                    op_id,
+                                    Some(provider_id.clone()),
+                                    ServiceScope::Credential,
+                                    error.to_string(),
+                                    true,
+                                    None,
+                                );
+                                continue;
+                            }
+                        };
+                        // Keep the live session connected unless every local
+                        // credential store confirms the forget operation. This
+                        // keeps the event contract truthful and allows retrying
+                        // transient keyring failures without re-entering a key.
                         session.key = None;
-                        let store = Arc::clone(&session.store);
-                        let credential_status = tokio::task::spawn_blocking(move || {
-                            let mut store = store.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                            store.delete();
-                            store.status()
-                        }).await.unwrap_or_else(|_| memory_status());
+                        session.credential_status = credential_status.clone();
                         let _ = events.send(ServiceEvent::ApiKeyForgotten {
                             op_id,
                             provider_id: provider_id.clone(),
@@ -1083,7 +1187,13 @@ async fn run_service(
                             events.clone(),
                             preparation_tx.clone(),
                         ));
-                        preparation = Some(ActiveOperation { task_id, op_id, cancel, task });
+                        preparation = Some(ActiveOperation {
+                            task_id,
+                            op_id,
+                            cancel,
+                            remote_continues: Arc::new(AtomicBool::new(false)),
+                            task,
+                        });
                     }
                     ServiceCommand::SubmitPrepared { op_id, prepared_id } => {
                         if submission_task.is_some() {
@@ -1195,6 +1305,7 @@ async fn run_service(
                         let cancel = Arc::new(AtomicBool::new(false));
                         let task_id = next_task_id;
                         next_task_id = next_task_id.saturating_add(1);
+                        let remote_continues = Arc::new(AtomicBool::new(false));
                         let task = tokio::spawn(run_generate(
                             task_id,
                             op_id,
@@ -1209,10 +1320,20 @@ async fn run_service(
                             paths.clone(),
                             config.clone(),
                             Arc::clone(&cancel),
+                            Arc::clone(&remote_continues),
                             events.clone(),
                             notice_tx.clone(),
                         ));
-                        operations.insert(task_id, ActiveOperation { task_id, op_id, cancel, task });
+                        operations.insert(
+                            task_id,
+                            ActiveOperation {
+                                task_id,
+                                op_id,
+                                cancel,
+                                remote_continues,
+                                task,
+                            },
+                        );
                         submission_task = Some(task_id);
                     }
                     ServiceCommand::InvalidatePrepared { op_id, revision } => {
@@ -1426,7 +1547,7 @@ async fn run_service(
                     }
                     ServiceCommand::DeleteGeneration { op_id, key, delete_output } => {
                         if monitors.contains_key(&key) {
-                            emit_error(
+                            emit_job_error(
                                 &events,
                                 op_id,
                                 Some(key.provider_id.clone()),
@@ -1434,6 +1555,7 @@ async fn run_service(
                                 "This render is still being monitored. Wait for it to finish before removing it.".into(),
                                 true,
                                 Some(key.remote_job_id.clone()),
+                                true,
                             );
                             continue;
                         }
@@ -1500,19 +1622,33 @@ async fn run_service(
                     }
                     ServiceCommand::PauseMonitor { op_id, key } => {
                         let Some(task_id) = monitors.get(&key).copied() else {
-                            emit_error(&events, op_id, Some(key.provider_id.clone()), ServiceScope::Generation, "That job is not currently being monitored".into(), true, Some(key.remote_job_id));
+                            emit_job_error(&events, op_id, Some(key.provider_id.clone()), ServiceScope::Generation, "That job is not currently being monitored".into(), true, Some(key.remote_job_id), true);
                             continue;
                         };
+                        let remote_continues = operations
+                            .get(&task_id)
+                            .is_some_and(|operation| {
+                                operation.remote_continues.load(Ordering::Acquire)
+                            });
                         if let Some(operation) = operations.get(&task_id) {
                             operation.cancel.store(true, Ordering::Release);
                         }
                         let saved_state = gui_state.clone();
                         let saved_key = key.clone();
                         let _ = tokio::task::spawn_blocking(move || saved_state.set_monitoring_paused(&saved_key, true)).await;
-                        let _ = events.send(ServiceEvent::MonitorPaused { op_id, key, remote_continues: true });
+                        let _ = events.send(ServiceEvent::MonitorPaused {
+                            op_id,
+                            key,
+                            remote_continues,
+                        });
                     }
                     ServiceCommand::PauseAll { op_id } => {
                         let keys: Vec<_> = monitors.keys().cloned().collect();
+                        let remote_continue = monitors.values().any(|task_id| {
+                            operations.get(task_id).is_some_and(|operation| {
+                                operation.remote_continues.load(Ordering::Acquire)
+                            })
+                        });
                         for task_id in monitors.values() {
                             if let Some(operation) = operations.get(task_id) {
                                 operation.cancel.store(true, Ordering::Release);
@@ -1525,7 +1661,11 @@ async fn run_service(
                                 let _ = saved_state.set_monitoring_paused(&key, true);
                             }
                         }).await;
-                        let _ = events.send(ServiceEvent::MonitorsPaused { op_id, count: keys.len(), remote_continue: true });
+                        let _ = events.send(ServiceEvent::MonitorsPaused {
+                            op_id,
+                            count: keys.len(),
+                            remote_continue,
+                        });
                     }
                     ServiceCommand::Generate { op_id, provider_id, mut request } => {
                         if submission_task.is_some() || preparation.is_some() {
@@ -1618,6 +1758,7 @@ async fn run_service(
                         let cancel = Arc::new(AtomicBool::new(false));
                         let task_id = next_task_id;
                         next_task_id = next_task_id.saturating_add(1);
+                        let remote_continues = Arc::new(AtomicBool::new(false));
                         let task = tokio::spawn(run_generate(
                             task_id,
                             op_id,
@@ -1632,33 +1773,54 @@ async fn run_service(
                             paths.clone(),
                             config.clone(),
                             Arc::clone(&cancel),
+                            Arc::clone(&remote_continues),
                             events.clone(),
                             notice_tx.clone(),
                         ));
-                        operations.insert(task_id, ActiveOperation { task_id, op_id, cancel, task });
+                        operations.insert(
+                            task_id,
+                            ActiveOperation {
+                                task_id,
+                                op_id,
+                                cancel,
+                                remote_continues,
+                                task,
+                            },
+                        );
                         submission_task = Some(task_id);
                     }
                     ServiceCommand::Resume { op_id, key } => {
                         if monitors.contains_key(&key) {
-                            emit_error(&events, op_id, Some(key.provider_id.clone()), ServiceScope::Generation, "That job is already being monitored".into(), true, Some(key.remote_job_id.clone()));
+                            emit_job_error(&events, op_id, Some(key.provider_id.clone()), ServiceScope::Generation, "That job is already being monitored".into(), true, Some(key.remote_job_id.clone()), true);
                             continue;
                         }
                         let provider_id = key.provider_id.clone();
-                        let Some(secret) = sessions.get(&provider_id).and_then(|session| session.key.clone()) else {
-                            emit_missing_key(&events, op_id, &provider_id, ServiceScope::Credential, Some(key.remote_job_id.clone()));
-                            continue;
-                        };
-                        let provider = match make_provider(&provider_id, &secret, &config, executor.clone()) {
-                            Ok(provider) => provider,
-                            Err(error) => {
-                                emit_provider_error(&events, op_id, ServiceScope::Generation, error, Some(key.remote_job_id.clone()));
-                                continue;
-                            }
+                        let provider = match sessions
+                            .get(&provider_id)
+                            .and_then(|session| session.key.clone())
+                        {
+                            Some(secret) => match make_provider(
+                                &provider_id,
+                                &secret,
+                                &config,
+                                executor.clone(),
+                            ) {
+                                Ok(provider) => Some(provider),
+                                Err(error) => {
+                                    emit_provider_error(&events, op_id, ServiceScope::Generation, error, Some(key.remote_job_id.clone()));
+                                    continue;
+                                }
+                            },
+                            // Resume validates durable local output before it
+                            // needs a provider. Missing credentials are reported
+                            // by the task only if remote monitoring is required.
+                            None => None,
                         };
                         let monitor_key = key.clone();
                         let cancel = Arc::new(AtomicBool::new(false));
                         let task_id = next_task_id;
                         next_task_id = next_task_id.saturating_add(1);
+                        let remote_continues = Arc::new(AtomicBool::new(true));
                         let task = tokio::spawn(run_existing(
                             task_id,
                             op_id,
@@ -1670,11 +1832,25 @@ async fn run_service(
                             paths.clone(),
                             config.clone(),
                             Arc::clone(&cancel),
+                            Arc::clone(&remote_continues),
                             events.clone(),
                             notice_tx.clone(),
                         ));
-                        operations.insert(task_id, ActiveOperation { task_id, op_id, cancel, task });
-                        monitors.insert(monitor_key, task_id);
+                        operations.insert(
+                            task_id,
+                            ActiveOperation {
+                                task_id,
+                                op_id,
+                                cancel,
+                                remote_continues,
+                                task,
+                            },
+                        );
+                        monitors.insert(monitor_key.clone(), task_id);
+                        let _ = events.send(ServiceEvent::MonitorStarted {
+                            op_id,
+                            key: monitor_key,
+                        });
                     }
                     ServiceCommand::ResumeAll { op_id } => {
                         let saved_state = gui_state.clone();
@@ -1696,12 +1872,19 @@ async fn run_service(
                                 continue;
                             }
                             let provider_id = job.key.provider_id.clone();
-                            let Some(secret) = sessions.get(&provider_id).and_then(|session| session.key.clone()) else { continue; };
-                            let Ok(provider) = make_provider(&provider_id, &secret, &config, executor.clone()) else { continue; };
+                            let provider = match sessions.get(&provider_id).and_then(|session| session.key.clone()) {
+                                Some(secret) => {
+                                    let Ok(provider) = make_provider(&provider_id, &secret, &config, executor.clone()) else { continue; };
+                                    Some(provider)
+                                }
+                                None if job.completed_output_path.is_some() => None,
+                                None => continue,
+                            };
                             let task_id = next_task_id;
                             next_task_id = next_task_id.saturating_add(1);
                             let cancel = Arc::new(AtomicBool::new(false));
                             let task_key = job.key.clone();
+                            let remote_continues = Arc::new(AtomicBool::new(true));
                             let task = tokio::spawn(run_existing(
                                 task_id,
                                 op_id,
@@ -1713,11 +1896,25 @@ async fn run_service(
                                 paths.clone(),
                                 config.clone(),
                                 Arc::clone(&cancel),
+                                Arc::clone(&remote_continues),
                                 events.clone(),
                                 notice_tx.clone(),
                             ));
-                            operations.insert(task_id, ActiveOperation { task_id, op_id, cancel, task });
+                            operations.insert(
+                                task_id,
+                                ActiveOperation {
+                                    task_id,
+                                    op_id,
+                                    cancel,
+                                    remote_continues,
+                                    task,
+                                },
+                            );
                             monitors.insert(task_key.clone(), task_id);
+                            let _ = events.send(ServiceEvent::MonitorStarted {
+                                op_id,
+                                key: task_key.clone(),
+                            });
                             let state = gui_state.clone();
                             let _ = tokio::task::spawn_blocking(move || state.set_monitoring_paused(&task_key, false)).await;
                             started += 1;
@@ -1726,7 +1923,7 @@ async fn run_service(
                     }
                     ServiceCommand::Import { op_id, provider_id, locator } => {
                         if locator.provider_id() != provider_id {
-                            emit_error(&events, op_id, Some(provider_id), ServiceScope::Import, "Import locator belongs to a different provider".into(), false, Some(locator.remote_job_id().into()));
+                            emit_job_error(&events, op_id, Some(provider_id), ServiceScope::Import, "Import locator belongs to a different provider".into(), false, Some(locator.remote_job_id().into()), true);
                             continue;
                         }
                         let Some(secret) = sessions.get(&provider_id).and_then(|session| session.key.clone()) else {
@@ -1745,28 +1942,43 @@ async fn run_service(
                             remote_job_id: locator.remote_job_id().to_owned(),
                         };
                         if monitors.contains_key(&monitor_key) {
-                            emit_error(&events, op_id, Some(provider_id), ServiceScope::Import, "That job is already being monitored".into(), true, Some(locator.remote_job_id().into()));
+                            emit_job_error(&events, op_id, Some(provider_id), ServiceScope::Import, "That job is already being monitored".into(), true, Some(locator.remote_job_id().into()), true);
                             continue;
                         }
                         let cancel = Arc::new(AtomicBool::new(false));
                         let task_id = next_task_id;
                         next_task_id = next_task_id.saturating_add(1);
+                        let remote_continues = Arc::new(AtomicBool::new(true));
                         let task = tokio::spawn(run_existing(
                             task_id,
                             op_id,
                             provider_id.clone(),
                             ExistingJob::Import(locator),
-                            provider,
+                            Some(provider),
                             history.clone(),
                             gui_state.clone(),
                             paths.clone(),
                             config.clone(),
                             Arc::clone(&cancel),
+                            Arc::clone(&remote_continues),
                             events.clone(),
                             notice_tx.clone(),
                         ));
-                        operations.insert(task_id, ActiveOperation { task_id, op_id, cancel, task });
-                        monitors.insert(monitor_key, task_id);
+                        operations.insert(
+                            task_id,
+                            ActiveOperation {
+                                task_id,
+                                op_id,
+                                cancel,
+                                remote_continues,
+                                task,
+                            },
+                        );
+                        monitors.insert(monitor_key.clone(), task_id);
+                        let _ = events.send(ServiceEvent::MonitorStarted {
+                            op_id,
+                            key: monitor_key,
+                        });
                     }
                     ServiceCommand::Shutdown => {
                         if submission_task.is_some() {
@@ -1806,27 +2018,35 @@ async fn run_service(
     }
 }
 
+fn validated_local_output(path: &Path, videos_dir: &Path) -> Result<PathBuf, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| "The saved video could not be inspected.".to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("The saved output is not a regular video file.".into());
+    }
+
+    let canonical_videos = videos_dir
+        .canonicalize()
+        .map_err(|_| "The Videos folder is unavailable.".to_string())?;
+    let canonical_output = path
+        .canonicalize()
+        .map_err(|_| "The saved video could not be verified.".to_string())?;
+    if !canonical_output.starts_with(&canonical_videos) {
+        return Err("The saved output is outside the Videos folder.".into());
+    }
+    Ok(canonical_output)
+}
+
 fn remove_recorded_output(path: &Path, videos_dir: &Path) -> Result<bool, String> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(_) => {
             return Err("The saved video could not be inspected, so it was left alone.".into());
         }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err("The saved output is not a regular video file, so it was left alone.".into());
     }
-
-    let canonical_videos = videos_dir.canonicalize().map_err(|_| {
-        "The Videos folder is unavailable, so the video was left alone.".to_string()
-    })?;
-    let canonical_output = path
-        .canonicalize()
-        .map_err(|_| "The saved video could not be verified, so it was left alone.".to_string())?;
-    if !canonical_output.starts_with(&canonical_videos) {
-        return Err("The saved output is outside the Videos folder, so it was left alone.".into());
-    }
+    let canonical_output = validated_local_output(path, videos_dir)
+        .map_err(|error| format!("{error} It was left alone."))?;
 
     std::fs::remove_file(&canonical_output).map_err(|_| {
         "The saved video could not be deleted. Close any app using it and try again.".to_string()
@@ -1875,15 +2095,10 @@ fn delete_generation_locally(
 }
 
 fn connection(provider_id: &ProviderId, session: &ProviderSession) -> ProviderConnection {
-    let credential_status = session
-        .store
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .status();
     ProviderConnection {
         descriptor: descriptor(provider_id),
         connected: session.key.is_some(),
-        credential_status,
+        credential_status: session.credential_status.clone(),
     }
 }
 
@@ -2008,6 +2223,20 @@ fn memory_status() -> CredentialStatus {
         available: false,
         persistent: false,
         message: "API key is kept in memory for this session only".into(),
+    }
+}
+
+fn unavailable_credential_status(
+    error: CredentialWorkerError,
+    operation: &'static str,
+) -> CredentialStatus {
+    CredentialStatus {
+        backend: "system keyring".into(),
+        available: false,
+        persistent: false,
+        message: format!(
+            "API key was not {operation} because the credential backend was unavailable ({error}); you can continue with an in-memory key"
+        ),
     }
 }
 
@@ -2743,9 +2972,11 @@ fn emit_gui_state_error(
     emit_error(events, op_id, None, scope, error.to_string(), true, None);
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum TaskFailureKind {
     Ordinary,
+    RemoteContinues,
+    RemoteFinished,
     SubmissionUncertain,
     RecoveryFailed,
 }
@@ -2793,6 +3024,17 @@ impl TaskFailure {
             kind: TaskFailureKind::Ordinary,
         }
     }
+
+    fn with_remote_continues(mut self, remote_continues: bool) -> Self {
+        if matches!(self.kind, TaskFailureKind::Ordinary) {
+            self.kind = if remote_continues {
+                TaskFailureKind::RemoteContinues
+            } else {
+                TaskFailureKind::RemoteFinished
+            };
+        }
+        self
+    }
 }
 
 struct GuiRecoverySaved {
@@ -2803,6 +3045,7 @@ async fn persist_accepted_gui_state(
     gui_state: &GuiStateStore,
     key: &ProviderJobKey,
     locator: &JobLocator,
+    accepted_at: DateTime<Utc>,
     prepared_media: Vec<PreparedMediaAssociation>,
 ) -> Result<GuiRecoverySaved, GuiStateError> {
     let state = gui_state.clone();
@@ -2812,8 +3055,9 @@ async fn persist_accepted_gui_state(
         state.save_resumable_job(&ResumableJob {
             key: saved_key.clone(),
             locator: saved_locator,
-            accepted_at: Utc::now(),
+            accepted_at,
             monitoring_paused: false,
+            completed_output_path: None,
         })?;
         let media = prepared_media
             .into_iter()
@@ -2839,12 +3083,15 @@ async fn persist_existing_gui_state(
     op_id: u64,
     gui_state: &GuiStateStore,
     job: &VideoJob,
+    accepted_at: DateTime<Utc>,
     events: &mpsc::UnboundedSender<ServiceEvent>,
 ) {
-    match persist_accepted_gui_state(gui_state, &job.key(), &job.locator, Vec::new()).await {
+    match persist_accepted_gui_state(gui_state, &job.key(), &job.locator, accepted_at, Vec::new())
+        .await
+    {
         Ok(saved) => {
             if let Some(error) = saved.media_error {
-                emit_error(
+                emit_job_error(
                     events,
                     op_id,
                     Some(job.provider_id.clone()),
@@ -2852,10 +3099,11 @@ async fn persist_existing_gui_state(
                     error.to_string(),
                     true,
                     Some(job.id.clone()),
+                    !job.terminal(),
                 );
             }
         }
-        Err(error) => emit_error(
+        Err(error) => emit_job_error(
             events,
             op_id,
             Some(job.provider_id.clone()),
@@ -2863,8 +3111,30 @@ async fn persist_existing_gui_state(
             format!("Could not save resumable GUI job state: {error}"),
             true,
             Some(job.id.clone()),
+            !job.terminal(),
         ),
     }
+}
+
+async fn persist_completed_gui_state(
+    gui_state: &GuiStateStore,
+    job: &VideoJob,
+    accepted_at: DateTime<Utc>,
+    output_path: PathBuf,
+) -> Result<(), GuiStateError> {
+    let state = gui_state.clone();
+    let resumable = ResumableJob {
+        key: job.key(),
+        locator: job.locator.clone(),
+        accepted_at,
+        monitoring_paused: true,
+        completed_output_path: Some(output_path),
+    };
+    tokio::task::spawn_blocking(move || state.save_resumable_job(&resumable))
+        .await
+        .map_err(|_| {
+            GuiStateError::InvalidValue("completed-output recovery save task failed".into())
+        })?
 }
 
 async fn clear_uncertain_submission_record(
@@ -2909,6 +3179,7 @@ async fn run_generate(
     paths: AppPaths,
     config: ServiceConfig,
     cancel: Arc<AtomicBool>,
+    remote_continues: Arc<AtomicBool>,
     events: mpsc::UnboundedSender<ServiceEvent>,
     notices: mpsc::UnboundedSender<OperationNotice>,
 ) {
@@ -2926,6 +3197,7 @@ async fn run_generate(
         paths,
         config,
         cancel,
+        remote_continues,
         &events,
         &notices,
     )
@@ -2953,6 +3225,7 @@ async fn run_generate_inner(
     paths: AppPaths,
     config: ServiceConfig,
     cancel: Arc<AtomicBool>,
+    remote_continues: Arc<AtomicBool>,
     events: &mpsc::UnboundedSender<ServiceEvent>,
     notices: &mpsc::UnboundedSender<OperationNotice>,
 ) -> Result<(), TaskFailure> {
@@ -2985,6 +3258,7 @@ async fn run_generate_inner(
             return Err(TaskFailure::provider(ServiceScope::Generation, error, None));
         }
     };
+    remote_continues.store(!job.terminal(), Ordering::Release);
     let _ = events.send(ServiceEvent::JobAccepted {
         op_id,
         provider_id: provider_id.clone(),
@@ -2993,7 +3267,8 @@ async fn run_generate_inner(
     });
     let key = job.key();
     let gui_recovery =
-        persist_accepted_gui_state(&gui_state, &key, &job.locator, prepared_media).await;
+        persist_accepted_gui_state(&gui_state, &key, &job.locator, Utc::now(), prepared_media)
+            .await;
     let mut gui_recovery_error = None;
     let mut safety_cleared = false;
     match gui_recovery {
@@ -3043,13 +3318,16 @@ async fn run_generate_inner(
         saved_history.create_provider_job(&saved_provider, &saved_request, &saved_job)
     })
     .await
-    .map_err(|_| TaskFailure {
-        provider_id: provider_id.clone(),
-        scope: ServiceScope::History,
-        message: "History task failed after the provider accepted the job".into(),
-        recoverable: false,
-        job_id: Some(job.id.clone()),
-        kind: TaskFailureKind::Ordinary,
+    .map_err(|_| {
+        TaskFailure {
+            provider_id: provider_id.clone(),
+            scope: ServiceScope::History,
+            message: "History task failed after the provider accepted the job".into(),
+            recoverable: false,
+            job_id: Some(job.id.clone()),
+            kind: TaskFailureKind::Ordinary,
+        }
+        .with_remote_continues(!job.terminal())
     })
     .and_then(|result| {
         result.map_err(|error| {
@@ -3059,6 +3337,7 @@ async fn run_generate_inner(
                 error,
                 Some(job.id.clone()),
             )
+            .with_remote_continues(!job.terminal())
         })
     });
     let record = match history_result {
@@ -3116,6 +3395,11 @@ async fn run_generate_inner(
                     error.message
                 );
                 error.kind = TaskFailureKind::RecoveryFailed;
+            } else {
+                // The accepted job is already durable in GUI recovery state.
+                // Compatible-history failure must leave Resume available in
+                // this process instead of terminalizing a paid remote job.
+                error.recoverable = true;
             }
             return Err(error);
         }
@@ -3135,9 +3419,11 @@ async fn run_generate_inner(
         paths,
         config,
         cancel,
+        remote_continues,
         request,
         job,
         record,
+        false,
         events,
     )
     .await
@@ -3154,12 +3440,13 @@ async fn run_existing(
     op_id: u64,
     provider_id: ProviderId,
     existing: ExistingJob,
-    provider: Arc<dyn VideoProvider>,
+    provider: Option<Arc<dyn VideoProvider>>,
     history: HistoryStore,
     gui_state: GuiStateStore,
     paths: AppPaths,
     config: ServiceConfig,
     cancel: Arc<AtomicBool>,
+    remote_continues: Arc<AtomicBool>,
     events: mpsc::UnboundedSender<ServiceEvent>,
     notices: mpsc::UnboundedSender<OperationNotice>,
 ) {
@@ -3173,6 +3460,7 @@ async fn run_existing(
         paths,
         config,
         cancel,
+        remote_continues,
         &events,
     )
     .await;
@@ -3187,19 +3475,32 @@ async fn run_existing_inner(
     op_id: u64,
     provider_id: ProviderId,
     existing: ExistingJob,
-    provider: Arc<dyn VideoProvider>,
+    provider: Option<Arc<dyn VideoProvider>>,
     history: HistoryStore,
     gui_state: GuiStateStore,
     paths: AppPaths,
     config: ServiceConfig,
     cancel: Arc<AtomicBool>,
+    remote_continues: Arc<AtomicBool>,
     events: &mpsc::UnboundedSender<ServiceEvent>,
 ) -> Result<(), TaskFailure> {
-    let (request, job, record) = match existing {
+    let (request, job, record, tolerate_history_failure) = match existing {
         ExistingJob::Import(locator) => {
+            let provider = provider.as_ref().ok_or_else(|| TaskFailure {
+                provider_id: provider_id.clone(),
+                scope: ServiceScope::Credential,
+                message: format!(
+                    "Connect a {} API key first",
+                    descriptor(&provider_id).display_name
+                ),
+                recoverable: true,
+                job_id: Some(locator.remote_job_id().to_owned()),
+                kind: TaskFailureKind::RemoteContinues,
+            })?;
             let requested_id = locator.remote_job_id().to_owned();
             let job = provider.import(&locator).await.map_err(|error| {
                 TaskFailure::provider(ServiceScope::Import, error, Some(requested_id))
+                    .with_remote_continues(true)
             })?;
             let saved_history = history.clone();
             let saved_provider = provider_id.clone();
@@ -3208,13 +3509,16 @@ async fn run_existing_inner(
                 saved_history.import_provider_job(&saved_provider, &saved_job, None)
             })
             .await
-            .map_err(|_| TaskFailure {
-                provider_id: provider_id.clone(),
-                scope: ServiceScope::History,
-                message: "History import task failed".into(),
-                recoverable: true,
-                job_id: Some(job.id.clone()),
-                kind: TaskFailureKind::Ordinary,
+            .map_err(|_| {
+                TaskFailure {
+                    provider_id: provider_id.clone(),
+                    scope: ServiceScope::History,
+                    message: "History import task failed".into(),
+                    recoverable: true,
+                    job_id: Some(job.id.clone()),
+                    kind: TaskFailureKind::Ordinary,
+                }
+                .with_remote_continues(!job.terminal())
             })?
             .map_err(|error| {
                 TaskFailure::history(
@@ -3223,6 +3527,7 @@ async fn run_existing_inner(
                     error,
                     Some(job.id.clone()),
                 )
+                .with_remote_continues(!job.terminal())
             })?;
             let _ = events.send(ServiceEvent::Imported {
                 op_id,
@@ -3230,31 +3535,355 @@ async fn run_existing_inner(
                 job: job.clone(),
                 record: record.clone(),
             });
-            persist_existing_gui_state(op_id, &gui_state, &job, events).await;
-            (record.request.clone(), job, record)
+            persist_existing_gui_state(op_id, &gui_state, &job, record.created_at, events).await;
+            (record.request.clone(), job, record, false)
         }
         ExistingJob::Resume(key) => {
             let lookup = history.clone();
             let saved_key = key.clone();
-            let stored = tokio::task::spawn_blocking(move || lookup.get_provider(&saved_key))
+            let mut history_warning_emitted = false;
+            let stored = match tokio::task::spawn_blocking(move || lookup.get_provider(&saved_key))
                 .await
-                .map_err(|_| TaskFailure {
+            {
+                Ok(Ok(stored)) => stored,
+                Ok(Err(error)) => {
+                    history_warning_emitted = true;
+                    let _ = events.send(ServiceEvent::JobRecoveryWarning {
+                        op_id,
+                        provider_id: provider_id.clone(),
+                        key: key.clone(),
+                        message: format!(
+                            "Compatible history could not be read; restoring from saved GUI recovery state: {error}"
+                        ),
+                    });
+                    None
+                }
+                Err(_) => {
+                    history_warning_emitted = true;
+                    let _ = events.send(ServiceEvent::JobRecoveryWarning {
+                        op_id,
+                        provider_id: provider_id.clone(),
+                        key: key.clone(),
+                        message: "Compatible history lookup failed; restoring from saved GUI recovery state"
+                            .into(),
+                    });
+                    None
+                }
+            };
+
+            // Load the sidecar even when compatible history is readable: the
+            // sidecar may be the only durable record of an already-downloaded
+            // output if the final history update failed.
+            let recovery_state = gui_state.clone();
+            let recovery_key = key.clone();
+            let recovery_lookup = tokio::task::spawn_blocking(move || {
+                recovery_state.resumable_jobs().map(|jobs| {
+                    jobs.into_iter()
+                        .find(|candidate| candidate.key == recovery_key)
+                })
+            })
+            .await;
+            let recovery = match recovery_lookup {
+                Ok(Ok(recovery)) => recovery,
+                Ok(Err(error)) if stored.is_some() => {
+                    let _ = events.send(ServiceEvent::JobRecoveryWarning {
+                        op_id,
+                        provider_id: provider_id.clone(),
+                        key: key.clone(),
+                        message: format!("Saved GUI recovery state could not be read: {error}"),
+                    });
+                    None
+                }
+                Err(_) if stored.is_some() => {
+                    let _ = events.send(ServiceEvent::JobRecoveryWarning {
+                        op_id,
+                        provider_id: provider_id.clone(),
+                        key: key.clone(),
+                        message: "Saved GUI recovery-state lookup failed".into(),
+                    });
+                    None
+                }
+                Ok(Err(error)) => {
+                    return Err(TaskFailure {
+                        provider_id: provider_id.clone(),
+                        scope: ServiceScope::Generation,
+                        message: error.to_string(),
+                        recoverable: true,
+                        job_id: Some(key.remote_job_id.clone()),
+                        kind: TaskFailureKind::RemoteContinues,
+                    });
+                }
+                Err(_) => {
+                    return Err(TaskFailure {
+                        provider_id: provider_id.clone(),
+                        scope: ServiceScope::Generation,
+                        message: "Saved recovery-state lookup failed".into(),
+                        recoverable: true,
+                        job_id: Some(key.remote_job_id.clone()),
+                        kind: TaskFailureKind::RemoteContinues,
+                    });
+                }
+            };
+            let recovered_output = if let Some(path) = recovery
+                .as_ref()
+                .and_then(|saved| saved.completed_output_path.clone())
+            {
+                let videos_dir = paths.videos_dir.clone();
+                match tokio::task::spawn_blocking(move || {
+                    validated_local_output(&path, &videos_dir)
+                })
+                .await
+                {
+                    Ok(Ok(path)) => Some(path),
+                    Ok(Err(error)) => {
+                        let _ = events.send(ServiceEvent::JobRecoveryWarning {
+                            op_id,
+                            provider_id: provider_id.clone(),
+                            key: key.clone(),
+                            message: format!(
+                                "Saved completed output was ignored during recovery: {error}"
+                            ),
+                        });
+                        None
+                    }
+                    Err(_) => {
+                        let _ = events.send(ServiceEvent::JobRecoveryWarning {
+                            op_id,
+                            provider_id: provider_id.clone(),
+                            key: key.clone(),
+                            message: "Saved completed output could not be verified".into(),
+                        });
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let history_output = if recovered_output.is_none() {
+                if let Some(path) = stored
+                    .as_ref()
+                    .and_then(|record| record.output_path.clone())
+                {
+                    let videos_dir = paths.videos_dir.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        validated_local_output(&path, &videos_dir)
+                    })
+                    .await
+                    {
+                        Ok(Ok(path)) => Some(path),
+                        Ok(Err(error)) => {
+                            let _ = events.send(ServiceEvent::JobRecoveryWarning {
+                                op_id,
+                                provider_id: provider_id.clone(),
+                                key: key.clone(),
+                                message: format!(
+                                    "Saved history output was ignored during recovery: {error}"
+                                ),
+                            });
+                            None
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // A validated completed-output path is already durable proof that
+            // this provider job finished and downloaded successfully. Restore
+            // it before touching provider credentials or transport.
+            if let Some(path) = recovered_output.clone().or(history_output) {
+                let output_from_sidecar = recovered_output.is_some();
+                let locator = recovery
+                    .as_ref()
+                    .map(|saved| &saved.locator)
+                    .or_else(|| stored.as_ref().map(|record| &record.locator))
+                    .ok_or_else(|| TaskFailure {
+                        provider_id: provider_id.clone(),
+                        scope: ServiceScope::History,
+                        message: "Completed output has no saved provider locator".into(),
+                        recoverable: true,
+                        job_id: Some(key.remote_job_id.clone()),
+                        kind: TaskFailureKind::RemoteFinished,
+                    })?;
+                let job = completed_job_from_recovery(&key, locator, stored.as_ref());
+                let (mut record, history_persisted) = if output_from_sidecar {
+                    if let Some(stored) = stored.as_ref() {
+                        let fallback_request = stored
+                            .request
+                            .clone()
+                            .unwrap_or_else(|| request_from_job(&provider_id, &job));
+                        update_history_with_recovery_fallback(
+                            &history,
+                            &provider_id,
+                            &job,
+                            Some(path.clone()),
+                            &fallback_request,
+                            true,
+                            stored.created_at,
+                        )
+                        .await?
+                    } else {
+                        let recovery = recovery.as_ref().ok_or_else(|| TaskFailure {
+                            provider_id: provider_id.clone(),
+                            scope: ServiceScope::History,
+                            message: "Completed output has no saved GUI recovery row".into(),
+                            recoverable: true,
+                            job_id: Some(key.remote_job_id.clone()),
+                            kind: TaskFailureKind::RemoteFinished,
+                        })?;
+                        let saved_history = history.clone();
+                        let saved_provider = provider_id.clone();
+                        let saved_job = job.clone();
+                        let saved_path = path.clone();
+                        let saved_accepted_at = recovery.accepted_at;
+                        match tokio::task::spawn_blocking(move || {
+                            saved_history.restore_provider_job(
+                                &saved_provider,
+                                &saved_job,
+                                Some(&saved_path),
+                                saved_accepted_at,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(Ok(record)) => (record, true),
+                            Ok(Err(error)) => {
+                                if !history_warning_emitted {
+                                    let _ = events.send(ServiceEvent::JobRecoveryWarning {
+                                        op_id,
+                                        provider_id: provider_id.clone(),
+                                        key: key.clone(),
+                                        message: format!(
+                                            "The completed output was restored from GUI recovery state, but compatible history is unavailable: {error}"
+                                        ),
+                                    });
+                                }
+                                (
+                                    transient_history_record(
+                                        &provider_id,
+                                        &job,
+                                        None,
+                                        Some(path.clone()),
+                                        recovery.accepted_at,
+                                    ),
+                                    false,
+                                )
+                            }
+                            Err(_) => {
+                                if !history_warning_emitted {
+                                    let _ = events.send(ServiceEvent::JobRecoveryWarning {
+                                        op_id,
+                                        provider_id: provider_id.clone(),
+                                        key: key.clone(),
+                                        message: "The completed output was restored from GUI recovery state, but the history restoration task failed"
+                                            .into(),
+                                    });
+                                }
+                                (
+                                    transient_history_record(
+                                        &provider_id,
+                                        &job,
+                                        None,
+                                        Some(path.clone()),
+                                        recovery.accepted_at,
+                                    ),
+                                    false,
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    (
+                        stored.as_ref().cloned().ok_or_else(|| TaskFailure {
+                            provider_id: provider_id.clone(),
+                            scope: ServiceScope::History,
+                            message: "Validated history output has no history record".into(),
+                            recoverable: true,
+                            job_id: Some(key.remote_job_id.clone()),
+                            kind: TaskFailureKind::RemoteFinished,
+                        })?,
+                        true,
+                    )
+                };
+                record.output_path = Some(path.clone());
+                let _ = events.send(ServiceEvent::JobUpdated {
+                    op_id,
                     provider_id: provider_id.clone(),
-                    scope: ServiceScope::History,
-                    message: "History lookup task failed".into(),
+                    job: job.clone(),
+                    record: record.clone(),
+                });
+                if history_persisted {
+                    remove_resumable_state(&gui_state, &key).await;
+                } else {
+                    pause_resumable_state(&gui_state, &key).await;
+                }
+                let _ = events.send(ServiceEvent::Downloaded {
+                    op_id,
+                    provider_id,
+                    job,
+                    record,
+                    path,
+                });
+                return Ok(());
+            }
+
+            let (job, mut updated, tolerate_history_failure, history_persisted) = if let Some(
+                stored,
+            ) = stored
+            {
+                let provider = provider.as_ref().ok_or_else(|| TaskFailure {
+                    provider_id: provider_id.clone(),
+                    scope: ServiceScope::Credential,
+                    message: format!(
+                        "Connect a {} API key first",
+                        descriptor(&provider_id).display_name
+                    ),
                     recoverable: true,
                     job_id: Some(key.remote_job_id.clone()),
-                    kind: TaskFailureKind::Ordinary,
-                })?
-                .map_err(|error| {
-                    TaskFailure::history(
-                        provider_id.clone(),
-                        ServiceScope::History,
+                    kind: TaskFailureKind::RemoteContinues,
+                })?;
+                let job = provider.poll(&stored.locator).await.map_err(|error| {
+                    TaskFailure::provider(
+                        ServiceScope::Generation,
                         error,
-                        Some(key.remote_job_id.clone()),
+                        Some(stored.job_id.clone()),
                     )
-                })?
-                .ok_or_else(|| TaskFailure {
+                    .with_remote_continues(true)
+                })?;
+                let fallback_request = stored
+                    .request
+                    .clone()
+                    .unwrap_or_else(|| request_from_job(&provider_id, &job));
+                let (updated, history_persisted) = update_history_with_recovery_fallback(
+                    &history,
+                    &provider_id,
+                    &job,
+                    None,
+                    &fallback_request,
+                    false,
+                    stored.created_at,
+                )
+                .await?;
+                if !history_persisted && !history_warning_emitted {
+                    let _ = events.send(ServiceEvent::JobRecoveryWarning {
+                        op_id,
+                        provider_id: provider_id.clone(),
+                        key: key.clone(),
+                        message: "The completed output remains in saved GUI recovery state because compatible history is unavailable"
+                            .into(),
+                    });
+                }
+                (job, updated, !history_persisted, history_persisted)
+            } else {
+                // The GUI sidecar is deliberately written before compatible
+                // history after a paid provider accepts a job. If the latter
+                // write failed, its validated locator is the recovery source
+                // of truth and must be sufficient to rebuild history.
+                let recovery = recovery.ok_or_else(|| TaskFailure {
                     provider_id: provider_id.clone(),
                     scope: ServiceScope::History,
                     message: format!(
@@ -3263,22 +3892,138 @@ async fn run_existing_inner(
                     ),
                     recoverable: true,
                     job_id: Some(key.remote_job_id.clone()),
-                    kind: TaskFailureKind::Ordinary,
+                    kind: TaskFailureKind::RemoteContinues,
                 })?;
-            let job = provider.poll(&stored.locator).await.map_err(|error| {
-                TaskFailure::provider(ServiceScope::Generation, error, Some(stored.job_id.clone()))
-            })?;
-            let updated = update_history(&history, &provider_id, &job, None).await?;
+                let provider = provider.as_ref().ok_or_else(|| TaskFailure {
+                    provider_id: provider_id.clone(),
+                    scope: ServiceScope::Credential,
+                    message: format!(
+                        "Connect a {} API key first",
+                        descriptor(&provider_id).display_name
+                    ),
+                    recoverable: true,
+                    job_id: Some(key.remote_job_id.clone()),
+                    kind: TaskFailureKind::RemoteContinues,
+                })?;
+                let job = provider.import(&recovery.locator).await.map_err(|error| {
+                    TaskFailure::provider(
+                        ServiceScope::Import,
+                        error,
+                        Some(key.remote_job_id.clone()),
+                    )
+                    .with_remote_continues(true)
+                })?;
+                if job.key() != key {
+                    return Err(TaskFailure {
+                        provider_id: provider_id.clone(),
+                        scope: ServiceScope::Import,
+                        message:
+                            "The provider returned a different job while restoring recovery state"
+                                .into(),
+                        recoverable: false,
+                        job_id: Some(key.remote_job_id.clone()),
+                        kind: TaskFailureKind::RemoteContinues,
+                    });
+                }
+                let saved_history = history.clone();
+                let saved_provider = provider_id.clone();
+                let saved_job = job.clone();
+                let saved_accepted_at = recovery.accepted_at;
+                let restoration = tokio::task::spawn_blocking(move || {
+                    saved_history.restore_provider_job(
+                        &saved_provider,
+                        &saved_job,
+                        None,
+                        saved_accepted_at,
+                    )
+                })
+                .await;
+                let (updated, history_persisted) = match restoration {
+                    Ok(Ok(updated)) => (updated, true),
+                    Ok(Err(error)) => {
+                        if !history_warning_emitted {
+                            let _ = events.send(ServiceEvent::JobRecoveryWarning {
+                                op_id,
+                                provider_id: provider_id.clone(),
+                                key: key.clone(),
+                                message: format!(
+                                    "The job was restored from GUI recovery state, but compatible history is unavailable: {error}"
+                                ),
+                            });
+                        }
+                        (
+                            transient_history_record(
+                                &provider_id,
+                                &job,
+                                None,
+                                None,
+                                recovery.accepted_at,
+                            ),
+                            false,
+                        )
+                    }
+                    Err(_) => {
+                        if !history_warning_emitted {
+                            let _ = events.send(ServiceEvent::JobRecoveryWarning {
+                                op_id,
+                                provider_id: provider_id.clone(),
+                                key: key.clone(),
+                                message: "The job was restored from GUI recovery state, but the history restoration task failed"
+                                    .into(),
+                            });
+                        }
+                        (
+                            transient_history_record(
+                                &provider_id,
+                                &job,
+                                None,
+                                None,
+                                recovery.accepted_at,
+                            ),
+                            false,
+                        )
+                    }
+                };
+                (job, updated, !history_persisted, history_persisted)
+            };
             let _ = events.send(ServiceEvent::JobUpdated {
                 op_id,
                 provider_id: provider_id.clone(),
                 job: job.clone(),
                 record: updated.clone(),
             });
-            if let Some(path) = updated.output_path.clone()
-                && path.is_file()
-            {
-                remove_resumable_state(&gui_state, &updated.key()).await;
+            let completed_output = if let Some(path) = updated.output_path.clone() {
+                let videos_dir = paths.videos_dir.clone();
+                match tokio::task::spawn_blocking(move || {
+                    validated_local_output(&path, &videos_dir)
+                })
+                .await
+                {
+                    Ok(Ok(path)) => Some(path),
+                    Ok(Err(error)) => {
+                        let _ = events.send(ServiceEvent::JobRecoveryWarning {
+                            op_id,
+                            provider_id: provider_id.clone(),
+                            key: key.clone(),
+                            message: format!(
+                                "Saved history output was ignored during recovery: {error}"
+                            ),
+                        });
+                        None
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            if let Some(path) = completed_output {
+                remote_continues.store(false, Ordering::Release);
+                updated.output_path = Some(path.clone());
+                if history_persisted {
+                    remove_resumable_state(&gui_state, &updated.key()).await;
+                } else {
+                    pause_resumable_state(&gui_state, &updated.key()).await;
+                }
                 let _ = events.send(ServiceEvent::Downloaded {
                     op_id,
                     provider_id,
@@ -3288,11 +4033,31 @@ async fn run_existing_inner(
                 });
                 return Ok(());
             }
-            persist_existing_gui_state(op_id, &gui_state, &job, events).await;
-            (updated.request.clone(), job, updated)
+            persist_existing_gui_state(op_id, &gui_state, &job, updated.created_at, events).await;
+            (
+                updated.request.clone(),
+                job,
+                updated,
+                tolerate_history_failure,
+            )
         }
     };
+    remote_continues.store(!job.terminal(), Ordering::Release);
     let request = request.unwrap_or_else(|| request_from_job(&provider_id, &job));
+    let provider = provider.ok_or_else(|| {
+        TaskFailure {
+            provider_id: provider_id.clone(),
+            scope: ServiceScope::Credential,
+            message: format!(
+                "Connect a {} API key first",
+                descriptor(&provider_id).display_name
+            ),
+            recoverable: true,
+            job_id: Some(job.id.clone()),
+            kind: TaskFailureKind::Ordinary,
+        }
+        .with_remote_continues(!job.terminal())
+    })?;
     monitor_job(
         op_id,
         provider_id,
@@ -3302,9 +4067,11 @@ async fn run_existing_inner(
         paths,
         config,
         cancel,
+        remote_continues,
         request,
         job,
         record,
+        tolerate_history_failure,
         events,
     )
     .await
@@ -3320,14 +4087,23 @@ async fn monitor_job(
     paths: AppPaths,
     config: ServiceConfig,
     cancel: Arc<AtomicBool>,
+    remote_continues: Arc<AtomicBool>,
     request: VideoRequest,
     mut job: VideoJob,
-    _record: JobRecord,
+    mut record: JobRecord,
+    tolerate_history_failure: bool,
     events: &mpsc::UnboundedSender<ServiceEvent>,
 ) -> Result<(), TaskFailure> {
+    remote_continues.store(!job.terminal(), Ordering::Release);
     if cancel.load(Ordering::Acquire) {
         pause_resumable_state(&gui_state, &job.key()).await;
-        emit_cancelled(events, op_id, provider_id, Some(job.id), true);
+        emit_cancelled(
+            events,
+            op_id,
+            provider_id,
+            Some(job.id),
+            remote_continues.load(Ordering::Acquire),
+        );
         return Ok(());
     }
     let mut attempts = 0usize;
@@ -3350,17 +4126,35 @@ async fn monitor_job(
         attempts += 1;
         job = provider.poll(&job.locator).await.map_err(|error| {
             TaskFailure::provider(ServiceScope::Generation, error, Some(job.id.clone()))
+                .with_remote_continues(true)
         })?;
-        let record = update_history(&history, &provider_id, &job, None).await?;
+        remote_continues.store(!job.terminal(), Ordering::Release);
+        let (updated, _) = update_history_with_recovery_fallback(
+            &history,
+            &provider_id,
+            &job,
+            None,
+            &request,
+            tolerate_history_failure,
+            record.created_at,
+        )
+        .await?;
+        record = updated.clone();
         let _ = events.send(ServiceEvent::JobUpdated {
             op_id,
             provider_id: provider_id.clone(),
             job: job.clone(),
-            record,
+            record: updated,
         });
         if cancel.load(Ordering::Acquire) {
             pause_resumable_state(&gui_state, &job.key()).await;
-            emit_cancelled(events, op_id, provider_id, Some(job.id), true);
+            emit_cancelled(
+                events,
+                op_id,
+                provider_id,
+                Some(job.id),
+                remote_continues.load(Ordering::Acquire),
+            );
             return Ok(());
         }
     }
@@ -3372,10 +4166,11 @@ async fn monitor_job(
             message: "Monitoring reached its local limit. The remote job was not cancelled; open History later to resume checking it.".into(),
             recoverable: true,
             job_id: Some(job.id),
-            kind: TaskFailureKind::Ordinary,
+            kind: TaskFailureKind::RemoteContinues,
         });
     }
     if job.status != JobStatus::Completed {
+        remote_continues.store(false, Ordering::Release);
         remove_resumable_state(&gui_state, &job.key()).await;
         return Err(TaskFailure {
             provider_id,
@@ -3386,12 +4181,13 @@ async fn monitor_job(
                 .unwrap_or_else(|| format!("The provider marked the job {}.", job.status.as_str())),
             recoverable: false,
             job_id: Some(job.id),
-            kind: TaskFailureKind::Ordinary,
+            kind: TaskFailureKind::RemoteFinished,
         });
     }
+    remote_continues.store(false, Ordering::Release);
     if cancel.load(Ordering::Acquire) {
         pause_resumable_state(&gui_state, &job.key()).await;
-        emit_cancelled(events, op_id, provider_id, Some(job.id), true);
+        emit_cancelled(events, op_id, provider_id, Some(job.id), false);
         return Ok(());
     }
     let artifact = job.artifacts.first().cloned().ok_or_else(|| TaskFailure {
@@ -3400,7 +4196,7 @@ async fn monitor_job(
         message: "The provider completed without a video artifact".into(),
         recoverable: true,
         job_id: Some(job.id.clone()),
-        kind: TaskFailureKind::Ordinary,
+        kind: TaskFailureKind::RemoteFinished,
     })?;
     let destination = make_output_path(&request.prompt, &job.id, &paths.videos_dir);
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
@@ -3430,16 +4226,62 @@ async fn monitor_job(
         }
     };
     let Some(download_result) = download_result else {
-        let _ = tokio::fs::remove_file(partial_path(&destination)).await;
         pause_resumable_state(&gui_state, &job.key()).await;
-        emit_cancelled(events, op_id, provider_id, Some(job.id), true);
+        emit_cancelled(events, op_id, provider_id, Some(job.id), false);
         return Ok(());
     };
     let saved = download_result.map_err(|error| {
         TaskFailure::provider(ServiceScope::Generation, error, Some(job.id.clone()))
+            .with_remote_continues(false)
     })?;
-    let record = update_history(&history, &provider_id, &job, Some(saved.clone())).await?;
-    remove_resumable_state(&gui_state, &job.key()).await;
+    // Save the completed local artifact before the final compatible-history
+    // write. This closes the crash/failure window where the file existed but
+    // the only recovery row still described a job that needed downloading.
+    let completed_recovery_saved = match persist_completed_gui_state(
+        &gui_state,
+        &job,
+        record.created_at,
+        saved.clone(),
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            let _ = events.send(ServiceEvent::JobRecoveryWarning {
+                    op_id,
+                    provider_id: provider_id.clone(),
+                    key: job.key(),
+                    message: format!(
+                        "The video downloaded, but completed-output recovery state could not be saved: {error}"
+                    ),
+                });
+            false
+        }
+    };
+    let (record, history_persisted) = update_history_with_recovery_fallback(
+        &history,
+        &provider_id,
+        &job,
+        Some(saved.clone()),
+        &request,
+        tolerate_history_failure || completed_recovery_saved,
+        record.created_at,
+    )
+    .await?;
+    if history_persisted {
+        remove_resumable_state(&gui_state, &job.key()).await;
+    } else {
+        // Until compatible history records the completed output, retain the
+        // durable sidecar so a later launch cannot silently lose this job.
+        pause_resumable_state(&gui_state, &job.key()).await;
+        let _ = events.send(ServiceEvent::JobRecoveryWarning {
+            op_id,
+            provider_id: provider_id.clone(),
+            key: job.key(),
+            message: "The completed output is saved in GUI recovery state because compatible history is unavailable"
+                .into(),
+        });
+    }
     let _ = events.send(ServiceEvent::Downloaded {
         op_id,
         provider_id,
@@ -3462,6 +4304,91 @@ async fn remove_resumable_state(gui_state: &GuiStateStore, key: &ProviderJobKey)
     let _ = tokio::task::spawn_blocking(move || state.remove_resumable_job(&key)).await;
 }
 
+async fn update_history_with_recovery_fallback(
+    history: &HistoryStore,
+    provider_id: &ProviderId,
+    job: &VideoJob,
+    output_path: Option<PathBuf>,
+    request: &VideoRequest,
+    tolerate_failure: bool,
+    created_at: DateTime<Utc>,
+) -> Result<(JobRecord, bool), TaskFailure> {
+    match update_history(history, provider_id, job, output_path.clone()).await {
+        Ok(record) => Ok((record, true)),
+        Err(_) if tolerate_failure => Ok((
+            transient_history_record(
+                provider_id,
+                job,
+                Some(request.clone()),
+                output_path,
+                created_at,
+            ),
+            false,
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn transient_history_record(
+    provider_id: &ProviderId,
+    job: &VideoJob,
+    request: Option<VideoRequest>,
+    output_path: Option<PathBuf>,
+    created_at: DateTime<Utc>,
+) -> JobRecord {
+    let updated_at = Utc::now();
+    JobRecord {
+        provider_id: provider_id.clone(),
+        job_id: job.id.clone(),
+        polling_url: job.polling_url.clone(),
+        locator: job.locator.clone(),
+        status: job.status.as_str().into(),
+        request,
+        generation_id: job.generation_id.clone(),
+        output_path,
+        cost: job.cost(),
+        currency: None,
+        error: job.error.clone(),
+        created_at,
+        updated_at,
+    }
+}
+
+fn completed_job_from_recovery(
+    key: &ProviderJobKey,
+    locator: &JobLocator,
+    stored: Option<&JobRecord>,
+) -> VideoJob {
+    let polling_url = stored.map_or_else(
+        || match locator {
+            JobLocator::OpenRouter { polling_url } => polling_url.clone(),
+            JobLocator::Fal {
+                endpoint_id,
+                request_id,
+                status_url,
+                response_url,
+            } => status_url
+                .clone()
+                .or_else(|| response_url.clone())
+                .unwrap_or_else(|| format!("{endpoint_id}/requests/{request_id}")),
+        },
+        |record| record.polling_url.clone(),
+    );
+    VideoJob {
+        provider_id: key.provider_id.clone(),
+        id: key.remote_job_id.clone(),
+        status: JobStatus::Completed,
+        polling_url,
+        generation_id: stored.and_then(|record| record.generation_id.clone()),
+        unsigned_urls: Vec::new(),
+        usage: Default::default(),
+        error: None,
+        locator: locator.clone(),
+        artifacts: Vec::new(),
+        raw: serde_json::json!({"recovered_local_output": true}),
+    }
+}
+
 async fn update_history(
     history: &HistoryStore,
     provider_id: &ProviderId,
@@ -3470,6 +4397,7 @@ async fn update_history(
 ) -> Result<JobRecord, TaskFailure> {
     let history = history.clone();
     let provider_id = provider_id.clone();
+    let remote_continues = !job.terminal();
     let saved_provider = provider_id.clone();
     let job = job.clone();
     let job_id = job.id.clone();
@@ -3477,15 +4405,21 @@ async fn update_history(
         history.update_provider_job(&saved_provider, &job, output_path.as_deref())
     })
     .await
-    .map_err(|_| TaskFailure {
-        provider_id: provider_id.clone(),
-        scope: ServiceScope::History,
-        message: "History update task failed".into(),
-        recoverable: true,
-        job_id: Some(job_id.clone()),
-        kind: TaskFailureKind::Ordinary,
+    .map_err(|_| {
+        TaskFailure {
+            provider_id: provider_id.clone(),
+            scope: ServiceScope::History,
+            message: "History update task failed".into(),
+            recoverable: true,
+            job_id: Some(job_id.clone()),
+            kind: TaskFailureKind::Ordinary,
+        }
+        .with_remote_continues(remote_continues)
     })?
-    .map_err(|error| TaskFailure::history(provider_id, ServiceScope::History, error, Some(job_id)))
+    .map_err(|error| {
+        TaskFailure::history(provider_id, ServiceScope::History, error, Some(job_id))
+            .with_remote_continues(remote_continues)
+    })
 }
 
 fn request_from_job(provider_id: &ProviderId, job: &VideoJob) -> VideoRequest {
@@ -3580,15 +4514,28 @@ fn emit_provider_error(
         return;
     }
     let recoverable = error.retryable();
-    emit_error(
-        events,
-        op_id,
-        Some(error.provider_id),
-        scope,
-        error.message,
-        recoverable,
-        job_id,
-    );
+    if job_id.is_some() {
+        emit_job_error(
+            events,
+            op_id,
+            Some(error.provider_id),
+            scope,
+            error.message,
+            recoverable,
+            job_id,
+            true,
+        );
+    } else {
+        emit_error(
+            events,
+            op_id,
+            Some(error.provider_id),
+            scope,
+            error.message,
+            recoverable,
+            None,
+        );
+    }
 }
 
 fn emit_task_failure(
@@ -3630,6 +4577,19 @@ fn emit_task_failure(
             error.recoverable,
             error.job_id,
         ),
+        TaskFailureKind::RemoteContinues | TaskFailureKind::RemoteFinished => {
+            let remote_continues = matches!(error.kind, TaskFailureKind::RemoteContinues);
+            emit_job_error(
+                events,
+                op_id,
+                Some(error.provider_id),
+                error.scope,
+                error.message,
+                error.recoverable,
+                error.job_id,
+                remote_continues,
+            );
+        }
     }
 }
 
@@ -3640,18 +4600,32 @@ fn emit_missing_key(
     scope: ServiceScope,
     job_id: Option<String>,
 ) {
-    emit_error(
-        events,
-        op_id,
-        Some(provider_id.clone()),
-        scope,
-        format!(
-            "Connect a {} API key first",
-            descriptor(provider_id).display_name
-        ),
-        true,
-        job_id,
+    let message = format!(
+        "Connect a {} API key first",
+        descriptor(provider_id).display_name
     );
+    if job_id.is_some() {
+        emit_job_error(
+            events,
+            op_id,
+            Some(provider_id.clone()),
+            scope,
+            message,
+            true,
+            job_id,
+            true,
+        );
+    } else {
+        emit_error(
+            events,
+            op_id,
+            Some(provider_id.clone()),
+            scope,
+            message,
+            true,
+            None,
+        );
+    }
 }
 
 fn emit_unknown_provider(
@@ -3680,6 +4654,52 @@ fn emit_error(
     recoverable: bool,
     job_id: Option<String>,
 ) {
+    emit_error_with_remote(
+        events,
+        op_id,
+        provider_id,
+        scope,
+        message,
+        recoverable,
+        job_id,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_job_error(
+    events: &mpsc::UnboundedSender<ServiceEvent>,
+    op_id: u64,
+    provider_id: Option<ProviderId>,
+    scope: ServiceScope,
+    message: String,
+    recoverable: bool,
+    job_id: Option<String>,
+    remote_continues: bool,
+) {
+    emit_error_with_remote(
+        events,
+        op_id,
+        provider_id,
+        scope,
+        message,
+        recoverable,
+        job_id,
+        Some(remote_continues),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_error_with_remote(
+    events: &mpsc::UnboundedSender<ServiceEvent>,
+    op_id: u64,
+    provider_id: Option<ProviderId>,
+    scope: ServiceScope,
+    message: String,
+    recoverable: bool,
+    job_id: Option<String>,
+    remote_continues: Option<bool>,
+) {
     let _ = events.send(ServiceEvent::Error {
         op_id,
         provider_id,
@@ -3687,6 +4707,7 @@ fn emit_error(
         message,
         recoverable,
         job_id,
+        remote_continues,
     });
 }
 

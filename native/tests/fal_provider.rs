@@ -7,13 +7,15 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{TimeDelta, Utc};
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, LOCATION};
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, HeaderMap, HeaderValue, LOCATION};
 use reqwest::{Method, StatusCode};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use url::Url;
-use video_harness::api::{HttpExecutor, HttpRequest, HttpResponse, TransportError};
+use video_harness::api::{
+    HttpExecutor, HttpRequest, HttpResponse, MAX_VIDEO_DOWNLOAD_BYTES, TransportError,
+};
 use video_harness::domain::{
     DraftMedia, GenerationDraft, JobLocator, JobStatus, MediaRole, ProviderId, QuoteConfidence,
     VideoRequest,
@@ -40,6 +42,7 @@ enum Reply {
     DelayedJson(Duration, StatusCode, Value),
     Redirect(String),
     Bytes(Vec<u8>),
+    BytesWithHeaders(HeaderMap, Vec<u8>),
     InterruptedBody,
 }
 
@@ -123,6 +126,12 @@ impl HttpExecutor for ScriptedExecutor {
                     Bytes::from(body),
                 ))
             }
+            Some(Reply::BytesWithHeaders(headers, body)) => Ok(HttpResponse::from_bytes(
+                StatusCode::OK,
+                request.url,
+                headers,
+                Bytes::from(body),
+            )),
             Some(Reply::InterruptedBody) => Ok(HttpResponse {
                 status: StatusCode::OK,
                 headers: HeaderMap::new(),
@@ -324,6 +333,16 @@ fn expanded_string_duration_model() -> Value {
     model
 }
 
+fn expanded_symbolic_size_model() -> Value {
+    let mut model = expanded_model();
+    model["openapi"]["components"]["schemas"]["Input"]["properties"]["video_size"] = json!({
+        "type": "string",
+        "enum": ["square_hd", "landscape_16_9"],
+        "default": "square_hd"
+    });
+    model
+}
+
 fn catalog_replies() -> [Reply; 5] {
     [
         Reply::Json(
@@ -349,6 +368,35 @@ fn catalog_replies() -> [Reply; 5] {
     ]
 }
 
+fn symbolic_size_catalog_replies() -> [Reply; 5] {
+    [
+        Reply::Json(
+            StatusCode::OK,
+            json!({"models": [discovery_model()], "next_cursor": null, "has_more": false}),
+        ),
+        Reply::Json(
+            StatusCode::OK,
+            json!({"models": [], "next_cursor": null, "has_more": false}),
+        ),
+        Reply::Json(
+            StatusCode::OK,
+            json!({"models": [], "next_cursor": null, "has_more": false}),
+        ),
+        Reply::Json(
+            StatusCode::OK,
+            json!({"models": [], "next_cursor": null, "has_more": false}),
+        ),
+        Reply::Json(
+            StatusCode::OK,
+            json!({
+                "models": [expanded_symbolic_size_model()],
+                "next_cursor": null,
+                "has_more": false
+            }),
+        ),
+    ]
+}
+
 fn request() -> VideoRequest {
     let mut request = VideoRequest::for_provider(
         ProviderId::fal(),
@@ -360,6 +408,40 @@ fn request() -> VideoRequest {
     request.aspect_ratio = Some("16:9".into());
     request.adapter_options = Some(json!({"custom_strength": 0.75}));
     request
+}
+
+#[tokio::test]
+async fn catalog_rejects_a_repeated_pagination_cursor() {
+    let executor = ScriptedExecutor::with_replies([
+        Reply::Json(
+            StatusCode::OK,
+            json!({"models": [], "next_cursor": "repeat-me", "has_more": true}),
+        ),
+        Reply::Json(
+            StatusCode::OK,
+            json!({"models": [], "next_cursor": "repeat-me", "has_more": true}),
+        ),
+    ]);
+    let provider = provider(executor.clone());
+
+    let error = provider
+        .load_catalog()
+        .await
+        .expect_err("repeated pagination cursor must fail closed");
+    assert_eq!(error.kind, ProviderErrorKind::Response);
+    assert!(error.message.contains("repeated cursor"));
+
+    let requests = executor.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1]
+            .url
+            .query_pairs()
+            .find(|(name, _)| name == "cursor")
+            .map(|(_, value)| value.into_owned())
+            .as_deref(),
+        Some("repeat-me")
+    );
 }
 
 #[tokio::test]
@@ -470,6 +552,73 @@ async fn catalog_queue_pricing_and_download_use_the_correct_auth_scope() {
         requests[8].url.path(),
         "/fal-ai/fixture/text-to-video/requests/request-fixture/response"
     );
+}
+
+#[tokio::test]
+async fn catalog_symbolic_default_survives_preparation_and_reaches_the_paid_wire() {
+    let mut replies = Vec::from(symbolic_size_catalog_replies());
+    replies.push(Reply::Json(
+        StatusCode::OK,
+        json!({
+            "request_id": "request-symbolic-size",
+            "status_url": "https://queue.fal.run/fal-ai/fixture/text-to-video/requests/request-symbolic-size/status",
+            "response_url": "https://queue.fal.run/fal-ai/fixture/text-to-video/requests/request-symbolic-size/response"
+        }),
+    ));
+    let executor = ScriptedExecutor::with_replies(replies);
+    let provider = provider(executor.clone());
+
+    let catalog = provider
+        .load_catalog()
+        .await
+        .expect("symbolic-size catalog");
+    let model = catalog
+        .find("fal-ai/fixture/text-to-video")
+        .expect("symbolic-size model");
+    assert_eq!(model.supported_sizes, vec!["square_hd", "landscape_16_9"]);
+    assert_eq!(
+        model.field_map.get("size").map(String::as_str),
+        Some("video_size")
+    );
+
+    // This mirrors the composer choosing the catalog's first advertised size
+    // for a new draft.
+    let default_size = model.supported_sizes.first().expect("default size").clone();
+    let mut draft = GenerationDraft::new(
+        ProviderId::fal(),
+        &model.id,
+        "A symbolic output-size fixture",
+    )
+    .expect("draft");
+    draft.size = Some(default_size.clone());
+    let request = draft
+        .to_video_request(&[])
+        .expect("symbolic size survives draft preparation");
+    provider
+        .validate_request(&request)
+        .await
+        .expect("catalog-backed symbolic size validates");
+    provider
+        .submit(&request)
+        .await
+        .expect("catalog-backed symbolic size submits");
+
+    let requests = executor.requests();
+    assert_eq!(requests.len(), 6);
+    assert_eq!(
+        requests[5].body.as_ref().expect("paid request body")["video_size"],
+        default_size
+    );
+
+    let mut unadvertised = request;
+    unadvertised.size = Some("portrait_16_9".into());
+    let error = provider
+        .validate_request(&unadvertised)
+        .await
+        .expect_err("unadvertised symbolic size must fail before the paid request");
+    assert_eq!(error.kind, ProviderErrorKind::Validation);
+    assert!(error.message.contains("not advertised"));
+    assert_eq!(executor.requests().len(), 6);
 }
 
 #[tokio::test]
@@ -965,6 +1114,35 @@ async fn failed_or_empty_download_cleans_up_the_partial_file() {
         assert!(!destination.exists());
         assert!(!directory.path().join("incomplete.mp4.part").exists());
     }
+}
+
+#[tokio::test]
+async fn anonymous_download_rejects_oversized_content_before_creating_a_partial_file() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&(MAX_VIDEO_DOWNLOAD_BYTES + 1).to_string())
+            .expect("oversized content length"),
+    );
+    let executor = ScriptedExecutor::with_replies([Reply::BytesWithHeaders(
+        headers,
+        b"unused fixture bytes".to_vec(),
+    )]);
+    let provider = provider(executor);
+    let directory = tempdir().expect("temporary output");
+    let destination = directory.path().join("oversized.mp4");
+    let artifact =
+        video_harness::domain::VideoArtifact::new("https://cdn.fal.media/oversized.mp4", 0)
+            .expect("artifact");
+
+    let error = provider
+        .download(&artifact, &destination, None)
+        .await
+        .expect_err("oversized download must fail closed");
+
+    assert_eq!(error.kind, ProviderErrorKind::Download);
+    assert!(!destination.exists());
+    assert!(!directory.path().join("oversized.mp4.part").exists());
 }
 
 #[tokio::test]

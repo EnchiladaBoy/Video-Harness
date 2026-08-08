@@ -1,9 +1,10 @@
 # Video Harness release runbook
 
 Releases publish the Tauri/Svelte desktop application as unsigned, single-file
-AppImages for x86_64 and aarch64 Linux. GitHub hosts the executables and a plain
-`SHA256SUMS` file. No personal signing key, release secret, Flatpak repository,
-or GitHub Pages deployment is required.
+AppImages for x86_64 and aarch64 Linux. GitHub hosts the executables, a pinned
+SPDX JSON software bill of materials, and a plain `SHA256SUMS` file. No personal
+signing key, release secret, Flatpak repository, or GitHub Pages deployment is
+required.
 
 ## Release policy
 
@@ -13,7 +14,8 @@ or GitHub Pages deployment is required.
 - Pin npm, Cargo, and GitHub Action inputs. A release build must not modify any
   lockfile.
 - Require an unsigned annotated release tag whose commit is contained in
-  `main`, and require every version-bearing file to match the tag.
+  `main`, require the exact commit's full push CI run to have succeeded, and
+  require every version-bearing file to match the tag.
 - Never replace an existing GitHub release. Correct a bad release with a new
   version.
 - Keep GitHub's keyless artifact attestations. They require no user-managed key
@@ -36,6 +38,7 @@ or GitHub Pages deployment is required.
 
    - `Video-Harness-0.7.0-linux-x86_64.AppImage`
    - `Video-Harness-0.7.0-linux-aarch64.AppImage`
+   - `Video-Harness-v0.7.0.spdx.json`
    - `SHA256SUMS`
 
 5. Download the assets and verify the hashes:

@@ -20,17 +20,22 @@ use video_harness::config::APP_NAME;
 use video_harness::credentials::CredentialStatus;
 use video_harness::domain::{
     CostQuote, DraftMedia, GenerationDraft as CoreDraft, JobStatus as CoreJobStatus,
-    MediaKind as CoreMediaKind, MediaRole as CoreMediaRole, MediaSource, ProviderId,
-    ProviderJobKey, VideoCatalog, VideoJob, VideoModel, VideoRequest,
+    MediaCardinality, MediaKind as CoreMediaKind, MediaRole as CoreMediaRole, MediaSource,
+    ProviderId, ProviderJobKey, VideoCatalog, VideoJob, VideoModel, VideoRequest,
 };
-use video_harness::gui_state::{DraftEditorState, UncertainSubmissionRecord};
+use video_harness::gui_state::{DraftEditorState, ResumableJob, UncertainSubmissionRecord};
 use video_harness::history::JobRecord;
-use video_harness::providers::ProviderAccount;
+use video_harness::providers::{
+    MAX_AUDIO_INPUTS, MAX_IMAGE_INPUTS, MAX_MEDIA_INPUTS_TOTAL, MAX_VIDEO_INPUTS, ProviderAccount,
+    audio_input_requires_visual,
+};
 use video_harness::workflow::{PreparedGenerationId, ProviderConnection};
 use video_harness::{AppPaths, ServiceCommand, ServiceConfig, ServiceEvent, spawn_service};
 use zeroize::Zeroize;
 
 const HISTORY_LIMIT: usize = 200;
+const CLOSE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const CLOSE_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const CROSS_PROVIDER_DISCLOSURE: &str = "Your local references will be uploaded to fal.ai as public-by-link files with a requested 24-hour expiry, then their URLs will be shared with OpenRouter and the selected model provider.";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -82,6 +87,23 @@ struct ModelCapabilities {
     video: bool,
     audio_references: bool,
     generated_audio: bool,
+    seed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaConstraintSummary {
+    kind: MediaKind,
+    roles: Vec<MediaRole>,
+    required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_items: Option<usize>,
+    /// A conditional schema minimum: zero items are valid, but once this
+    /// media bucket is used it must contain at least this many items.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_items_when_present: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_items: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +117,14 @@ struct ModelSummary {
     duration_options: Vec<String>,
     resolution_options: Vec<String>,
     aspect_ratio_options: Vec<String>,
+    size_options: Vec<String>,
+    supported_image_roles: Vec<MediaRole>,
+    required_image_roles: Vec<MediaRole>,
+    media_constraints: Vec<MediaConstraintSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_media_items: Option<usize>,
+    audio_requires_visual: bool,
+    frames_exclusive_with_references: bool,
     price_hint: String,
 }
 
@@ -109,6 +139,8 @@ struct MediaItem {
     detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     preview_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,8 +149,12 @@ struct GenerationSettings {
     duration: String,
     resolution: String,
     aspect_ratio: String,
+    #[serde(default)]
+    size: String,
     generated_audio: String,
     seed: String,
+    #[serde(default)]
+    advanced_json: String,
 }
 
 impl Default for GenerationSettings {
@@ -127,8 +163,10 @@ impl Default for GenerationSettings {
             duration: String::new(),
             resolution: String::new(),
             aspect_ratio: String::new(),
+            size: String::new(),
             generated_audio: "provider_default".into(),
             seed: String::new(),
+            advanced_json: "{}".into(),
         }
     }
 }
@@ -207,6 +245,18 @@ struct JobSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_job_id: Option<String>,
     deletable: bool,
+    monitor_state: MonitorState,
+    can_resume: bool,
+    can_pause: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MonitorState {
+    Active,
+    Paused,
+    Recoverable,
+    Terminal,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -275,6 +325,10 @@ enum UiEvent {
         tone: String,
         message: String,
     },
+    CloseRequested {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -295,6 +349,8 @@ struct UiEventEnvelope {
 struct OpenSessionResult {
     seq: u64,
     snapshot: AppSnapshot,
+    preparing: bool,
+    submitting: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -349,7 +405,6 @@ struct SafetyHoldGrant {
 struct PreservedDraftFields {
     provider_id: String,
     model_id: String,
-    size: Option<String>,
     adapter_options: Option<serde_json::Value>,
     typed_seed: Option<i64>,
     editor_state: DraftEditorState,
@@ -360,7 +415,6 @@ impl PreservedDraftFields {
         Self {
             provider_id: draft.provider_id.as_str().into(),
             model_id: draft.model.clone(),
-            size: draft.size.clone(),
             adapter_options: draft.adapter_options.clone(),
             typed_seed: draft.seed,
             editor_state,
@@ -383,9 +437,14 @@ struct Shared {
     opened: bool,
     snapshot: AppSnapshot,
     channels: Vec<Channel<UiEventEnvelope>>,
+    channel_generation: u64,
     media: HashMap<String, MediaGrant>,
     jobs: HashMap<String, JobGrant>,
     job_ids: HashMap<ProviderJobKey, String>,
+    resumable_jobs: HashMap<ProviderJobKey, ResumableJob>,
+    active_monitors: HashSet<ProviderJobKey>,
+    pausing_monitors: HashMap<ProviderJobKey, bool>,
+    stopping_monitors: HashSet<ProviderJobKey>,
     safety_holds: HashMap<String, SafetyHoldGrant>,
     safety_hold_ids: HashMap<(ProviderId, String), String>,
     pending_drafts: HashMap<u64, GenerationDraft>,
@@ -405,6 +464,11 @@ struct Shared {
     shutdown_complete: bool,
     shutdown_retry_scheduled: bool,
     shutdown_block_notice_sent: bool,
+    close_flush_next_id: u64,
+    close_flush_pending: Option<u64>,
+    close_flush_acknowledged: bool,
+    close_flush_watchdog_generation: u64,
+    close_flush_save_attempt: Option<u64>,
 }
 
 impl Shared {
@@ -414,9 +478,14 @@ impl Shared {
             opened: false,
             snapshot: AppSnapshot::default(),
             channels: Vec::new(),
+            channel_generation: 0,
             media: HashMap::new(),
             jobs: HashMap::new(),
             job_ids: HashMap::new(),
+            resumable_jobs: HashMap::new(),
+            active_monitors: HashSet::new(),
+            pausing_monitors: HashMap::new(),
+            stopping_monitors: HashSet::new(),
             safety_holds: HashMap::new(),
             safety_hold_ids: HashMap::new(),
             pending_drafts: HashMap::new(),
@@ -436,6 +505,134 @@ impl Shared {
             shutdown_complete: false,
             shutdown_retry_scheduled: false,
             shutdown_block_notice_sent: false,
+            close_flush_next_id: 0,
+            close_flush_pending: None,
+            close_flush_acknowledged: false,
+            close_flush_watchdog_generation: 0,
+            close_flush_save_attempt: None,
+        }
+    }
+
+    fn begin_close_flush(&mut self) -> Option<u64> {
+        if self.shutdown_requested || self.shutdown_complete || self.close_flush_pending.is_some() {
+            return None;
+        }
+        self.close_flush_next_id = self.close_flush_next_id.wrapping_add(1);
+        if self.close_flush_next_id == 0 {
+            self.close_flush_next_id = 1;
+        }
+        self.close_flush_pending = Some(self.close_flush_next_id);
+        self.close_flush_acknowledged = false;
+        self.close_flush_pending
+    }
+
+    fn advance_close_flush_watchdog(&mut self) -> u64 {
+        self.close_flush_watchdog_generation = self.close_flush_watchdog_generation.wrapping_add(1);
+        if self.close_flush_watchdog_generation == 0 {
+            self.close_flush_watchdog_generation = 1;
+        }
+        self.close_flush_watchdog_generation
+    }
+
+    fn issue_close_flush(&mut self) -> Option<(u64, u64)> {
+        if self.shutdown_requested || self.shutdown_complete {
+            return None;
+        }
+        let request_id = match self.close_flush_pending {
+            Some(request_id) => request_id,
+            None => self.begin_close_flush()?,
+        };
+        let watchdog_generation = self.advance_close_flush_watchdog();
+        Some((request_id, watchdog_generation))
+    }
+
+    fn begin_close_save(&mut self, request_id: u64) -> Option<u64> {
+        if self.close_flush_pending != Some(request_id)
+            || self.shutdown_requested
+            || self.close_flush_save_attempt.is_some()
+        {
+            return None;
+        }
+        let watchdog_generation = self.advance_close_flush_watchdog();
+        self.close_flush_save_attempt = Some(watchdog_generation);
+        Some(watchdog_generation)
+    }
+
+    fn suspend_failed_close_save(&mut self, request_id: u64, watchdog_generation: u64) -> bool {
+        if self.close_flush_pending == Some(request_id)
+            && self.close_flush_save_attempt == Some(watchdog_generation)
+            && !self.shutdown_requested
+        {
+            self.close_flush_save_attempt = None;
+            // A second window-close request may have armed a newer watchdog
+            // while this save was running. Invalidate that timeout too: a
+            // failed save must always leave the application open.
+            self.advance_close_flush_watchdog();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn acknowledge_close_flush(&mut self, request_id: u64) -> bool {
+        if self.close_flush_pending == Some(request_id) && !self.shutdown_requested {
+            self.close_flush_acknowledged = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn cancel_close_flush(&mut self, request_id: u64) -> bool {
+        if self.close_flush_pending == Some(request_id) && !self.shutdown_requested {
+            self.close_flush_pending = None;
+            self.close_flush_acknowledged = false;
+            self.close_flush_save_attempt = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish_close_flush(&mut self, request_id: u64, watchdog_generation: u64) -> bool {
+        if self.close_flush_pending == Some(request_id)
+            && self.close_flush_save_attempt == Some(watchdog_generation)
+            && !self.shutdown_requested
+        {
+            self.close_flush_pending = None;
+            self.close_flush_acknowledged = false;
+            self.close_flush_save_attempt = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn begin_shutdown(&mut self) -> bool {
+        if self.shutdown_requested || self.shutdown_complete {
+            return false;
+        }
+        self.close_flush_pending = None;
+        self.close_flush_acknowledged = false;
+        self.close_flush_save_attempt = None;
+        self.shutdown_requested = true;
+        true
+    }
+
+    fn begin_close_timeout_shutdown(
+        &mut self,
+        request_id: u64,
+        watchdog_generation: Option<u64>,
+        require_unacknowledged: bool,
+    ) -> bool {
+        if self.close_flush_pending != Some(request_id)
+            || watchdog_generation
+                .is_some_and(|generation| self.close_flush_watchdog_generation != generation)
+            || (require_unacknowledged && self.close_flush_acknowledged)
+        {
+            false
+        } else {
+            self.begin_shutdown()
         }
     }
 
@@ -466,6 +663,12 @@ impl Shared {
             self.snapshot.jobs.insert(0, job);
             true
         }
+    }
+
+    fn sort_jobs_newest_first(&mut self) {
+        self.snapshot
+            .jobs
+            .sort_by(|left, right| right.created_at.cmp(&left.created_at));
     }
 
     fn refresh_safety_holds(&mut self) {
@@ -654,17 +857,206 @@ fn update_provider(
     summary
 }
 
+const fn provider_media_limit(kind: CoreMediaKind) -> usize {
+    match kind {
+        CoreMediaKind::Image => MAX_IMAGE_INPUTS,
+        CoreMediaKind::Video => MAX_VIDEO_INPUTS,
+        CoreMediaKind::Audio => MAX_AUDIO_INPUTS,
+    }
+}
+
+fn media_constraint(model: &VideoModel, kind: CoreMediaKind) -> Option<MediaConstraintSummary> {
+    let bindings = model
+        .media_bindings
+        .iter()
+        .filter(|binding| binding.kind == kind)
+        .collect::<Vec<_>>();
+    let ui_kind = match kind {
+        CoreMediaKind::Image => MediaKind::Image,
+        CoreMediaKind::Video => MediaKind::Video,
+        CoreMediaKind::Audio => MediaKind::Audio,
+    };
+    let mut roles = match kind {
+        CoreMediaKind::Image => vec![MediaRole::Reference],
+        CoreMediaKind::Video => vec![MediaRole::VideoReference],
+        CoreMediaKind::Audio => vec![MediaRole::AudioReference],
+    };
+    if kind == CoreMediaKind::Image && !bindings.is_empty() {
+        if model.field_map.get("first_frame").is_some_and(|property| {
+            bindings
+                .iter()
+                .any(|binding| &binding.property_name == property)
+        }) {
+            roles.push(MediaRole::StartFrame);
+        }
+        if model.field_map.get("last_frame").is_some_and(|property| {
+            bindings
+                .iter()
+                .any(|binding| &binding.property_name == property)
+        }) {
+            roles.push(MediaRole::EndFrame);
+        }
+    }
+    if bindings.is_empty() {
+        return model
+            .supports_media_kind(kind)
+            .then_some(MediaConstraintSummary {
+                kind: ui_kind,
+                roles,
+                required: false,
+                min_items: None,
+                min_items_when_present: None,
+                max_items: Some(provider_media_limit(kind)),
+            });
+    }
+
+    let minimum =
+        bindings
+            .iter()
+            .filter(|binding| binding.required)
+            .fold(0usize, |total, binding| {
+                // An optional array may still declare `minItems`; that minimum
+                // applies only when the property is present and must not make
+                // media globally required in the composer.
+                total.saturating_add(binding.min_items.unwrap_or(1))
+            });
+    let minimum_when_present = (minimum == 0)
+        .then(|| {
+            bindings
+                .iter()
+                .filter(|binding| !binding.required)
+                .map(|binding| match binding.cardinality {
+                    MediaCardinality::Scalar => 1,
+                    MediaCardinality::List => binding.min_items.unwrap_or(0).max(1),
+                })
+                // Fal discovery exposes at most one unambiguous binding for a
+                // media kind. Taking the least positive minimum also keeps
+                // hand-authored multi-binding catalogs permissive rather than
+                // incorrectly requiring every optional property at once.
+                .min()
+        })
+        .flatten();
+    let maximum = bindings
+        .iter()
+        .try_fold(0usize, |total, binding| {
+            let binding_maximum = match binding.cardinality {
+                MediaCardinality::Scalar => Some(1),
+                MediaCardinality::List => binding.max_items,
+            }?;
+            Some(total.saturating_add(binding_maximum))
+        })
+        .or(Some(provider_media_limit(kind)));
+    Some(MediaConstraintSummary {
+        kind: ui_kind,
+        roles,
+        required: minimum > 0,
+        min_items: (minimum > 0).then_some(minimum),
+        min_items_when_present: minimum_when_present,
+        max_items: maximum,
+    })
+}
+
+fn model_max_media_items(model: &VideoModel) -> Option<usize> {
+    match model.provider_id.as_str() {
+        "openrouter" => Some(MAX_MEDIA_INPUTS_TOTAL),
+        "fal" => {
+            // Fal deliberately honors a non-Seedance schema that advertises
+            // a higher per-kind maximum instead of applying the conservative
+            // cross-provider total fallback.
+            let has_explicit_higher_maximum =
+                !audio_input_requires_visual(&model.provider_id, &model.id)
+                    && model.media_bindings.iter().any(|binding| {
+                        binding.cardinality == MediaCardinality::List
+                            && binding
+                                .max_items
+                                .is_some_and(|maximum| maximum > provider_media_limit(binding.kind))
+                    });
+            (!has_explicit_higher_maximum).then_some(MAX_MEDIA_INPUTS_TOTAL)
+        }
+        _ => None,
+    }
+}
+
+fn frames_exclusive_with_references(model: &VideoModel) -> bool {
+    // OpenRouter has two mutually exclusive request shapes: frame_images or
+    // input_references of any kind. Fal conflicts are property-specific, so a
+    // single all-reference flag would incorrectly reject valid frame+audio or
+    // frame+video schemas there; its schema validator remains authoritative.
+    model.provider_id == ProviderId::openrouter()
+}
+
+fn schema_requires_property(schema: &serde_json::Value, property: &str) -> bool {
+    schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|required| {
+            required
+                .iter()
+                .any(|candidate| candidate.as_str() == Some(property))
+        })
+        || schema
+            .get("allOf")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|branches| {
+                branches
+                    .iter()
+                    .any(|branch| schema_requires_property(branch, property))
+            })
+}
+
+fn required_image_roles(model: &VideoModel) -> Vec<MediaRole> {
+    let Some(schema) = model.input_schema.as_ref() else {
+        return Vec::new();
+    };
+    [
+        ("first_frame", MediaRole::StartFrame),
+        ("last_frame", MediaRole::EndFrame),
+    ]
+    .into_iter()
+    .filter_map(|(field, role)| {
+        model
+            .field_map
+            .get(field)
+            .is_some_and(|property| schema_requires_property(schema, property))
+            .then_some(role)
+    })
+    .collect()
+}
+
 fn model_summary(model: &VideoModel) -> ModelSummary {
+    let mut supported_image_roles = Vec::new();
+    if model.supports_media_kind(CoreMediaKind::Image) {
+        supported_image_roles.push(MediaRole::Reference);
+    }
+    if model
+        .supported_frame_images
+        .iter()
+        .any(|role| role == "first_frame")
+    {
+        supported_image_roles.push(MediaRole::StartFrame);
+    }
+    if model
+        .supported_frame_images
+        .iter()
+        .any(|role| role == "last_frame")
+    {
+        supported_image_roles.push(MediaRole::EndFrame);
+    }
+    // Frame inputs travel through dedicated provider fields rather than the
+    // general image-reference binding. A frame-only model must still expose
+    // an image picker to the renderer.
+    let accepts_images = !supported_image_roles.is_empty();
     ModelSummary {
         id: model.id.clone(),
         provider_id: model.provider_id.as_str().into(),
         name: model.name.clone(),
         description: model.description.clone(),
         capabilities: ModelCapabilities {
-            images: model.supports_media_kind(CoreMediaKind::Image),
+            images: accepts_images,
             video: model.supports_media_kind(CoreMediaKind::Video),
             audio_references: model.supports_media_kind(CoreMediaKind::Audio),
             generated_audio: model.generated_audio.supported,
+            seed: model.supports_seed(),
         },
         duration_options: model
             .supported_durations
@@ -673,6 +1065,20 @@ fn model_summary(model: &VideoModel) -> ModelSummary {
             .collect(),
         resolution_options: model.supported_resolutions.clone(),
         aspect_ratio_options: model.supported_aspect_ratios.clone(),
+        size_options: model.supported_sizes.clone(),
+        supported_image_roles,
+        required_image_roles: required_image_roles(model),
+        media_constraints: [
+            CoreMediaKind::Image,
+            CoreMediaKind::Video,
+            CoreMediaKind::Audio,
+        ]
+        .into_iter()
+        .filter_map(|kind| media_constraint(model, kind))
+        .collect(),
+        max_media_items: model_max_media_items(model),
+        audio_requires_visual: audio_input_requires_visual(&model.provider_id, &model.id),
+        frames_exclusive_with_references: frames_exclusive_with_references(model),
         price_hint: if model.pricing_skus.is_empty() {
             "Price checked in Review".into()
         } else {
@@ -765,6 +1171,7 @@ fn local_media_item(shared: &mut Shared, path: PathBuf) -> Result<MediaItem, Str
         source: "local".into(),
         detail: format!("Local {}", kind.label()),
         preview_url: None,
+        display_url: None,
     })
 }
 
@@ -794,6 +1201,9 @@ fn remote_media_item(
             kind,
         },
     );
+    let mut display_url = parsed;
+    display_url.set_query(None);
+    display_url.set_fragment(None);
     Ok(MediaItem {
         handle,
         display_name,
@@ -802,6 +1212,7 @@ fn remote_media_item(
         source: "remote".into(),
         detail: host,
         preview_url: None,
+        display_url: Some(display_url.to_string()),
     })
 }
 
@@ -849,6 +1260,7 @@ fn core_media_item(shared: &mut Shared, media: &DraftMedia) -> Result<MediaItem,
                 source: "local".into(),
                 detail: format!("Local {}", kind.label()),
                 preview_url: None,
+                display_url: None,
             })
         }
         MediaSource::RemoteUrl { url } => remote_media_item(shared, url.clone(), kind, role),
@@ -867,12 +1279,25 @@ fn core_draft(
         &draft.settings.duration,
         &draft.settings.resolution,
         &draft.settings.aspect_ratio,
+        &draft.settings.size,
         &draft.settings.seed,
     ] {
         if value.len() > 256 || value.chars().any(char::is_control) {
             return Err("A generation setting contains an invalid value.".into());
         }
     }
+    if draft.settings.advanced_json.len() > 100_000
+        || draft
+            .settings
+            .advanced_json
+            .chars()
+            .any(|character| character.is_control() && character != '\n' && character != '\t')
+    {
+        return Err("Advanced settings are larger than this build supports.".into());
+    }
+    editor_state_for_draft(shared, draft)
+        .validate()
+        .map_err(|error| shared.ui_safe_message(&error.to_string()))?;
     let provider_id = checked_provider(&draft.provider_id)?;
     let duration = if draft.settings.duration.trim().is_empty() {
         None
@@ -907,6 +1332,24 @@ fn core_draft(
         "off" => Some(false),
         _ => return Err("Generated audio has an invalid value.".into()),
     };
+    let advanced_text = draft.settings.advanced_json.trim();
+    let adapter_options = if advanced_text.is_empty() {
+        None
+    } else {
+        match serde_json::from_str::<serde_json::Value>(advanced_text) {
+            Ok(serde_json::Value::Object(values)) => {
+                (!values.is_empty()).then_some(serde_json::Value::Object(values))
+            }
+            Ok(_) if matches!(purpose, DraftPurpose::Autosave) => {
+                preserved.and_then(|fields| fields.adapter_options.clone())
+            }
+            Err(_) if matches!(purpose, DraftPurpose::Autosave) => {
+                preserved.and_then(|fields| fields.adapter_options.clone())
+            }
+            Ok(_) => return Err("Advanced settings must be a JSON object.".into()),
+            Err(_) => return Err("Advanced settings must contain valid JSON.".into()),
+        }
+    };
     let mut media = Vec::with_capacity(draft.media.len());
     for item in &draft.media {
         let grant = shared
@@ -939,11 +1382,11 @@ fn core_draft(
         duration,
         resolution: nonempty(&draft.settings.resolution),
         aspect_ratio: nonempty(&draft.settings.aspect_ratio),
-        size: preserved.and_then(|fields| fields.size.clone()),
+        size: nonempty(&draft.settings.size),
         generate_audio,
         seed,
         media,
-        adapter_options: preserved.and_then(|fields| fields.adapter_options.clone()),
+        adapter_options,
     })
 }
 
@@ -955,6 +1398,7 @@ fn editor_state_for_draft(shared: &Shared, draft: &GenerationDraft) -> DraftEdit
         .map(|fields| fields.editor_state.clone())
         .unwrap_or_default();
     editor.seed_text = draft.settings.seed.clone();
+    editor.advanced_json_text = draft.settings.advanced_json.clone();
     editor
 }
 
@@ -971,6 +1415,7 @@ fn settings_from_core(draft: &CoreDraft) -> GenerationSettings {
             .unwrap_or_default(),
         resolution: draft.resolution.clone().unwrap_or_default(),
         aspect_ratio: draft.aspect_ratio.clone().unwrap_or_default(),
+        size: draft.size.clone().unwrap_or_default(),
         generated_audio: match draft.generate_audio {
             None => "provider_default",
             Some(true) => "on",
@@ -981,6 +1426,11 @@ fn settings_from_core(draft: &CoreDraft) -> GenerationSettings {
             .seed
             .map(|value| value.to_string())
             .unwrap_or_default(),
+        advanced_json: draft
+            .adapter_options
+            .as_ref()
+            .and_then(|value| serde_json::to_string_pretty(value).ok())
+            .unwrap_or_else(|| "{}".into()),
     }
 }
 
@@ -1012,6 +1462,7 @@ fn settings_from_request(request: &VideoRequest) -> GenerationSettings {
             .unwrap_or_default(),
         resolution: request.resolution.clone().unwrap_or_default(),
         aspect_ratio: request.aspect_ratio.clone().unwrap_or_default(),
+        size: request.size.clone().unwrap_or_default(),
         generated_audio: match request.generate_audio {
             None => "provider_default",
             Some(true) => "on",
@@ -1022,6 +1473,11 @@ fn settings_from_request(request: &VideoRequest) -> GenerationSettings {
             .seed
             .map(|value| value.to_string())
             .unwrap_or_default(),
+        advanced_json: request
+            .adapter_options
+            .as_ref()
+            .and_then(|value| serde_json::to_string_pretty(value).ok())
+            .unwrap_or_else(|| "{}".into()),
     }
 }
 
@@ -1138,6 +1594,101 @@ fn status_projection(status: &CoreJobStatus, has_output: bool) -> (String, Strin
     }
 }
 
+fn monitor_capabilities(state: MonitorState) -> (bool, bool) {
+    match state {
+        MonitorState::Active => (false, true),
+        MonitorState::Paused | MonitorState::Recoverable => (true, false),
+        MonitorState::Terminal => (false, false),
+    }
+}
+
+fn monitor_for_record(
+    shared: &Shared,
+    key: &ProviderJobKey,
+    status: &CoreJobStatus,
+    has_output: bool,
+) -> MonitorState {
+    match status {
+        CoreJobStatus::Completed if has_output => MonitorState::Terminal,
+        CoreJobStatus::Failed | CoreJobStatus::Cancelled | CoreJobStatus::Expired => {
+            MonitorState::Terminal
+        }
+        _ if shared.active_monitors.contains(key) => MonitorState::Active,
+        _ => MonitorState::Recoverable,
+    }
+}
+
+fn record_deletable(status: &CoreJobStatus, has_output: bool) -> bool {
+    matches!(
+        status,
+        CoreJobStatus::Failed | CoreJobStatus::Cancelled | CoreJobStatus::Expired
+    ) || matches!(status, CoreJobStatus::Completed) && has_output
+}
+
+fn set_monitor_state(job: &mut JobSummary, monitor_state: MonitorState) {
+    let (can_resume, can_pause) = monitor_capabilities(monitor_state);
+    job.monitor_state = monitor_state;
+    job.can_resume = can_resume;
+    job.can_pause = can_pause;
+}
+
+fn set_monitor_starting(job: &mut JobSummary) {
+    set_monitor_state(job, MonitorState::Active);
+    // The paid request is active, but Pause is addressable only after the
+    // service actor acknowledges insertion into its monitor registry.
+    job.can_pause = false;
+}
+
+fn set_paused_projection(job: &mut JobSummary, remote_continues: bool) {
+    job.status = "paused".into();
+    job.status_label = "Monitoring paused".into();
+    job.detail = if remote_continues {
+        "The provider job continues remotely; only local checks are paused."
+    } else {
+        "The provider job has finished; local follow-up is paused."
+    }
+    .into();
+    job.remote_continues = Some(remote_continues);
+    job.next_poll_seconds = None;
+    job.progress = None;
+    set_monitor_state(job, MonitorState::Paused);
+}
+
+fn set_pause_pending_projection(job: &mut JobSummary, remote_continues: bool) {
+    job.status = "paused".into();
+    job.status_label = "Pausing monitoring".into();
+    job.detail = if remote_continues {
+        "Finishing the current provider check before local monitoring pauses."
+    } else {
+        "Finishing the current local step before monitoring pauses."
+    }
+    .into();
+    job.remote_continues = Some(remote_continues);
+    job.next_poll_seconds = None;
+    job.progress = None;
+    set_monitor_state(job, MonitorState::Paused);
+    // The monitor actor has acknowledged Pause, but it has not removed the
+    // old task from its registry yet. Resume must stay unavailable until the
+    // final Cancelled event makes that hand-off authoritative.
+    job.can_resume = false;
+    job.can_pause = false;
+}
+
+fn set_recovery_stop_pending(job: &mut JobSummary, remote_continues: bool) {
+    job.remote_continues = Some(remote_continues);
+    job.next_poll_seconds = None;
+    job.progress = None;
+    set_monitor_state(job, MonitorState::Recoverable);
+    // A recoverable task failure has been reported, but the actor may still
+    // own its registry entry. Wait for MonitorStopped before offering Resume.
+    job.can_resume = false;
+    job.can_pause = false;
+}
+
+fn pause_projection_allowed(job: &JobSummary) -> bool {
+    job.monitor_state != MonitorState::Terminal
+}
+
 fn redact_url_secrets(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     let mut cursor = 0;
@@ -1248,11 +1799,14 @@ fn displayable_remote_job_id(value: &str) -> Option<String> {
 fn job_from_record(shared: &mut Shared, record: &JobRecord) -> JobSummary {
     let key = record.key();
     let id = shared.opaque_job_id(&key);
-    let output_path = record.output_path.clone();
+    let output_path = record.output_path.clone().filter(|path| path.is_file());
     if let Some(grant) = shared.jobs.get_mut(&id) {
         grant.output_path = output_path.clone();
     }
     let status = CoreJobStatus::from_raw(record.status.clone());
+    let monitor_state = monitor_for_record(shared, &key, &status, output_path.is_some());
+    let (can_resume, can_pause) = monitor_capabilities(monitor_state);
+    let deletable = record_deletable(&status, output_path.is_some());
     let (status, status_label, mut detail) = status_projection(&status, output_path.is_some());
     if let Some(error) = &record.error {
         detail = shared.ui_safe_message(error);
@@ -1275,7 +1829,7 @@ fn job_from_record(shared: &mut Shared, record: &JobRecord) -> JobSummary {
         model_name,
         prompt: request
             .map(|value| value.prompt.clone())
-            .unwrap_or_default(),
+            .unwrap_or_else(|| "Imported provider job".into()),
         status,
         status_label,
         detail,
@@ -1293,7 +1847,10 @@ fn job_from_record(shared: &mut Shared, record: &JobRecord) -> JobSummary {
         captions_url: None,
         remote_continues: None,
         provider_job_id: displayable_remote_job_id(record.remote_id()),
-        deletable: record.terminal(),
+        deletable,
+        monitor_state,
+        can_resume,
+        can_pause,
     }
 }
 
@@ -1332,14 +1889,50 @@ fn job_from_acceptance(shared: &mut Shared, job: &VideoJob) -> JobSummary {
         provider_job_id: displayable_remote_job_id(&key.remote_job_id),
         // A record-less acceptance has no durable history row to remove yet.
         deletable: false,
+        monitor_state: MonitorState::Active,
+        can_resume: false,
+        can_pause: false,
     }
 }
 
-fn broadcast(shared: &Arc<Mutex<Shared>>, event: UiEvent) {
-    let (envelope, channels) = {
+fn job_from_resumable(shared: &mut Shared, resumable: &ResumableJob) -> JobSummary {
+    let id = shared.opaque_job_id(&resumable.key);
+    JobSummary {
+        id,
+        provider_id: resumable.key.provider_id.as_str().into(),
+        provider_name: provider_name(&resumable.key.provider_id).into(),
+        model_name: "Recovered provider job".into(),
+        prompt: "Recovered provider job".into(),
+        status: "paused".into(),
+        status_label: "Ready to resume".into(),
+        detail: if resumable.monitoring_paused {
+            "Local monitoring is paused; the provider job continues remotely."
+        } else {
+            "Video Harness recovered this provider job after relaunch. Resume to continue local checks."
+        }
+        .into(),
+        created_at: resumable.accepted_at.to_rfc3339(),
+        elapsed_seconds: None,
+        next_poll_seconds: None,
+        progress: None,
+        output_file_name: None,
+        has_local_output: false,
+        playback_url: None,
+        captions_url: None,
+        remote_continues: Some(true),
+        provider_job_id: displayable_remote_job_id(&resumable.key.remote_job_id),
+        deletable: false,
+        monitor_state: MonitorState::Recoverable,
+        can_resume: true,
+        can_pause: false,
+    }
+}
+
+fn broadcast(shared: &Arc<Mutex<Shared>>, event: UiEvent) -> bool {
+    let (envelope, channels, channel_generation) = {
         let mut guard = match shared.lock() {
             Ok(guard) => guard,
-            Err(_) => return,
+            Err(_) => return false,
         };
         guard.seq = guard.seq.saturating_add(1);
         (
@@ -1348,11 +1941,23 @@ fn broadcast(shared: &Arc<Mutex<Shared>>, event: UiEvent) {
                 event,
             },
             guard.channels.clone(),
+            guard.channel_generation,
         )
     };
+    let mut delivered = false;
     for channel in channels {
-        let _ = channel.send(envelope.clone());
+        delivered |= channel.send(envelope.clone()).is_ok();
     }
+    if !delivered && let Ok(mut guard) = shared.lock() {
+        if guard.channel_generation == channel_generation {
+            guard.channels.clear();
+        } else {
+            // A renderer replaced the failed channel while this event was in
+            // flight. Its subsequent snapshot resync is authoritative.
+            delivered = true;
+        }
+    }
+    delivered
 }
 
 fn mutate_and_broadcast<F>(shared: &Arc<Mutex<Shared>>, update: F)
@@ -1361,7 +1966,7 @@ where
 {
     let event = shared.lock().ok().and_then(|mut guard| update(&mut guard));
     if let Some(event) = event {
-        broadcast(shared, event);
+        let _ = broadcast(shared, event);
     }
 }
 
@@ -1411,6 +2016,23 @@ async fn service_events(
                         update_provider(state, &provider_id, true, &credential_status, Some(&info));
                     Some(UiEvent::ProviderChanged { provider })
                 });
+                if commands
+                    .send(ServiceCommand::RefreshCatalog {
+                        op_id: next_op_id(),
+                        provider_id,
+                    })
+                    .await
+                    .is_err()
+                {
+                    broadcast(
+                        &shared,
+                        UiEvent::Notice {
+                            tone: "warning".into(),
+                            message: "The provider connected, but its model list could not be refreshed. Restart Video Harness to try again."
+                                .into(),
+                        },
+                    );
+                }
             }
             ServiceEvent::ApiKeyForgotten {
                 op_id,
@@ -1426,13 +2048,14 @@ async fn service_events(
                     let _ = reply.send(Ok(()));
                 }
                 mutate_and_broadcast(&shared, |state| {
-                    let provider =
-                        update_provider(state, &provider_id, false, &credential_status, None);
+                    update_provider(state, &provider_id, false, &credential_status, None);
                     state
                         .snapshot
                         .models
                         .retain(|model| model.provider_id != provider_id.as_str());
-                    Some(UiEvent::ProviderChanged { provider })
+                    Some(UiEvent::SnapshotChanged {
+                        snapshot: Box::new(state.snapshot.clone()),
+                    })
                 });
             }
             ServiceEvent::CatalogLoaded { catalog, .. } => {
@@ -1450,13 +2073,23 @@ async fn service_events(
                 ..
             } => mutate_and_broadcast(&shared, |state| {
                 if let Some(draft) = draft {
-                    let editor_state = editor_state.unwrap_or_else(|| DraftEditorState {
-                        seed_text: draft.seed.map(|seed| seed.to_string()).unwrap_or_default(),
-                        ..DraftEditorState::default()
-                    });
+                    let mut editor_state = editor_state.unwrap_or_default();
+                    if editor_state.seed_text.is_empty() {
+                        editor_state.seed_text =
+                            draft.seed.map(|seed| seed.to_string()).unwrap_or_default();
+                    }
+                    if editor_state.advanced_json_text.is_empty() {
+                        editor_state.advanced_json_text = draft
+                            .adapter_options
+                            .as_ref()
+                            .and_then(|value| serde_json::to_string_pretty(value).ok())
+                            .unwrap_or_else(|| "{}".into());
+                    }
                     match ui_draft_from_core(state, &draft, revision.unwrap_or_default()) {
                         Ok(mut ui_draft) => {
                             ui_draft.settings.seed = editor_state.seed_text.clone();
+                            ui_draft.settings.advanced_json =
+                                editor_state.advanced_json_text.clone();
                             state.preserved_draft =
                                 Some(PreservedDraftFields::from_core(&draft, editor_state));
                             state.snapshot.draft = ui_draft;
@@ -1542,6 +2175,22 @@ async fn service_events(
                         let job = job_from_record(state, record);
                         state.upsert_job(job, false);
                     }
+                    state.sort_jobs_newest_first();
+                    Some(UiEvent::SnapshotChanged {
+                        snapshot: Box::new(state.snapshot.clone()),
+                    })
+                });
+            }
+            ServiceEvent::ResumableJobsLoaded { jobs, .. } => {
+                mutate_and_broadcast(&shared, |state| {
+                    for resumable in jobs {
+                        state
+                            .resumable_jobs
+                            .insert(resumable.key.clone(), resumable.clone());
+                        let job = job_from_resumable(state, &resumable);
+                        state.upsert_job(job, false);
+                    }
+                    state.sort_jobs_newest_first();
                     Some(UiEvent::SnapshotChanged {
                         snapshot: Box::new(state.snapshot.clone()),
                     })
@@ -1553,6 +2202,10 @@ async fn service_events(
                 output_deleted: _,
             } => {
                 let removed_id = shared.lock().ok().and_then(|mut state| {
+                    state.active_monitors.remove(&key);
+                    state.pausing_monitors.remove(&key);
+                    state.stopping_monitors.remove(&key);
+                    state.resumable_jobs.remove(&key);
                     let id = state.job_ids.remove(&key)?;
                     state.jobs.remove(&id);
                     state.deletion_pending.remove(&id);
@@ -1579,22 +2232,56 @@ async fn service_events(
             } => {
                 mutate_and_broadcast(&shared, |state| {
                     state.submission_ops.remove(&op_id);
-                    let job = record
+                    let key = job.key();
+                    state.pausing_monitors.remove(&key);
+                    state.stopping_monitors.remove(&key);
+                    let mut job = record
                         .as_ref()
                         .map(|record| job_from_record(state, record))
                         .unwrap_or_else(|| job_from_acceptance(state, &job));
+                    set_monitor_starting(&mut job);
                     state.snapshot.prepared_review = None;
+                    state.submitted_review = None;
                     let added = state.upsert_job(job.clone(), true);
                     Some(if added {
                         UiEvent::JobAdded { job }
                     } else {
                         UiEvent::JobUpdated { job }
                     })
+                });
+            }
+            ServiceEvent::MonitorStarted { key, .. } => {
+                mutate_and_broadcast(&shared, |state| {
+                    // Import can be acknowledged by the actor before its
+                    // first provider response creates a visible job. Retain
+                    // that authoritative registry state even when there is
+                    // nothing to broadcast yet.
+                    state.pausing_monitors.remove(&key);
+                    state.stopping_monitors.remove(&key);
+                    state.active_monitors.insert(key.clone());
+                    let id = state.job_ids.get(&key)?.clone();
+                    let index = state.snapshot.jobs.iter().position(|job| job.id == id)?;
+                    let mut job = state.snapshot.jobs[index].clone();
+                    if job.monitor_state == MonitorState::Terminal {
+                        state.active_monitors.remove(&key);
+                        return Some(UiEvent::JobUpdated { job });
+                    }
+                    set_monitor_state(&mut job, MonitorState::Active);
+                    state.snapshot.jobs[index] = job.clone();
+                    Some(UiEvent::JobUpdated { job })
                 });
             }
             ServiceEvent::Imported { record, .. } => {
                 mutate_and_broadcast(&shared, |state| {
-                    let job = job_from_record(state, &record);
+                    let key = record.key();
+                    state.pausing_monitors.remove(&key);
+                    state.stopping_monitors.remove(&key);
+                    let mut job = job_from_record(state, &record);
+                    if job.monitor_state != MonitorState::Terminal
+                        && !state.active_monitors.contains(&key)
+                    {
+                        set_monitor_starting(&mut job);
+                    }
                     state.snapshot.prepared_review = None;
                     let added = state.upsert_job(job.clone(), true);
                     Some(if added {
@@ -1604,8 +2291,35 @@ async fn service_events(
                     })
                 });
             }
-            ServiceEvent::JobUpdated { record, .. } | ServiceEvent::Downloaded { record, .. } => {
+            ServiceEvent::JobUpdated { record, .. } => {
                 mutate_and_broadcast(&shared, |state| {
+                    let key = record.key();
+                    let pause_pending = state.pausing_monitors.get(&key).copied();
+                    let mut job = job_from_record(state, &record);
+                    if job.monitor_state == MonitorState::Terminal {
+                        state.active_monitors.remove(&key);
+                        state.pausing_monitors.remove(&key);
+                        state.stopping_monitors.remove(&key);
+                    } else if let Some(remote_continues) = pause_pending {
+                        set_pause_pending_projection(&mut job, remote_continues);
+                    } else if !state.active_monitors.contains(&key) {
+                        set_monitor_starting(&mut job);
+                    }
+                    let added = state.upsert_job(job.clone(), false);
+                    Some(if added {
+                        UiEvent::JobAdded { job }
+                    } else {
+                        UiEvent::JobUpdated { job }
+                    })
+                });
+            }
+            ServiceEvent::Downloaded { record, .. } => {
+                mutate_and_broadcast(&shared, |state| {
+                    let key = record.key();
+                    state.active_monitors.remove(&key);
+                    state.pausing_monitors.remove(&key);
+                    state.stopping_monitors.remove(&key);
+                    state.resumable_jobs.remove(&key);
                     let job = job_from_record(state, &record);
                     let added = state.upsert_job(job.clone(), false);
                     Some(if added {
@@ -1625,6 +2339,16 @@ async fn service_events(
                 let id = state.job_ids.get(&key)?.clone();
                 let index = state.snapshot.jobs.iter().position(|job| job.id == id)?;
                 let mut job = state.snapshot.jobs[index].clone();
+                if let Some(remote_continues) = state.pausing_monitors.get(&key).copied() {
+                    set_pause_pending_projection(&mut job, remote_continues);
+                    state.snapshot.jobs[index] = job.clone();
+                    return Some(UiEvent::JobUpdated { job });
+                }
+                if state.active_monitors.contains(&key) {
+                    set_monitor_state(&mut job, MonitorState::Active);
+                } else {
+                    set_monitor_starting(&mut job);
+                }
                 job.status = "processing".into();
                 job.status_label = "Generating video".into();
                 job.next_poll_seconds = Some(next_in.as_secs());
@@ -1643,6 +2367,16 @@ async fn service_events(
                 let id = state.job_ids.get(&key)?.clone();
                 let index = state.snapshot.jobs.iter().position(|job| job.id == id)?;
                 let mut job = state.snapshot.jobs[index].clone();
+                if let Some(remote_continues) = state.pausing_monitors.get(&key).copied() {
+                    set_pause_pending_projection(&mut job, remote_continues);
+                    state.snapshot.jobs[index] = job.clone();
+                    return Some(UiEvent::JobUpdated { job });
+                }
+                if state.active_monitors.contains(&key) {
+                    set_monitor_state(&mut job, MonitorState::Active);
+                } else {
+                    set_monitor_starting(&mut job);
+                }
                 job.status = "downloading".into();
                 job.status_label = "Saving finished video".into();
                 job.detail = "The output is being written to your Videos folder.".into();
@@ -1657,18 +2391,80 @@ async fn service_events(
                 remote_continues,
                 ..
             } => mutate_and_broadcast(&shared, |state| {
+                state.active_monitors.remove(&key);
+                state.stopping_monitors.remove(&key);
+                state.pausing_monitors.insert(key.clone(), remote_continues);
                 let id = state.job_ids.get(&key)?.clone();
                 let index = state.snapshot.jobs.iter().position(|job| job.id == id)?;
                 let mut job = state.snapshot.jobs[index].clone();
-                job.status = "paused".into();
-                job.status_label = "Monitoring paused".into();
-                job.detail =
-                    "The provider job continues remotely; only local checks are paused.".into();
-                job.remote_continues = Some(remote_continues);
-                job.next_poll_seconds = None;
+                if !pause_projection_allowed(&job) {
+                    // The monitor can finish between the UI's pause click and
+                    // the actor's acknowledgement. Never regress a completed
+                    // or failed terminal result back to resumable.
+                    state.pausing_monitors.remove(&key);
+                    return Some(UiEvent::JobUpdated { job });
+                }
+                set_pause_pending_projection(&mut job, remote_continues);
                 state.snapshot.jobs[index] = job.clone();
                 Some(UiEvent::JobUpdated { job })
             }),
+            ServiceEvent::Cancelled {
+                provider_id: Some(provider_id),
+                job_id: Some(job_id),
+                remote_continues,
+                ..
+            } => mutate_and_broadcast(&shared, |state| {
+                // The task has observed cancellation, but the actor may not
+                // have removed it from the monitor registry yet. Keep Resume
+                // disabled until MonitorStopped confirms that hand-off.
+                let key = ProviderJobKey::new(provider_id, job_id).ok()?;
+                state.active_monitors.remove(&key);
+                state.stopping_monitors.remove(&key);
+                state.pausing_monitors.insert(key.clone(), remote_continues);
+                let id = state.job_ids.get(&key)?.clone();
+                let index = state.snapshot.jobs.iter().position(|job| job.id == id)?;
+                let mut job = state.snapshot.jobs[index].clone();
+                if !pause_projection_allowed(&job) {
+                    state.pausing_monitors.remove(&key);
+                    return Some(UiEvent::JobUpdated { job });
+                }
+                set_pause_pending_projection(&mut job, remote_continues);
+                state.snapshot.jobs[index] = job.clone();
+                Some(UiEvent::JobUpdated { job })
+            }),
+            ServiceEvent::MonitorStopped { key, .. } => {
+                mutate_and_broadcast(&shared, |state| {
+                    let was_active = state.active_monitors.remove(&key);
+                    let was_stopping = state.stopping_monitors.remove(&key);
+                    let remote_continues = state.pausing_monitors.remove(&key);
+                    let id = state.job_ids.get(&key)?.clone();
+                    let index = state.snapshot.jobs.iter().position(|job| job.id == id)?;
+                    let mut job = state.snapshot.jobs[index].clone();
+                    if !pause_projection_allowed(&job) {
+                        return Some(UiEvent::JobUpdated { job });
+                    }
+                    if let Some(remote_continues) = remote_continues {
+                        set_paused_projection(&mut job, remote_continues);
+                    } else if was_stopping {
+                        set_monitor_state(&mut job, MonitorState::Recoverable);
+                        job.can_pause = false;
+                    } else if was_active {
+                        job.status = "attention".into();
+                        job.status_label = "Monitoring stopped".into();
+                        job.detail =
+                            "Local monitoring ended before this remote job reached a final state."
+                                .into();
+                        job.remote_continues = Some(true);
+                        job.next_poll_seconds = None;
+                        job.progress = None;
+                        set_monitor_state(&mut job, MonitorState::Recoverable);
+                    } else {
+                        return None;
+                    }
+                    state.snapshot.jobs[index] = job.clone();
+                    Some(UiEvent::JobUpdated { job })
+                });
+            }
             ServiceEvent::PreparationStarted { media_count, .. } => {
                 broadcast(
                     &shared,
@@ -1697,15 +2493,21 @@ async fn service_events(
                     },
                 );
             }
-            ServiceEvent::SubmissionStarted { .. } => broadcast(
-                &shared,
-                UiEvent::Notice {
-                    tone: "neutral".into(),
-                    message: "Submitting the reviewed generation once.".into(),
-                },
-            ),
+            ServiceEvent::SubmissionStarted { .. } => {
+                broadcast(
+                    &shared,
+                    UiEvent::Notice {
+                        tone: "neutral".into(),
+                        message: "Submitting the reviewed generation once.".into(),
+                    },
+                );
+            }
             ServiceEvent::JobRecoveryFailed { key, message, .. } => {
                 mutate_and_broadcast(&shared, |state| {
+                    state.active_monitors.remove(&key);
+                    state.pausing_monitors.remove(&key);
+                    state.stopping_monitors.remove(&key);
+                    state.resumable_jobs.remove(&key);
                     let Some(id) = state.job_ids.get(&key).cloned() else {
                         return Some(UiEvent::Notice {
                             tone: "danger".into(),
@@ -1718,9 +2520,19 @@ async fn service_events(
                     job.status_label = "Remote job needs attention".into();
                     job.detail = state.ui_safe_message(&message);
                     job.remote_continues = Some(true);
+                    set_monitor_state(&mut job, MonitorState::Terminal);
                     state.snapshot.jobs[index] = job.clone();
                     Some(UiEvent::JobUpdated { job })
                 });
+            }
+            ServiceEvent::JobRecoveryWarning { message, .. } => {
+                broadcast(
+                    &shared,
+                    UiEvent::Notice {
+                        tone: "warning".into(),
+                        message: safe_shared_message(&shared, &message),
+                    },
+                );
             }
             ServiceEvent::SubmissionUncertain { op_id, message, .. } => {
                 let message = safe_shared_message(&shared, &message);
@@ -1791,8 +2603,13 @@ async fn service_events(
                 message,
                 recoverable,
                 job_id,
+                remote_continues,
                 ..
             } => {
+                // Older or non-job errors do not carry this hint. Preserve
+                // the prior recoverability convention only as a fallback;
+                // task failures now report the provider's terminal state.
+                let remote_continues = remote_continues.unwrap_or(recoverable);
                 let message = safe_shared_message(&shared, &message);
                 if let Some(reply) = shared
                     .lock()
@@ -1854,11 +2671,40 @@ async fn service_events(
                 };
                 if let Some(id) = handled {
                     mutate_and_broadcast(&shared, |state| {
+                        let key = state.jobs.get(&id).map(|grant| grant.key.clone());
+                        let monitor_stop_pending = key.as_ref().is_some_and(|key| {
+                            let was_active = state.active_monitors.remove(key);
+                            let was_pausing = state.pausing_monitors.remove(key).is_some();
+                            let was_stopping = state.stopping_monitors.contains(key);
+                            was_active || was_pausing || was_stopping
+                        });
+                        if let Some(key) = &key {
+                            if recoverable && monitor_stop_pending {
+                                state.stopping_monitors.insert(key.clone());
+                            } else {
+                                state.stopping_monitors.remove(key);
+                            }
+                        }
                         let index = state.snapshot.jobs.iter().position(|job| job.id == id)?;
                         let mut job = state.snapshot.jobs[index].clone();
+                        if job.monitor_state == MonitorState::Terminal {
+                            return Some(UiEvent::JobUpdated { job });
+                        }
                         job.status = "attention".into();
                         job.status_label = "Generation needs attention".into();
                         job.detail = message.clone();
+                        if recoverable {
+                            if monitor_stop_pending {
+                                set_recovery_stop_pending(&mut job, remote_continues);
+                            } else {
+                                set_monitor_state(&mut job, MonitorState::Recoverable);
+                                job.remote_continues = Some(remote_continues);
+                            }
+                            job.deletable = false;
+                        } else {
+                            set_monitor_state(&mut job, MonitorState::Terminal);
+                            job.remote_continues = Some(remote_continues);
+                        }
                         state.snapshot.jobs[index] = job.clone();
                         Some(UiEvent::JobUpdated { job })
                     });
@@ -1940,21 +2786,12 @@ fn queue(state: &DesktopState, command: ServiceCommand) -> Result<(), String> {
         .map_err(|_| "The background service is busy; try again in a moment.".into())
 }
 
-async fn await_credential_ack(
-    shared: Arc<Mutex<Shared>>,
-    op_id: u64,
-    reply: oneshot::Receiver<Result<(), String>>,
-) -> Result<(), String> {
-    match tokio::time::timeout(std::time::Duration::from_secs(30), reply).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("The credential service stopped before confirming the change.".into()),
-        Err(_) => {
-            if let Ok(mut state) = shared.lock() {
-                state.pending_credential_ops.remove(&op_id);
-            }
-            Err("The provider credential check timed out.".into())
-        }
-    }
+async fn await_credential_ack(reply: oneshot::Receiver<Result<(), String>>) -> Result<(), String> {
+    // Provider validation has its own finite HTTP deadline and retry policy.
+    // Do not report a timeout while the actor can still persist the key later.
+    reply
+        .await
+        .map_err(|_| "The credential service stopped before confirming the change.".to_string())?
 }
 
 #[tauri::command]
@@ -1967,39 +2804,48 @@ fn open_session(
             .shared
             .lock()
             .map_err(|_| "The desktop session is unavailable.".to_string())?;
+        // There is one production renderer. Replacing its channel on reload
+        // prevents disconnected WebView subscriptions from accumulating.
+        shared.channels.clear();
         shared.channels.push(on_event);
+        shared.channel_generation = shared.channel_generation.saturating_add(1);
         let start = !shared.opened;
         shared.opened = true;
         (
             OpenSessionResult {
                 seq: shared.seq,
                 snapshot: shared.snapshot.clone(),
+                preparing: !shared.preparation_ops.is_empty(),
+                submitting: !shared.submission_ops.is_empty(),
             },
             start,
         )
     };
     if start {
-        queue(
-            &state,
+        let startup_commands = [
             ServiceCommand::LoadHistory {
                 op_id: next_op_id(),
                 limit: HISTORY_LIMIT,
             },
-        )?;
-        queue(
-            &state,
             ServiceCommand::LoadDraft {
                 op_id: next_op_id(),
             },
-        )?;
-        for provider_id in [ProviderId::openrouter(), ProviderId::fal()] {
-            queue(
-                &state,
-                ServiceCommand::RefreshCatalog {
-                    op_id: next_op_id(),
-                    provider_id,
-                },
-            )?;
+            ServiceCommand::RefreshCatalog {
+                op_id: next_op_id(),
+                provider_id: ProviderId::openrouter(),
+            },
+            ServiceCommand::RefreshCatalog {
+                op_id: next_op_id(),
+                provider_id: ProviderId::fal(),
+            },
+        ];
+        for command in startup_commands {
+            if let Err(error) = queue(&state, command) {
+                if let Ok(mut shared) = state.shared.lock() {
+                    shared.opened = false;
+                }
+                return Err(error);
+            }
         }
     }
     Ok(result)
@@ -2014,6 +2860,8 @@ fn get_snapshot(state: State<'_, DesktopState>) -> Result<OpenSessionResult, Str
     Ok(OpenSessionResult {
         seq: shared.seq,
         snapshot: shared.snapshot.clone(),
+        preparing: !shared.preparation_ops.is_empty(),
+        submitting: !shared.submission_ops.is_empty(),
     })
 }
 
@@ -2053,7 +2901,7 @@ async fn connect_provider(
         }
         return Err(error);
     }
-    await_credential_ack(state.shared.clone(), op_id, reply_rx).await
+    await_credential_ack(reply_rx).await
 }
 
 #[tauri::command]
@@ -2076,7 +2924,7 @@ async fn forget_provider(
         }
         return Err(error);
     }
-    await_credential_ack(state.shared.clone(), op_id, reply_rx).await
+    await_credential_ack(reply_rx).await
 }
 
 #[tauri::command]
@@ -2288,8 +3136,7 @@ fn invalidate_prepared(revision: u64, state: State<'_, DesktopState>) -> Result<
     )
 }
 
-#[tauri::command]
-async fn save_draft(draft: GenerationDraft, state: State<'_, DesktopState>) -> Result<(), String> {
+async fn save_draft_inner(draft: GenerationDraft, state: &DesktopState) -> Result<(), String> {
     let op_id = next_op_id();
     let (reply_tx, reply_rx) = oneshot::channel();
     let (core, editor_state) = {
@@ -2306,7 +3153,7 @@ async fn save_draft(draft: GenerationDraft, state: State<'_, DesktopState>) -> R
         (core, editor_state)
     };
     if let Err(error) = queue(
-        &state,
+        state,
         ServiceCommand::SaveDraft {
             op_id,
             draft: core,
@@ -2319,16 +3166,78 @@ async fn save_draft(draft: GenerationDraft, state: State<'_, DesktopState>) -> R
         }
         return Err(error);
     }
-    match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("The draft service stopped before confirming the save.".into()),
-        Err(_) => {
-            if let Ok(mut shared) = state.shared.lock() {
-                shared.pending_save_ops.remove(&op_id);
-            }
-            Err("Saving the draft timed out; Review was not started.".into())
+    reply_rx
+        .await
+        .map_err(|_| "The draft service stopped before confirming the save.".to_string())?
+}
+
+#[tauri::command]
+async fn save_draft(draft: GenerationDraft, state: State<'_, DesktopState>) -> Result<(), String> {
+    save_draft_inner(draft, &state).await
+}
+
+#[tauri::command]
+fn acknowledge_close_request(
+    request_id: u64,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
+    let acknowledged = state
+        .shared
+        .lock()
+        .map_err(|_| "The desktop session is unavailable.".to_string())?
+        .acknowledge_close_flush(request_id);
+    acknowledged
+        .then_some(())
+        .ok_or_else(|| "That close request is no longer current.".to_string())
+}
+
+#[tauri::command]
+fn cancel_close_request(request_id: u64, state: State<'_, DesktopState>) -> Result<(), String> {
+    let cancelled = state
+        .shared
+        .lock()
+        .map_err(|_| "The desktop session is unavailable.".to_string())?
+        .cancel_close_flush(request_id);
+    cancelled
+        .then_some(())
+        .ok_or_else(|| "That close request is no longer current.".to_string())
+}
+
+#[tauri::command]
+async fn save_draft_and_close(
+    app: AppHandle,
+    draft: GenerationDraft,
+    request_id: u64,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
+    let watchdog_generation = state
+        .shared
+        .lock()
+        .map_err(|_| "The desktop session is unavailable.".to_string())?
+        .begin_close_save(request_id)
+        .ok_or_else(|| "That close request is no longer current.".to_string())?;
+    spawn_close_flush_watchdog(
+        app.clone(),
+        request_id,
+        watchdog_generation,
+        CLOSE_FLUSH_TIMEOUT,
+    );
+    if let Err(error) = save_draft_inner(draft, &state).await {
+        if let Ok(mut shared) = state.shared.lock() {
+            shared.suspend_failed_close_save(request_id, watchdog_generation);
         }
+        return Err(error);
     }
+    let finished = state
+        .shared
+        .lock()
+        .map_err(|_| "The desktop session is unavailable.".to_string())?
+        .finish_close_flush(request_id, watchdog_generation);
+    if !finished {
+        return Err("That close request is no longer current.".into());
+    }
+    request_safe_shutdown(&app);
+    Ok(())
 }
 
 fn job_command(state: &DesktopState, job_id: &str, resume: bool) -> Result<ServiceCommand, String> {
@@ -2341,6 +3250,18 @@ fn job_command(state: &DesktopState, job_id: &str, resume: bool) -> Result<Servi
         .get(job_id)
         .map(|grant| grant.key.clone())
         .ok_or_else(|| "That job handle is no longer valid.".to_string())?;
+    let job = shared
+        .snapshot
+        .jobs
+        .iter()
+        .find(|job| job.id == job_id)
+        .ok_or_else(|| "That render is no longer on the reel.".to_string())?;
+    if resume && !job.can_resume {
+        return Err("That job is not currently resumable.".into());
+    }
+    if !resume && !job.can_pause {
+        return Err("That job is not currently being monitored.".into());
+    }
     Ok(if resume {
         ServiceCommand::Resume {
             op_id: next_op_id(),
@@ -2443,17 +3364,9 @@ async fn delete_render(
         return Err(error);
     }
 
-    match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("The render service stopped before confirming cleanup.".into()),
-        Err(_) => {
-            if let Ok(mut shared) = state.shared.lock() {
-                shared.pending_delete_ops.remove(&op_id);
-                shared.deletion_pending.remove(&job_id);
-            }
-            Err("Removing the render timed out; it may still be on the reel.".into())
-        }
-    }
+    reply_rx
+        .await
+        .map_err(|_| "The render service stopped before confirming cleanup.".to_string())?
 }
 
 #[tauri::command]
@@ -2718,6 +3631,386 @@ mod tests {
     }
 
     #[test]
+    fn close_request_event_is_explicitly_serialized_for_the_renderer() {
+        let value = serde_json::to_value(UiEvent::CloseRequested { request_id: 42 })
+            .expect("serialize close request");
+        assert_eq!(value["type"], "close_requested");
+        assert_eq!(value["requestId"], 42);
+        assert!(value.get("request_id").is_none());
+    }
+
+    #[test]
+    fn close_flush_requires_the_current_request_and_can_be_cancelled() {
+        let mut shared = Shared::new(PathBuf::from("videos"), PathBuf::from("playback"));
+        let first = shared.begin_close_flush().expect("begin close request");
+        assert_eq!(
+            shared.begin_close_flush(),
+            None,
+            "do not replace an in-flight request"
+        );
+        assert!(!shared.acknowledge_close_flush(first.saturating_add(1)));
+        assert!(shared.acknowledge_close_flush(first));
+        let first_save = shared.begin_close_save(first).expect("arm close save");
+        assert!(shared.suspend_failed_close_save(first, first_save));
+        assert!(
+            shared.close_flush_watchdog_generation != first_save,
+            "a failed save must invalidate its forced-close watchdog"
+        );
+        assert!(
+            !shared.begin_close_timeout_shutdown(first, Some(first_save), false),
+            "a failed save must leave the acknowledged close request open for retry"
+        );
+        assert!(!shared.cancel_close_flush(first.saturating_add(1)));
+        assert!(shared.cancel_close_flush(first));
+
+        let second = shared
+            .begin_close_flush()
+            .expect("begin replacement request");
+        assert_ne!(second, first);
+        let second_save = shared
+            .begin_close_save(second)
+            .expect("arm replacement save");
+        assert!(!shared.finish_close_flush(first, first_save));
+        assert!(shared.finish_close_flush(second, second_save));
+    }
+
+    #[test]
+    fn a_later_window_close_reissues_a_pending_request_with_a_fresh_watchdog() {
+        let mut shared = Shared::new(PathBuf::from("videos"), PathBuf::from("playback"));
+        let request_id = shared.begin_close_flush().expect("begin close request");
+        assert!(shared.acknowledge_close_flush(request_id));
+        let failed_save = shared
+            .begin_close_save(request_id)
+            .expect("arm failed save");
+        assert!(shared.suspend_failed_close_save(request_id, failed_save));
+        let suspended_generation = shared.close_flush_watchdog_generation;
+
+        let (reissued_id, reissued_generation) =
+            shared.issue_close_flush().expect("reissue close request");
+        assert_eq!(reissued_id, request_id);
+        assert_ne!(reissued_generation, suspended_generation);
+        assert!(shared.close_flush_acknowledged);
+    }
+
+    #[test]
+    fn a_failed_save_invalidates_a_watchdog_rearmed_while_it_was_running() {
+        let mut shared = Shared::new(PathBuf::from("videos"), PathBuf::from("playback"));
+        let request_id = shared.begin_close_flush().expect("begin close request");
+        assert!(shared.acknowledge_close_flush(request_id));
+        let failed_save = shared
+            .begin_close_save(request_id)
+            .expect("arm failed save");
+
+        let (reissued_id, reissued_generation) =
+            shared.issue_close_flush().expect("reissue close request");
+        assert_eq!(reissued_id, request_id);
+        assert_ne!(reissued_generation, failed_save);
+        assert!(shared.suspend_failed_close_save(request_id, failed_save));
+        assert!(
+            !shared.begin_close_timeout_shutdown(request_id, Some(reissued_generation), false),
+            "no watchdog may close the application after the save failed"
+        );
+    }
+
+    #[test]
+    fn shutdown_disables_close_flush_state_transitions() {
+        let mut shared = Shared::new(PathBuf::from("videos"), PathBuf::from("playback"));
+        let request_id = shared.begin_close_flush().expect("begin close request");
+        assert!(shared.begin_shutdown());
+
+        assert!(!shared.acknowledge_close_flush(request_id));
+        assert!(!shared.cancel_close_flush(request_id));
+        assert!(!shared.finish_close_flush(request_id, 0));
+        assert_eq!(shared.begin_close_flush(), None);
+        assert_eq!(shared.close_flush_pending, None);
+        assert!(!shared.begin_shutdown());
+    }
+
+    fn record_fixture(status: &str, output_path: Option<PathBuf>) -> JobRecord {
+        JobRecord {
+            provider_id: ProviderId::openrouter(),
+            job_id: "job-recovery-fixture".into(),
+            polling_url: "/api/v1/videos/job-recovery-fixture".into(),
+            locator: video_harness::domain::JobLocator::OpenRouter {
+                polling_url: "/api/v1/videos/job-recovery-fixture".into(),
+            },
+            status: status.into(),
+            request: None,
+            generation_id: None,
+            output_path,
+            cost: None,
+            currency: None,
+            error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn history_jobs_expose_truthful_monitor_capabilities_after_restart() {
+        let mut shared = Shared::new(PathBuf::from("videos"), PathBuf::from("playback"));
+        let pending = record_fixture("pending", None);
+        let pending_summary = job_from_record(&mut shared, &pending);
+        assert_eq!(pending_summary.monitor_state, MonitorState::Recoverable);
+        assert!(pending_summary.can_resume);
+        assert!(!pending_summary.can_pause);
+        assert!(!pending_summary.deletable);
+
+        shared.active_monitors.insert(pending.key());
+        let active_summary = job_from_record(&mut shared, &pending);
+        assert_eq!(active_summary.monitor_state, MonitorState::Active);
+        assert!(!active_summary.can_resume);
+        assert!(active_summary.can_pause);
+
+        shared.active_monitors.clear();
+        let completed_without_output = record_fixture("completed", None);
+        let completed_summary = job_from_record(&mut shared, &completed_without_output);
+        assert_eq!(completed_summary.monitor_state, MonitorState::Recoverable);
+        assert!(completed_summary.can_resume);
+        assert!(!completed_summary.deletable);
+
+        let completed_with_output = record_fixture(
+            "completed",
+            Some(std::env::current_exe().expect("test executable path")),
+        );
+        let downloaded_summary = job_from_record(&mut shared, &completed_with_output);
+        assert_eq!(downloaded_summary.monitor_state, MonitorState::Terminal);
+        assert!(!downloaded_summary.can_resume);
+        assert!(downloaded_summary.deletable);
+    }
+
+    #[test]
+    fn final_monitor_cancellation_restores_pause_after_a_late_active_update() {
+        let mut shared = Shared::new(PathBuf::from("videos"), PathBuf::from("playback"));
+        let record = record_fixture("processing", None);
+        shared.active_monitors.insert(record.key());
+        let mut job = job_from_record(&mut shared, &record);
+        job.next_poll_seconds = Some(3);
+        job.progress = Some(0.5);
+
+        set_pause_pending_projection(&mut job, true);
+
+        assert_eq!(job.monitor_state, MonitorState::Paused);
+        assert!(!job.can_resume);
+        assert!(!job.can_pause);
+        assert_eq!(job.status_label, "Pausing monitoring");
+        assert_eq!(job.remote_continues, Some(true));
+        assert!(job.next_poll_seconds.is_none());
+        assert!(job.progress.is_none());
+
+        set_paused_projection(&mut job, true);
+
+        assert_eq!(job.monitor_state, MonitorState::Paused);
+        assert!(job.can_resume);
+        assert!(!job.can_pause);
+        assert_eq!(job.status, "paused");
+        assert_eq!(job.remote_continues, Some(true));
+        assert!(job.next_poll_seconds.is_none());
+        assert!(job.progress.is_none());
+
+        job.status = "attention".into();
+        job.status_label = "Generation needs attention".into();
+        set_recovery_stop_pending(&mut job, true);
+        assert!(!job.can_resume);
+        set_monitor_state(&mut job, MonitorState::Recoverable);
+        assert!(job.can_resume);
+
+        set_recovery_stop_pending(&mut job, false);
+        assert_eq!(job.remote_continues, Some(false));
+
+        let completed = record_fixture(
+            "completed",
+            Some(std::env::current_exe().expect("test executable path")),
+        );
+        let terminal = job_from_record(&mut shared, &completed);
+        assert_eq!(terminal.monitor_state, MonitorState::Terminal);
+        assert!(
+            !pause_projection_allowed(&terminal),
+            "a late pause acknowledgement must not regress a terminal job"
+        );
+    }
+
+    #[test]
+    fn sidecar_only_jobs_are_visible_and_resumable() {
+        let mut shared = Shared::new(PathBuf::from("videos"), PathBuf::from("playback"));
+        let resumable = ResumableJob {
+            key: ProviderJobKey::new(ProviderId::openrouter(), "sidecar-only")
+                .expect("provider key"),
+            locator: video_harness::domain::JobLocator::OpenRouter {
+                polling_url: "/api/v1/videos/sidecar-only".into(),
+            },
+            accepted_at: Utc::now(),
+            monitoring_paused: false,
+            completed_output_path: None,
+        };
+
+        let summary = job_from_resumable(&mut shared, &resumable);
+        assert_eq!(summary.provider_job_id.as_deref(), Some("sidecar-only"));
+        assert_eq!(summary.monitor_state, MonitorState::Recoverable);
+        assert!(summary.can_resume);
+        assert!(shared.jobs.contains_key(&summary.id));
+    }
+
+    #[test]
+    fn model_summary_exposes_native_constraints_to_the_renderer() {
+        let model = VideoModel::from_provider_api(
+            ProviderId::fal(),
+            &serde_json::json!({
+                "id": "fal/constraint-fixture",
+                "name": "Constraint fixture",
+                "input_modalities": ["image"],
+                "supported_frame_images": ["first_frame", "last_frame"],
+                "supported_sizes": ["1280x720"],
+                "seed": false,
+                "field_map": {
+                    "first_frame": "image_urls",
+                    "last_frame": "end_image_url"
+                },
+                "input_schema": {
+                    "type": "object",
+                    "required": ["image_urls"],
+                    "allOf": [{"required": ["end_image_url"]}]
+                },
+                "media_bindings": [{
+                    "kind": "image",
+                    "property_name": "image_urls",
+                    "cardinality": "list",
+                    "required": true,
+                    "min_items": 1,
+                    "max_items": 2
+                }]
+            }),
+        )
+        .expect("model fixture");
+
+        let summary = model_summary(&model);
+        assert!(!summary.capabilities.seed);
+        assert_eq!(summary.size_options, vec!["1280x720"]);
+        assert_eq!(
+            summary.supported_image_roles,
+            vec![
+                MediaRole::Reference,
+                MediaRole::StartFrame,
+                MediaRole::EndFrame
+            ]
+        );
+        assert_eq!(
+            summary.required_image_roles,
+            vec![MediaRole::StartFrame, MediaRole::EndFrame]
+        );
+        assert_eq!(summary.media_constraints.len(), 1);
+        assert_eq!(
+            summary.media_constraints[0].roles,
+            vec![MediaRole::Reference, MediaRole::StartFrame]
+        );
+        assert!(summary.media_constraints[0].required);
+        assert_eq!(summary.media_constraints[0].min_items, Some(1));
+        assert_eq!(summary.media_constraints[0].min_items_when_present, None);
+        assert_eq!(summary.media_constraints[0].max_items, Some(2));
+        assert_eq!(summary.max_media_items, Some(MAX_MEDIA_INPUTS_TOTAL));
+        assert!(!summary.audio_requires_visual);
+        assert!(!summary.frames_exclusive_with_references);
+
+        let optional = VideoModel::from_provider_api(
+            ProviderId::fal(),
+            &serde_json::json!({
+                "id": "fal/optional-media-fixture",
+                "name": "Optional media fixture",
+                "input_modalities": ["image"],
+                "media_bindings": [{
+                    "kind": "image",
+                    "property_name": "image_urls",
+                    "cardinality": "list",
+                    "required": false,
+                    "min_items": 2,
+                    "max_items": 3
+                }]
+            }),
+        )
+        .expect("optional model fixture");
+        let optional_summary = model_summary(&optional);
+        assert!(!optional_summary.media_constraints[0].required);
+        assert_eq!(optional_summary.media_constraints[0].min_items, None);
+        assert_eq!(
+            optional_summary.media_constraints[0].min_items_when_present,
+            Some(2)
+        );
+        assert_eq!(optional_summary.media_constraints[0].max_items, Some(3));
+        let serialized = serde_json::to_value(&optional_summary).expect("serialize model summary");
+        assert_eq!(
+            serialized["mediaConstraints"][0]["minItemsWhenPresent"],
+            serde_json::json!(2)
+        );
+
+        let frame_only = VideoModel::from_provider_api(
+            ProviderId::fal(),
+            &serde_json::json!({
+                "id": "fal/frame-only-fixture",
+                "name": "Frame-only fixture",
+                "input_modalities": [],
+                "supported_frame_images": ["first_frame"],
+                "field_map": { "first_frame": "start_image_url" }
+            }),
+        )
+        .expect("frame-only model fixture");
+        let frame_only_summary = model_summary(&frame_only);
+        assert!(frame_only_summary.capabilities.images);
+        assert!(!frame_only_summary.capabilities.seed);
+        assert_eq!(
+            frame_only_summary.supported_image_roles,
+            vec![MediaRole::StartFrame]
+        );
+
+        let openrouter = VideoModel::from_provider_api(
+            ProviderId::openrouter(),
+            &serde_json::json!({
+                "id": "bytedance/seedance-2.0",
+                "name": "OpenRouter policy fixture",
+                "input_modalities": ["image", "video", "audio"],
+                "supported_frame_images": ["first_frame"]
+            }),
+        )
+        .expect("OpenRouter policy fixture");
+        let openrouter_summary = model_summary(&openrouter);
+        assert_eq!(
+            openrouter_summary.max_media_items,
+            Some(MAX_MEDIA_INPUTS_TOTAL)
+        );
+        assert!(openrouter_summary.audio_requires_visual);
+        assert!(openrouter_summary.frames_exclusive_with_references);
+        assert_eq!(
+            openrouter_summary
+                .media_constraints
+                .iter()
+                .find(|constraint| constraint.kind == MediaKind::Image)
+                .and_then(|constraint| constraint.max_items),
+            Some(MAX_IMAGE_INPUTS)
+        );
+
+        let explicit_high = VideoModel::from_provider_api(
+            ProviderId::fal(),
+            &serde_json::json!({
+                "id": "fal/custom-many-images",
+                "name": "High schema maximum fixture",
+                "input_modalities": ["image"],
+                "media_bindings": [{
+                    "kind": "image",
+                    "property_name": "image_urls",
+                    "cardinality": "list",
+                    "max_items": 20
+                }]
+            }),
+        )
+        .expect("high maximum fixture");
+        let explicit_high_summary = model_summary(&explicit_high);
+        assert_eq!(explicit_high_summary.max_media_items, None);
+        assert_eq!(
+            explicit_high_summary.media_constraints[0].max_items,
+            Some(20)
+        );
+    }
+
+    #[test]
     fn verified_outputs_stay_in_videos_and_lock_during_deletion() {
         let root = std::env::temp_dir().join(format!("video-harness-test-{}", Uuid::new_v4()));
         let videos = root.join("Videos");
@@ -2833,11 +4126,12 @@ mod tests {
         shared.preserved_draft = Some(PreservedDraftFields {
             provider_id: "openrouter".into(),
             model_id: draft.model_id.clone(),
-            size: Some("1280x720".into()),
             adapter_options: Some(serde_json::json!({"guidance": 4})),
             typed_seed: Some(23),
             editor_state,
         });
+        draft.settings.size = "1280x720".into();
+        draft.settings.advanced_json = r#"{"guidance": 4}"#.into();
 
         let saved = core_draft(&shared, &draft, DraftPurpose::Autosave)
             .expect("autosave accepts raw editor seed");
@@ -2852,6 +4146,47 @@ mod tests {
             "half-written"
         );
         assert!(core_draft(&shared, &draft, DraftPurpose::Review).is_err());
+
+        draft.settings.seed = "23".into();
+        draft.settings.advanced_json = "{}".into();
+        let cleared = core_draft(&shared, &draft, DraftPurpose::Review)
+            .expect("visible advanced settings can be cleared");
+        assert_eq!(cleared.size.as_deref(), Some("1280x720"));
+        assert!(cleared.adapter_options.is_none());
+
+        draft.settings.advanced_json = "{half-written".into();
+        let autosaved = core_draft(&shared, &draft, DraftPurpose::Autosave)
+            .expect("autosave retains the last typed advanced object");
+        assert_eq!(
+            autosaved.adapter_options,
+            Some(serde_json::json!({"guidance": 4}))
+        );
+        assert_eq!(
+            editor_state_for_draft(&shared, &draft).advanced_json_text,
+            "{half-written"
+        );
+        assert!(core_draft(&shared, &draft, DraftPurpose::Review).is_err());
+    }
+
+    #[test]
+    fn review_rejects_credential_fields_in_advanced_settings() {
+        let shared = Shared::new(PathBuf::from("videos"), PathBuf::from("playback"));
+        let mut draft = GenerationDraft {
+            model_id: "fixture/model".into(),
+            prompt: "A fixture prompt".into(),
+            ..GenerationDraft::default()
+        };
+        draft.settings.advanced_json =
+            r#"{"nested":{"client_secret":"must-never-enter-a-review"}}"#.into();
+
+        let error = core_draft(&shared, &draft, DraftPurpose::Review)
+            .expect_err("credential-like fields must fail before preparation");
+        assert!(error.contains("credential"));
+        assert!(!error.contains("must-never-enter-a-review"));
+        assert!(core_draft(&shared, &draft, DraftPurpose::Autosave).is_err());
+
+        draft.settings.advanced_json = r#"{"max_tokens":128,"token_count":4}"#.into();
+        assert!(core_draft(&shared, &draft, DraftPurpose::Review).is_ok());
     }
 
     #[test]
@@ -2975,21 +4310,7 @@ mod tests {
     }
 }
 
-fn request_safe_shutdown(app: &AppHandle) {
-    let Some(state) = app.try_state::<DesktopState>() else {
-        return;
-    };
-    let should_request = state.shared.lock().ok().is_some_and(|mut shared| {
-        if shared.shutdown_requested || shared.shutdown_complete {
-            false
-        } else {
-            shared.shutdown_requested = true;
-            true
-        }
-    });
-    if !should_request {
-        return;
-    }
+fn dispatch_safe_shutdown(app: &AppHandle, state: &DesktopState) {
     let commands = state.commands.clone();
     let shared = state.shared.clone();
     let app = app.clone();
@@ -3000,6 +4321,89 @@ fn request_safe_shutdown(app: &AppHandle) {
             }
             app.exit(1);
         }
+    });
+}
+
+fn request_safe_shutdown(app: &AppHandle) {
+    let Some(state) = app.try_state::<DesktopState>() else {
+        return;
+    };
+    let should_request = state
+        .shared
+        .lock()
+        .ok()
+        .is_some_and(|mut shared| shared.begin_shutdown());
+    if should_request {
+        dispatch_safe_shutdown(app, &state);
+    }
+}
+
+fn request_close_timeout_shutdown(
+    app: &AppHandle,
+    request_id: u64,
+    watchdog_generation: Option<u64>,
+    require_unacknowledged: bool,
+) -> bool {
+    let Some(state) = app.try_state::<DesktopState>() else {
+        return false;
+    };
+    let should_request = state.shared.lock().ok().is_some_and(|mut shared| {
+        shared.begin_close_timeout_shutdown(request_id, watchdog_generation, require_unacknowledged)
+    });
+    if should_request {
+        dispatch_safe_shutdown(app, &state);
+    }
+    should_request
+}
+
+fn spawn_close_flush_watchdog(
+    app: AppHandle,
+    request_id: u64,
+    watchdog_generation: u64,
+    timeout: std::time::Duration,
+) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        request_close_timeout_shutdown(&app, request_id, Some(watchdog_generation), false);
+    });
+}
+
+fn request_close_flush(app: &AppHandle) {
+    let Some(state) = app.try_state::<DesktopState>() else {
+        return;
+    };
+    let close_request = state.shared.lock().ok().and_then(|mut shared| {
+        (shared.opened && !shared.channels.is_empty() && !shared.shutdown_requested)
+            .then(|| shared.issue_close_flush())
+            .flatten()
+    });
+    let has_renderer_or_pending_request = state.shared.lock().ok().is_some_and(|shared| {
+        shared.opened
+            && !shared.channels.is_empty()
+            && !shared.shutdown_requested
+            && (close_request.is_some() || shared.close_flush_pending.is_some())
+    });
+    let Some((request_id, watchdog_generation)) = close_request else {
+        if !has_renderer_or_pending_request {
+            request_safe_shutdown(app);
+        }
+        return;
+    };
+    if !broadcast(&state.shared, UiEvent::CloseRequested { request_id }) {
+        request_safe_shutdown(app);
+        return;
+    }
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(CLOSE_ACK_TIMEOUT).await;
+        // Claim shutdown atomically with respect to a late renderer
+        // acknowledgement or Keep-working cancellation.
+        if request_close_timeout_shutdown(&app, request_id, None, true) {
+            return;
+        }
+        tokio::time::sleep(CLOSE_FLUSH_TIMEOUT.saturating_sub(CLOSE_ACK_TIMEOUT)).await;
+        request_close_timeout_shutdown(&app, request_id, Some(watchdog_generation), false);
     });
 }
 
@@ -3075,6 +4479,9 @@ pub fn run() {
             submit_prepared,
             invalidate_prepared,
             save_draft,
+            acknowledge_close_request,
+            cancel_close_request,
+            save_draft_and_close,
             pause_job,
             resume_job,
             delete_render,
@@ -3090,7 +4497,7 @@ pub fn run() {
             ..
         } => {
             api.prevent_close();
-            request_safe_shutdown(app);
+            request_close_flush(app);
         }
         tauri::RunEvent::ExitRequested { api, .. } => {
             let complete = app
@@ -3105,7 +4512,7 @@ pub fn run() {
                 .unwrap_or(true);
             if !complete {
                 api.prevent_exit();
-                request_safe_shutdown(app);
+                request_close_flush(app);
             }
         }
         _ => {}

@@ -12,35 +12,45 @@ fail() {
     exit 1
 }
 
-field_has() {
-    local field="$1"
-    local value="$2"
-    local values
-    values="$(sed -n "s/^${field}=//p" "${PERMISSIONS_FILE}" | head -n 1)"
-    case ";${values}" in
-        *";${value};"*) ;;
-        *) fail "${field} does not contain ${value}" ;;
-    esac
+normalize_list() {
+    tr ';' '\n' | sed '/^$/d' | LC_ALL=C sort | paste -sd ';' -
 }
 
-field_has shared network
-field_has shared ipc
-field_has sockets wayland
-field_has sockets fallback-x11
-field_has sockets pulseaudio
-field_has devices dri
-field_has filesystems xdg-videos:create
-field_has filesystems '~/.local/share/openrouter-video-studio:ro'
-field_has filesystems '~/.config/openrouter-video-studio:ro'
-field_has filesystems '~/.cache/openrouter-video-studio:ro'
-grep -Fq -- 'org.freedesktop.secrets=talk' "${PERMISSIONS_FILE}" \
-    || fail "Secret Service talk permission is absent"
+field_equals() {
+    local field="$1"
+    shift
+    local -a matches=()
+    local actual expected
+    mapfile -t matches < <(sed -n "s/^${field}=//p" "${PERMISSIONS_FILE}")
+    [[ "${#matches[@]}" -eq 1 ]] \
+        || fail "${field} must occur exactly once"
+    actual="$(printf '%s' "${matches[0]}" | normalize_list)"
+    expected="$(printf '%s\n' "$@" | LC_ALL=C sort | paste -sd ';' -)"
+    [[ "${actual}" == "${expected}" ]] \
+        || fail "${field} is '${actual}', expected '${expected}'"
+}
 
-filesystems="$(sed -n 's/^filesystems=//p' "${PERMISSIONS_FILE}" | head -n 1)"
-case ";${filesystems}" in
-    *';host;'*|*';host:ro;'*|*';home;'*|*';home:ro;'*)
-        fail "broad host or home access is present"
-        ;;
-esac
+field_equals shared ipc network
+field_equals sockets fallback-x11 pulseaudio wayland
+field_equals devices dri
+field_equals filesystems \
+    '~/.cache/openrouter-video-studio:ro' \
+    '~/.config/openrouter-video-studio:ro' \
+    '~/.local/share/openrouter-video-studio:ro' \
+    xdg-videos:create
 
-echo "Installed Flatpak permissions match the narrow policy."
+unexpected="$(awk '
+    /^[[:space:]]*($|#)/ { next }
+    /^\[/ { section = $0; next }
+    section == "[Context]" && /^(shared|sockets|devices|filesystems)=/ { next }
+    section == "[Session Bus Policy]" && $0 == "org.freedesktop.secrets=talk" { next }
+    { print NR ":" $0 }
+' "${PERMISSIONS_FILE}")"
+[[ -z "${unexpected}" ]] \
+    || fail "unexpected permission entries: ${unexpected//$'\n'/, }"
+
+secret_count="$(grep -Fxc -- 'org.freedesktop.secrets=talk' "${PERMISSIONS_FILE}" || true)"
+[[ "${secret_count}" -eq 1 ]] \
+    || fail "Secret Service talk permission must occur exactly once"
+
+echo "Installed Flatpak permissions exactly match the reviewed allowlist."

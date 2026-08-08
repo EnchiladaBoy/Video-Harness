@@ -31,7 +31,7 @@ pub const MIGRATION_MARKER_FILE: &str = "legacy-import-v1.json";
 
 const MARKER_SCHEMA_VERSION: u32 = 1;
 const SUPPORTED_HISTORY_SCHEMA_VERSION: i64 = 2;
-const SUPPORTED_GUI_STATE_SCHEMA_VERSION: i64 = 1;
+const SUPPORTED_GUI_STATE_SCHEMA_VERSION: i64 = 2;
 const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1437,7 +1437,10 @@ mod tests {
                 )
                 .expect("seed resumable job");
             connection
-                .pragma_update(None, "user_version", SUPPORTED_GUI_STATE_SCHEMA_VERSION)
+                // This fixture represents the pre-completed-output sidecar
+                // imported from a legacy install. GuiStateStore upgrades the
+                // copied database to the current schema on first open.
+                .pragma_update(None, "user_version", 1_i64)
                 .expect("set GUI schema");
         }
 

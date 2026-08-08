@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{TimeDelta, Utc};
 use reqwest::header::{AUTHORIZATION, HeaderMap};
 use reqwest::{Method, StatusCode};
 use secrecy::SecretString;
@@ -15,11 +16,14 @@ use tokio::sync::Notify;
 use url::Url;
 use video_harness::AppPaths;
 use video_harness::api::{ClientOptions, HttpExecutor, HttpRequest, HttpResponse, TransportError};
+use video_harness::config::{make_output_path, partial_path};
 use video_harness::domain::{
     DraftMedia, GenerationDraft, InputReference, InputReferenceKind, JobLocator, JobStatus,
     MediaRole, ProviderId, ProviderJobKey, VideoCatalog, VideoJob, VideoRequest,
 };
-use video_harness::gui_state::{DraftEditorState, GuiStateStore, StoredDraft, StoredUploadReceipt};
+use video_harness::gui_state::{
+    DraftEditorState, GuiStateStore, ResumableJob, StoredDraft, StoredUploadReceipt,
+};
 use video_harness::history::HistoryStore;
 use video_harness::providers::media_sha256;
 use video_harness::workflow::{
@@ -46,6 +50,11 @@ enum Reply {
         release: Arc<Notify>,
     },
     Bytes(Vec<u8>),
+    WaitBytes {
+        body: Vec<u8>,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    },
 }
 
 #[derive(Default)]
@@ -99,6 +108,20 @@ impl HttpExecutor for WorkflowExecutor {
                 HeaderMap::new(),
                 Bytes::from(body),
             )),
+            Some(Reply::WaitBytes {
+                body,
+                started,
+                release,
+            }) => {
+                started.notify_one();
+                release.notified().await;
+                Ok(HttpResponse::from_bytes(
+                    StatusCode::OK,
+                    request.url,
+                    HeaderMap::new(),
+                    Bytes::from(body),
+                ))
+            }
             None => Err(TransportError),
         }
     }
@@ -760,6 +783,60 @@ async fn openrouter_explicit_fal_stager_without_fal_key_fails_before_prepare_net
 }
 
 #[tokio::test]
+async fn startup_keeps_gui_recovery_available_when_history_cannot_initialize() {
+    let (_root, paths) = fixture_paths();
+    paths.ensure_dirs().expect("create application directories");
+    let key = ProviderJobKey::new(ProviderId::openrouter(), "job-startup-recovery")
+        .expect("recovery key");
+    let locator = JobLocator::OpenRouter {
+        polling_url: format!("{BASE_URL}/videos/job-startup-recovery"),
+    };
+    let accepted_at = Utc::now() - TimeDelta::minutes(5);
+    GuiStateStore::new(paths.gui_state_db())
+        .save_resumable_job(&ResumableJob {
+            key: key.clone(),
+            locator,
+            accepted_at,
+            monitoring_paused: true,
+            completed_output_path: None,
+        })
+        .expect("seed GUI recovery state");
+    fs::create_dir(paths.history_db()).expect("make compatible history unavailable");
+
+    let executor = WorkflowExecutor::scripted([]);
+    let mut service = spawn_service_with_executor(paths, config(Duration::ZERO), executor)
+        .expect("spawn service with unavailable history");
+
+    assert!(matches!(
+        next_event(&mut service).await,
+        ServiceEvent::Ready { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut service).await,
+        ServiceEvent::Error {
+            op_id: 0,
+            scope: ServiceScope::History,
+            recoverable: true,
+            job_id: None,
+            remote_continues: None,
+            ref message,
+            ..
+        } if message.contains("GUI recovery state remains available")
+    ));
+    assert!(matches!(
+        next_event(&mut service).await,
+        ServiceEvent::ResumableJobsLoaded {
+            op_id: 0,
+            ref jobs,
+        } if jobs.len() == 1
+            && jobs[0].key == key
+            && jobs[0].accepted_at == accepted_at
+    ));
+
+    shutdown(&mut service).await;
+}
+
+#[tokio::test]
 async fn generate_surfaces_id_then_persists_polls_and_downloads_with_one_post() {
     let (_root, paths) = fixture_paths();
     let executor = WorkflowExecutor::scripted([
@@ -884,6 +961,169 @@ async fn generate_surfaces_id_then_persists_polls_and_downloads_with_one_post() 
         1
     );
     assert_eq!(requests.len(), 4);
+    shutdown(&mut service).await;
+}
+
+#[tokio::test]
+async fn monitor_limit_error_reports_that_the_remote_job_continues() {
+    let (_root, paths) = fixture_paths();
+    let executor = WorkflowExecutor::scripted([
+        Reply::Json(StatusCode::OK, json!({"data": {"label": "fixture"}})),
+        Reply::Json(StatusCode::OK, pending_job("job-monitor-limit")),
+        Reply::Json(StatusCode::OK, pending_job("job-monitor-limit")),
+        Reply::Json(StatusCode::OK, pending_job("job-monitor-limit")),
+        Reply::Json(StatusCode::OK, pending_job("job-monitor-limit")),
+    ]);
+    let mut service = spawn_service_with_executor(paths, config(Duration::ZERO), executor)
+        .expect("spawn service");
+    connect_fixture_key(&mut service, 1).await;
+
+    service
+        .commands
+        .send(ServiceCommand::Generate {
+            op_id: 11,
+            provider_id: ProviderId::openrouter(),
+            request: VideoRequest::new("example/video", "Monitor limit fixture").expect("request"),
+        })
+        .await
+        .expect("send generation");
+    let error = event_matching(&mut service, |event| {
+        matches!(event, ServiceEvent::Error { op_id: 11, .. })
+    })
+    .await;
+    assert!(matches!(
+        error,
+        ServiceEvent::Error {
+            job_id: Some(ref job_id),
+            remote_continues: Some(true),
+            ref message,
+            ..
+        } if job_id == "job-monitor-limit" && message.contains("local limit")
+    ));
+    shutdown(&mut service).await;
+}
+
+#[tokio::test]
+async fn completed_job_download_error_reports_that_the_remote_job_is_finished() {
+    let (_root, paths) = fixture_paths();
+    let executor = WorkflowExecutor::scripted([
+        Reply::Json(StatusCode::OK, json!({"data": {"label": "fixture"}})),
+        Reply::Json(
+            StatusCode::OK,
+            completed_job(
+                "job-download-failure",
+                "https://cdn.workflow.invalid/download-failure.mp4",
+            ),
+        ),
+        Reply::Json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": {"message": "fixture download failure"}}),
+        ),
+    ]);
+    let mut service = spawn_service_with_executor(paths, config(Duration::ZERO), executor)
+        .expect("spawn service");
+    connect_fixture_key(&mut service, 1).await;
+
+    service
+        .commands
+        .send(ServiceCommand::Generate {
+            op_id: 12,
+            provider_id: ProviderId::openrouter(),
+            request: VideoRequest::new("example/video", "Download failure fixture")
+                .expect("request"),
+        })
+        .await
+        .expect("send generation");
+    let error = event_matching(&mut service, |event| {
+        matches!(event, ServiceEvent::Error { op_id: 12, .. })
+    })
+    .await;
+    assert!(matches!(
+        error,
+        ServiceEvent::Error {
+            job_id: Some(ref job_id),
+            remote_continues: Some(false),
+            ref message,
+            ..
+        } if job_id == "job-download-failure" && message.contains("fixture download failure")
+    ));
+    shutdown(&mut service).await;
+}
+
+#[tokio::test]
+async fn pausing_a_completed_jobs_local_download_reports_remote_finished() {
+    let (_root, paths) = fixture_paths();
+    let download_started = Arc::new(Notify::new());
+    let release_download = Arc::new(Notify::new());
+    let executor = WorkflowExecutor::scripted([
+        Reply::Json(StatusCode::OK, json!({"data": {"label": "fixture"}})),
+        Reply::Json(
+            StatusCode::OK,
+            completed_job(
+                "job-download-paused",
+                "https://cdn.workflow.invalid/download-paused.mp4",
+            ),
+        ),
+        Reply::WaitBytes {
+            body: b"completed video".to_vec(),
+            started: download_started.clone(),
+            release: release_download,
+        },
+    ]);
+    let mut service = spawn_service_with_executor(paths, config(Duration::ZERO), executor)
+        .expect("spawn service");
+    connect_fixture_key(&mut service, 1).await;
+
+    service
+        .commands
+        .send(ServiceCommand::Generate {
+            op_id: 13,
+            provider_id: ProviderId::openrouter(),
+            request: VideoRequest::new("example/video", "Pause local download fixture")
+                .expect("request"),
+        })
+        .await
+        .expect("send generation");
+    let key = match event_matching(&mut service, |event| {
+        matches!(event, ServiceEvent::MonitorStarted { op_id: 13, .. })
+    })
+    .await
+    {
+        ServiceEvent::MonitorStarted { key, .. } => key,
+        _ => unreachable!(),
+    };
+    tokio::time::timeout(Duration::from_secs(5), download_started.notified())
+        .await
+        .expect("download did not start");
+
+    service
+        .commands
+        .send(ServiceCommand::PauseMonitor {
+            op_id: 14,
+            key: key.clone(),
+        })
+        .await
+        .expect("pause download");
+    assert!(matches!(
+        event_matching(&mut service, |event| {
+            matches!(event, ServiceEvent::MonitorPaused { op_id: 14, .. })
+        })
+        .await,
+        ServiceEvent::MonitorPaused {
+            remote_continues: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        event_matching(&mut service, |event| {
+            matches!(event, ServiceEvent::Cancelled { op_id: 13, .. })
+        })
+        .await,
+        ServiceEvent::Cancelled {
+            remote_continues: false,
+            ..
+        }
+    ));
     shutdown(&mut service).await;
 }
 
@@ -1092,10 +1332,14 @@ async fn accepted_job_id_survives_local_history_failure() {
     let executor = WorkflowExecutor::scripted([
         Reply::Json(StatusCode::OK, json!({"data": {"label": "fixture"}})),
         Reply::Json(StatusCode::OK, pending_job("job-history-failure")),
+        Reply::Json(StatusCode::OK, pending_job("job-history-failure")),
     ]);
-    let mut service =
-        spawn_service_with_executor(paths.clone(), config(Duration::ZERO), executor.clone())
-            .expect("spawn service");
+    let mut service = spawn_service_with_executor(
+        paths.clone(),
+        config(Duration::from_secs(30)),
+        executor.clone(),
+    )
+    .expect("spawn service");
     connect_fixture_key(&mut service, 1).await;
 
     // Replace the initialized SQLite file with a directory so persistence fails deterministically.
@@ -1132,9 +1376,51 @@ async fn accepted_job_id_survives_local_history_failure() {
         error,
         ServiceEvent::Error {
             scope: ServiceScope::History,
+            recoverable: true,
             job_id: Some(ref value),
             ..
         } if value == "job-history-failure"
+    ));
+
+    // Resume immediately in the same actor. This proves the recoverable event
+    // contract does not require an application restart to expose the sidecar.
+    service
+        .commands
+        .send(ServiceCommand::Resume {
+            op_id: 41,
+            key: ProviderJobKey::new(ProviderId::openrouter(), "job-history-failure")
+                .expect("recovery key"),
+        })
+        .await
+        .expect("resume sidecar recovery in the same service");
+    assert!(matches!(
+        event_matching(&mut service, |event| matches!(
+            event,
+            ServiceEvent::JobRecoveryWarning { op_id: 41, .. }
+        ))
+        .await,
+        ServiceEvent::JobRecoveryWarning { ref message, .. }
+            if message.contains("GUI recovery state")
+    ));
+    event_matching(&mut service, |event| {
+        matches!(event, ServiceEvent::JobUpdated { op_id: 41, .. })
+    })
+    .await;
+    service
+        .commands
+        .send(ServiceCommand::CancelCurrent { op_id: 42 })
+        .await
+        .expect("pause recovered monitor");
+    assert!(matches!(
+        event_matching(&mut service, |event| matches!(
+            event,
+            ServiceEvent::Cancelled { op_id: 41, .. }
+        ))
+        .await,
+        ServiceEvent::Cancelled {
+            remote_continues: true,
+            ..
+        }
     ));
     assert_eq!(
         executor
@@ -1144,6 +1430,305 @@ async fn accepted_job_id_survives_local_history_failure() {
             .count(),
         1
     );
+    let accepted_at = GuiStateStore::new(paths.gui_state_db())
+        .resumable_jobs()
+        .expect("read paused same-service recovery")[0]
+        .accepted_at;
+    shutdown(&mut service).await;
+
+    // Let startup initialize a fresh history database, then make that database
+    // inaccessible again before Resume. The validated GUI sidecar must remain
+    // sufficient to recover and download without another paid submission.
+    fs::remove_dir(paths.history_db()).expect("remove invalid history directory");
+    let restarted_executor = WorkflowExecutor::scripted([
+        Reply::Json(StatusCode::OK, json!({"data": {"label": "fixture"}})),
+        Reply::Json(
+            StatusCode::OK,
+            completed_job(
+                "job-history-failure",
+                "https://cdn.workflow.invalid/history-recovery.mp4",
+            ),
+        ),
+        Reply::Bytes(b"recovered video".to_vec()),
+    ]);
+    let mut restarted = spawn_service_with_executor(
+        paths.clone(),
+        config(Duration::ZERO),
+        restarted_executor.clone(),
+    )
+    .expect("restart service");
+    connect_fixture_key(&mut restarted, 2).await;
+    fs::remove_file(paths.history_db()).expect("remove restarted history database");
+    fs::create_dir(paths.history_db()).expect("make resumed history inaccessible");
+    restarted
+        .commands
+        .send(ServiceCommand::Resume {
+            op_id: 43,
+            key: ProviderJobKey::new(ProviderId::openrouter(), "job-history-failure")
+                .expect("recovery key"),
+        })
+        .await
+        .expect("resume sidecar-only recovery");
+    assert!(matches!(
+        event_matching(&mut restarted, |event| matches!(
+            event,
+            ServiceEvent::JobRecoveryWarning { op_id: 43, .. }
+        ))
+        .await,
+        ServiceEvent::JobRecoveryWarning { ref message, .. }
+            if message.contains("GUI recovery state")
+    ));
+    let downloaded = event_matching(&mut restarted, |event| {
+        matches!(event, ServiceEvent::Downloaded { op_id: 43, .. })
+    })
+    .await;
+    let ServiceEvent::Downloaded { record, path, .. } = downloaded else {
+        unreachable!()
+    };
+    let recovered_path = path.clone();
+    assert_eq!(record.remote_id(), "job-history-failure");
+    assert_eq!(record.created_at, accepted_at);
+    assert_eq!(
+        fs::read(path).expect("read recovered output"),
+        b"recovered video"
+    );
+    let durable_fallback = GuiStateStore::new(paths.gui_state_db())
+        .resumable_jobs()
+        .expect("read completed recovery fallback");
+    assert_eq!(durable_fallback.len(), 1);
+    assert!(durable_fallback[0].monitoring_paused);
+    assert_eq!(
+        durable_fallback[0].completed_output_path.as_deref(),
+        Some(recovered_path.as_path()),
+        "the sidecar must durably identify the completed local artifact"
+    );
+    assert_eq!(
+        restarted_executor
+            .requests()
+            .iter()
+            .filter(|request| request.method == Method::POST)
+            .count(),
+        0
+    );
+    shutdown(&mut restarted).await;
+
+    // A later restart must restore the validated local output without making
+    // another artifact request. Keep history unavailable to prove the sidecar
+    // remains independently sufficient until history can be repaired.
+    fs::remove_dir(paths.history_db()).expect("remove inaccessible history directory");
+    let completed_restart_executor = WorkflowExecutor::scripted([]);
+    let mut completed_restart = spawn_service_with_executor(
+        paths.clone(),
+        config(Duration::ZERO),
+        completed_restart_executor.clone(),
+    )
+    .expect("restart completed-output recovery");
+    assert!(matches!(
+        next_event(&mut completed_restart).await,
+        ServiceEvent::Ready { .. }
+    ));
+    fs::remove_file(paths.history_db()).expect("remove repaired history database");
+    fs::create_dir(paths.history_db()).expect("keep compatible history unavailable");
+    completed_restart
+        .commands
+        .send(ServiceCommand::Resume {
+            op_id: 44,
+            key: ProviderJobKey::new(ProviderId::openrouter(), "job-history-failure")
+                .expect("completed recovery key"),
+        })
+        .await
+        .expect("resume completed sidecar recovery");
+    let restored = event_matching(&mut completed_restart, |event| {
+        matches!(event, ServiceEvent::Downloaded { op_id: 44, .. })
+    })
+    .await;
+    assert!(matches!(
+        restored,
+        ServiceEvent::Downloaded {
+            ref path,
+            ref record,
+            ..
+        } if path == &recovered_path
+            && record.output_path.as_deref() == Some(recovered_path.as_path())
+            && record.created_at == accepted_at
+    ));
+    assert_eq!(
+        fs::read(&recovered_path).expect("read retained completed output"),
+        b"recovered video"
+    );
+    let completed_requests = completed_restart_executor.requests();
+    assert!(
+        completed_requests.is_empty(),
+        "validated local output must not require credentials, status polling, or artifact transport"
+    );
+    let still_durable = GuiStateStore::new(paths.gui_state_db())
+        .resumable_jobs()
+        .expect("completed recovery remains durable while history is unavailable");
+    assert_eq!(still_durable.len(), 1);
+    assert_eq!(
+        still_durable[0].completed_output_path.as_deref(),
+        Some(recovered_path.as_path())
+    );
+    shutdown(&mut completed_restart).await;
+}
+
+#[tokio::test]
+async fn monitor_started_is_the_authoritative_pause_acknowledgement() {
+    let (_root, paths) = fixture_paths();
+    let executor = WorkflowExecutor::scripted([
+        Reply::Json(StatusCode::OK, json!({"data": {"label": "fixture"}})),
+        Reply::Json(StatusCode::OK, pending_job("job-monitor-ack")),
+        Reply::Json(StatusCode::OK, pending_job("job-monitor-ack")),
+    ]);
+    let mut service =
+        spawn_service_with_executor(paths, config(Duration::from_secs(30)), executor.clone())
+            .expect("spawn service");
+    connect_fixture_key(&mut service, 1).await;
+    service
+        .commands
+        .send(ServiceCommand::Generate {
+            op_id: 44,
+            provider_id: ProviderId::openrouter(),
+            request: VideoRequest::new("example/video", "Monitor acknowledgement fixture")
+                .expect("request"),
+        })
+        .await
+        .expect("start generation");
+
+    let accepted = event_matching(&mut service, |event| {
+        matches!(event, ServiceEvent::JobAccepted { op_id: 44, .. })
+    })
+    .await;
+    let ServiceEvent::JobAccepted { job, .. } = accepted else {
+        unreachable!()
+    };
+    let key = job.key();
+    assert!(matches!(
+        event_matching(&mut service, |event| matches!(
+            event,
+            ServiceEvent::MonitorStarted { op_id: 44, .. }
+        ))
+        .await,
+        ServiceEvent::MonitorStarted { key: ref started, .. } if started == &key
+    ));
+
+    service
+        .commands
+        .send(ServiceCommand::PauseMonitor {
+            op_id: 45,
+            key: key.clone(),
+        })
+        .await
+        .expect("pause acknowledged monitor");
+    assert!(matches!(
+        event_matching(&mut service, |event| matches!(
+            event,
+            ServiceEvent::MonitorPaused { op_id: 45, .. }
+        ))
+        .await,
+        ServiceEvent::MonitorPaused { key: ref paused, .. } if paused == &key
+    ));
+    assert!(matches!(
+        event_matching(&mut service, |event| matches!(
+            event,
+            ServiceEvent::MonitorStopped { op_id: 44, .. }
+        ))
+        .await,
+        ServiceEvent::MonitorStopped { key: ref stopped, .. } if stopped == &key
+    ));
+
+    // MonitorStopped is emitted after actor-registry removal, so an immediate
+    // Resume must be accepted and produce a new authoritative start ack.
+    service
+        .commands
+        .send(ServiceCommand::Resume {
+            op_id: 46,
+            key: key.clone(),
+        })
+        .await
+        .expect("resume after monitor stop");
+    assert!(matches!(
+        event_matching(&mut service, |event| matches!(
+            event,
+            ServiceEvent::MonitorStarted { op_id: 46, .. }
+        ))
+        .await,
+        ServiceEvent::MonitorStarted { key: ref resumed, .. } if resumed == &key
+    ));
+    assert_eq!(
+        executor
+            .requests()
+            .iter()
+            .filter(|request| request.method == Method::POST)
+            .count(),
+        1
+    );
+    shutdown(&mut service).await;
+}
+
+#[tokio::test]
+async fn cancelling_before_partial_reservation_never_deletes_a_peer_partial() {
+    let (_root, paths) = fixture_paths();
+    let download_started = Arc::new(Notify::new());
+    let release_download = Arc::new(Notify::new());
+    let executor = WorkflowExecutor::scripted([
+        Reply::Json(StatusCode::OK, json!({"data": {"label": "fixture"}})),
+        Reply::Json(
+            StatusCode::OK,
+            completed_job(
+                "job-cancel-partial-race",
+                "https://cdn.workflow.invalid/cancel-race.mp4",
+            ),
+        ),
+        Reply::WaitBytes {
+            body: b"unused new video".to_vec(),
+            started: download_started.clone(),
+            release: release_download.clone(),
+        },
+    ]);
+    let mut service = spawn_service_with_executor(paths.clone(), config(Duration::ZERO), executor)
+        .expect("spawn service");
+    connect_fixture_key(&mut service, 1).await;
+    let prompt = "Cancellation partial ownership fixture";
+    service
+        .commands
+        .send(ServiceCommand::Generate {
+            op_id: 42,
+            provider_id: ProviderId::openrouter(),
+            request: VideoRequest::new("example/video", prompt).expect("request"),
+        })
+        .await
+        .expect("start generation");
+    tokio::time::timeout(Duration::from_secs(5), download_started.notified())
+        .await
+        .expect("download did not start");
+
+    let destination = make_output_path(prompt, "job-cancel-partial-race", &paths.videos_dir);
+    let peer_partial = partial_path(&destination);
+    fs::write(&peer_partial, b"peer download").expect("create peer partial");
+    service
+        .commands
+        .send(ServiceCommand::CancelCurrent { op_id: 43 })
+        .await
+        .expect("cancel download");
+    assert!(matches!(
+        event_matching(&mut service, |event| matches!(
+            event,
+            ServiceEvent::Cancelled { op_id: 42, .. }
+        ))
+        .await,
+        ServiceEvent::Cancelled {
+            remote_continues: false,
+            ..
+        }
+    ));
+    release_download.notify_one();
+
+    assert_eq!(
+        fs::read(&peer_partial).expect("peer partial remains"),
+        b"peer download"
+    );
+    assert!(!destination.exists());
     shutdown(&mut service).await;
 }
 

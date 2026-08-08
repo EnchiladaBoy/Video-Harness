@@ -14,13 +14,13 @@ use crate::domain::{
     VideoArtifact, VideoCatalog, VideoJob, VideoModel, VideoRequest, estimate_cost,
 };
 
-use super::{MediaCapabilities, ProviderAccount, ProviderError, ProviderErrorKind, VideoProvider};
+use super::{
+    MAX_AUDIO_INPUTS, MAX_IMAGE_INPUTS, MAX_MEDIA_INPUTS_TOTAL, MAX_VIDEO_INPUTS,
+    MediaCapabilities, ProviderAccount, ProviderError, ProviderErrorKind, VideoProvider,
+    audio_input_requires_visual,
+};
 
 const TYPED_REFERENCE_MODELS: &[&str] = &["bytedance/seedance-2.0", "bytedance/seedance-2.0-fast"];
-const MAX_REFERENCE_IMAGES: usize = 9;
-const MAX_REFERENCE_VIDEOS: usize = 3;
-const MAX_REFERENCE_AUDIO: usize = 3;
-const MAX_REFERENCES_TOTAL: usize = 12;
 
 #[derive(Debug)]
 pub struct OpenRouterProvider {
@@ -271,27 +271,30 @@ fn validate_reference_policy(model_id: &str, request: &VideoRequest) -> Result<(
             model_id
         )));
     }
-    if images > MAX_REFERENCE_IMAGES {
+    if images > MAX_IMAGE_INPUTS {
         return Err(validation(format!(
-            "OpenRouter accepts at most {MAX_REFERENCE_IMAGES} reference images"
+            "OpenRouter accepts at most {MAX_IMAGE_INPUTS} reference images"
         )));
     }
-    if videos > MAX_REFERENCE_VIDEOS {
+    if videos > MAX_VIDEO_INPUTS {
         return Err(validation(format!(
-            "OpenRouter accepts at most {MAX_REFERENCE_VIDEOS} reference videos"
+            "OpenRouter accepts at most {MAX_VIDEO_INPUTS} reference videos"
         )));
     }
-    if audio > MAX_REFERENCE_AUDIO {
+    if audio > MAX_AUDIO_INPUTS {
         return Err(validation(format!(
-            "OpenRouter accepts at most {MAX_REFERENCE_AUDIO} reference audio files"
+            "OpenRouter accepts at most {MAX_AUDIO_INPUTS} reference audio files"
         )));
     }
-    if images + videos + audio > MAX_REFERENCES_TOTAL {
+    if images + videos + audio > MAX_MEDIA_INPUTS_TOTAL {
         return Err(validation(format!(
-            "OpenRouter accepts at most {MAX_REFERENCES_TOTAL} reference media items"
+            "OpenRouter accepts at most {MAX_MEDIA_INPUTS_TOTAL} reference media items"
         )));
     }
-    if audio > 0 && images + videos == 0 {
+    if audio > 0
+        && images + videos == 0
+        && audio_input_requires_visual(&ProviderId::openrouter(), model_id)
+    {
         return Err(validation(
             "OpenRouter audio references require at least one image or video reference",
         ));
@@ -416,7 +419,7 @@ mod tests {
 
         let verified = seedance_model();
         request.model = verified.id.clone();
-        for index in 1..=MAX_REFERENCE_VIDEOS {
+        for index in 1..=MAX_VIDEO_INPUTS {
             request.input_references.push(
                 InputReference::with_kind(
                     format!("https://media.example/video-{index}.mp4"),

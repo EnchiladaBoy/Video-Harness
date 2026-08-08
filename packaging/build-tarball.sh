@@ -39,6 +39,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+[[ "$(uname -s)" == Linux ]] || {
+    echo "Native release archives can only be built on Linux" >&2
+    exit 1
+}
 case "$(uname -m)" in
     x86_64|amd64) RELEASE_ARCH="x86_64"; FILE_ARCH_PATTERN='x86-64|x86_64' ;;
     aarch64|arm64) RELEASE_ARCH="aarch64"; FILE_ARCH_PATTERN='aarch64|ARM aarch64' ;;
@@ -59,12 +63,16 @@ if [[ -z "${BINARY}" ]]; then
     BINARY="${PROJECT_DIR}/desktop/src-tauri/target/release/video-harness"
 fi
 [[ -x "${BINARY}" ]] || { echo "Executable not found: ${BINARY}" >&2; exit 1; }
-"${BINARY}" --version | grep -Fq -- "${VERSION}" \
-    || { echo "Binary version does not match ${VERSION}" >&2; exit 1; }
-if command -v file >/dev/null 2>&1; then
-    file --brief -- "${BINARY}" | grep -Eq -- "${FILE_ARCH_PATTERN}" \
-        || { echo "Binary does not match ${RELEASE_ARCH}: $(file --brief -- "${BINARY}")" >&2; exit 1; }
-fi
+VERSION_OUTPUT="$("${BINARY}" --version)"
+[[ "${VERSION_OUTPUT}" == "video-harness ${VERSION}" ]] \
+    || { echo "Binary version is '${VERSION_OUTPUT}', expected 'video-harness ${VERSION}'" >&2; exit 1; }
+command -v file >/dev/null 2>&1 \
+    || { echo "file is required to validate the release binary" >&2; exit 1; }
+BINARY_DESCRIPTION="$(file --brief -- "${BINARY}")"
+[[ "${BINARY_DESCRIPTION}" == ELF\ * ]] \
+    || { echo "Release binary is not a Linux ELF file: ${BINARY_DESCRIPTION}" >&2; exit 1; }
+grep -Eq -- "${FILE_ARCH_PATTERN}" <<<"${BINARY_DESCRIPTION}" \
+    || { echo "Binary does not match ${RELEASE_ARCH}: ${BINARY_DESCRIPTION}" >&2; exit 1; }
 
 mkdir -p -- "${OUTPUT_DIR}"
 STAGING_ROOT="$(mktemp -d)"

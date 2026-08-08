@@ -9,7 +9,7 @@ use video_harness::config::{
     save_app_settings, validated_provider_slug,
 };
 use video_harness::credentials::{
-    CredentialStore, DEFAULT_USERNAME, FAL_USERNAME, username_for_provider,
+    CredentialDeleteOutcome, CredentialStore, DEFAULT_USERNAME, FAL_USERNAME, username_for_provider,
 };
 use video_harness::domain::ProviderId;
 
@@ -171,7 +171,10 @@ fn provider_credentials_use_exact_identifiers_and_isolated_sessions() {
         fal.get().expect("fal key").expose_secret(),
         "fal-session-key"
     );
-    fal.delete();
+    assert_eq!(
+        fal.delete().expect("forget fal session key"),
+        CredentialDeleteOutcome::MemoryOnly
+    );
     assert!(fal.get().is_none());
     assert_eq!(
         openrouter

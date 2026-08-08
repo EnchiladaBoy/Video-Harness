@@ -71,7 +71,7 @@ AppImages update manually: download the newer file when a release is available.
 
 ## Build from source on Linux
 
-Install Node.js 24, Rust 1.95, a C toolchain, and the Tauri 2 system libraries.
+Install Node.js 24.18.0, Rust 1.95, a C toolchain, and the Tauri 2 system libraries.
 On Debian or Ubuntu, the packages used by CI are:
 
 ```bash
@@ -197,8 +197,8 @@ spend credits. The legacy GTK frontend can still be built explicitly from
 - Half-written seed, Advanced JSON, and schema-control text is restored exactly;
   credential-like fields and active provider keys fail closed instead of being
   written.
-- Downloads use `.part` files and become completed video files only after a
-  successful, non-empty transfer.
+- Downloads use owned `.part` files, enforce a 4 GiB transfer ceiling, and
+  become completed video files only after a successful, non-empty transfer.
 - Authorization is restricted to validated provider API endpoints and is never
   attached to unsigned output URLs.
 - Removing a render from the reel does not delete the provider's remote job or
@@ -210,7 +210,8 @@ provider's final usage charge is authoritative.
 ## Release channels
 
 - [GitHub releases](https://github.com/EnchiladaBoy/Video-Harness/releases)
-  provide the x86_64 and aarch64 AppImages plus `SHA256SUMS`.
+  provide the x86_64 and aarch64 AppImages, `SHA256SUMS`, and an SPDX software
+  bill of materials.
 - Releases are unsigned and require no project signing key. GitHub Actions adds
   keyless build-provenance attestations without a user-managed secret.
 - AppImages update manually by replacing the downloaded executable with the

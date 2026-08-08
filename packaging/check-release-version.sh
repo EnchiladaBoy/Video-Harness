@@ -10,6 +10,13 @@ fail() {
     exit 1
 }
 
+require_text() {
+    local file="$1"
+    local text="$2"
+    grep -Fq -- "${text}" "${file}" \
+        || fail "${file#"${PROJECT_DIR}/"} is missing '${text}'"
+}
+
 CORE_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${PROJECT_DIR}/native/Cargo.toml" | head -n 1)"
 DESKTOP_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${PROJECT_DIR}/desktop/src-tauri/Cargo.toml" | head -n 1)"
 TAURI_VERSION="$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "${PROJECT_DIR}/desktop/src-tauri/tauri.conf.json" | head -n 1)"
@@ -48,11 +55,35 @@ DESKTOP_LOCK_VERSION="$(lock_version "${PROJECT_DIR}/desktop/src-tauri/Cargo.loc
 [[ "${DESKTOP_LOCK_VERSION}" == "${CORE_VERSION}" ]] \
     || fail "desktop Cargo.lock has ${DESKTOP_LOCK_VERSION}, expected ${CORE_VERSION}"
 
-grep -Fq -- "<release version=\"${CORE_VERSION}\"" \
-    "${PROJECT_DIR}/native/data/io.github.EnchiladaBoy.VideoHarness.metainfo.xml" \
-    || fail "AppStream has no ${CORE_VERSION} release"
-grep -Fq -- "Version ${CORE_VERSION}" "${PROJECT_DIR}/README.md" \
-    || fail "README does not identify Version ${CORE_VERSION}"
+release_profile() {
+    awk '
+        $0 == "[profile.release]" { found = 1; next }
+        found && /^\[/ { exit }
+        found && !/^[[:space:]]*($|#)/ {
+            value = $0
+            gsub(/[[:space:]]/, "", value)
+            print value
+        }
+    ' "$1" | LC_ALL=C sort
+}
+
+CORE_RELEASE_PROFILE="$(release_profile "${PROJECT_DIR}/native/Cargo.toml")"
+DESKTOP_RELEASE_PROFILE="$(release_profile "${PROJECT_DIR}/desktop/src-tauri/Cargo.toml")"
+[[ -n "${CORE_RELEASE_PROFILE}" ]] || fail "native release profile is empty"
+[[ "${DESKTOP_RELEASE_PROFILE}" == "${CORE_RELEASE_PROFILE}" ]] \
+    || fail "desktop and native release profiles differ; Cargo ignores dependency profile tables"
+
+METAINFO="${PROJECT_DIR}/native/data/io.github.EnchiladaBoy.VideoHarness.metainfo.xml"
+require_text "${METAINFO}" '<id>io.github.EnchiladaBoy.VideoHarness</id>'
+require_text "${METAINFO}" "<release version=\"${CORE_VERSION}\""
+require_text "${PROJECT_DIR}/README.md" "Version ${CORE_VERSION}"
+require_text "${PROJECT_DIR}/README.md" "Video-Harness-${CORE_VERSION}-linux-x86_64.AppImage"
+require_text "${PROJECT_DIR}/README.md" "Video-Harness-${CORE_VERSION}-linux-aarch64.AppImage"
+require_text "${PROJECT_DIR}/packaging/README.md" "Video-Harness-${CORE_VERSION}-linux-x86_64.AppImage"
+require_text "${PROJECT_DIR}/packaging/README.md" "Video-Harness-${CORE_VERSION}-linux-aarch64.AppImage"
+require_text "${PROJECT_DIR}/.github/RELEASING.md" "## Cut v${CORE_VERSION}"
+require_text "${PROJECT_DIR}/.github/RELEASING.md" "check-release-version.sh v${CORE_VERSION}"
+require_text "${PROJECT_DIR}/.github/RELEASING.md" "Video-Harness-v${CORE_VERSION}.spdx.json"
 
 if [[ -n "${EXPECTED_TAG}" && "${EXPECTED_TAG}" != "v${CORE_VERSION}" ]]; then
     fail "tag ${EXPECTED_TAG} does not match v${CORE_VERSION}"
@@ -64,7 +95,6 @@ command -v appstreamcli >/dev/null 2>&1 \
     || fail "appstreamcli is required"
 desktop-file-validate \
     "${PROJECT_DIR}/native/data/io.github.EnchiladaBoy.VideoHarness.desktop"
-appstreamcli validate --no-net \
-    "${PROJECT_DIR}/native/data/io.github.EnchiladaBoy.VideoHarness.metainfo.xml"
+appstreamcli validate --no-net --strict --pedantic "${METAINFO}"
 
 echo "Core, desktop, UI, AppImage, and release metadata agree on ${CORE_VERSION}."

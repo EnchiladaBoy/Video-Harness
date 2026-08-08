@@ -24,7 +24,7 @@ use crate::domain::{
     DraftMedia, GenerationDraft, JobLocator, MediaRole, MediaSource, ProviderId, ProviderJobKey,
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const DEFAULT_DRAFT_ID: &str = "current";
 const DRAFT_EDITOR_STATE_KEY: &str = "__video_harness_editor_v1";
 const MAX_SEED_TEXT_BYTES: usize = 1_024;
@@ -187,6 +187,10 @@ pub struct ResumableJob {
     pub locator: JobLocator,
     pub accepted_at: DateTime<Utc>,
     pub monitoring_paused: bool,
+    /// A successfully downloaded output that compatible history has not yet
+    /// durably recorded. The workflow validates this path against the current
+    /// Videos directory before trusting it during recovery.
+    pub completed_output_path: Option<PathBuf>,
 }
 
 /// A credential-free, digest-only paid-submission safety barrier.
@@ -297,6 +301,7 @@ impl GuiStateStore {
                  locator_json TEXT NOT NULL,
                  accepted_at TEXT NOT NULL,
                  monitoring_paused INTEGER NOT NULL DEFAULT 0,
+                 completed_output_path TEXT,
                  PRIMARY KEY (provider_id, remote_job_id)
              );
              CREATE TABLE IF NOT EXISTS uncertain_submissions (
@@ -307,6 +312,22 @@ impl GuiStateStore {
                  PRIMARY KEY (provider_id, draft_fingerprint)
              );",
         )?;
+        if found < 2 {
+            let has_completed_output_path: bool = transaction.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('resumable_jobs')
+                     WHERE name = 'completed_output_path'
+                 )",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_completed_output_path {
+                transaction.execute(
+                    "ALTER TABLE resumable_jobs ADD COLUMN completed_output_path TEXT",
+                    [],
+                )?;
+            }
+        }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         Ok(())
@@ -600,18 +621,26 @@ impl GuiStateStore {
         let connection = self.ready_connection()?;
         connection.execute(
             "INSERT INTO resumable_jobs
-                 (provider_id, remote_job_id, locator_json, accepted_at, monitoring_paused)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+                 (provider_id, remote_job_id, locator_json, accepted_at, monitoring_paused,
+                  completed_output_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(provider_id, remote_job_id) DO UPDATE SET
                  locator_json = excluded.locator_json,
                  accepted_at = excluded.accepted_at,
-                 monitoring_paused = excluded.monitoring_paused",
+                 monitoring_paused = excluded.monitoring_paused,
+                 completed_output_path = COALESCE(
+                     excluded.completed_output_path,
+                     resumable_jobs.completed_output_path
+                 )",
             params![
                 job.key.provider_id.as_str(),
                 job.key.remote_job_id,
                 serde_json::to_string(&job.locator)?,
                 job.accepted_at.to_rfc3339(),
                 job.monitoring_paused,
+                job.completed_output_path
+                    .as_deref()
+                    .map(|path| path.to_string_lossy().into_owned()),
             ],
         )?;
         Ok(())
@@ -659,7 +688,8 @@ impl GuiStateStore {
     pub fn resumable_jobs(&self) -> Result<Vec<ResumableJob>, GuiStateError> {
         let connection = self.ready_connection()?;
         let mut statement = connection.prepare(
-            "SELECT provider_id, remote_job_id, locator_json, accepted_at, monitoring_paused
+            "SELECT provider_id, remote_job_id, locator_json, accepted_at, monitoring_paused,
+                    completed_output_path
              FROM resumable_jobs ORDER BY accepted_at ASC",
         )?;
         let rows = statement.query_map([], |row| {
@@ -669,11 +699,19 @@ impl GuiStateStore {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, bool>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
         let mut jobs = Vec::new();
         for row in rows {
-            let (provider_id, remote_job_id, locator_json, accepted_at, monitoring_paused) = row?;
+            let (
+                provider_id,
+                remote_job_id,
+                locator_json,
+                accepted_at,
+                monitoring_paused,
+                completed_output_path,
+            ) = row?;
             let provider_id = ProviderId::new(provider_id)?;
             let locator: JobLocator = serde_json::from_str(&locator_json)?;
             let job = ResumableJob {
@@ -684,6 +722,7 @@ impl GuiStateStore {
                 locator,
                 accepted_at: parse_timestamp(&accepted_at)?,
                 monitoring_paused,
+                completed_output_path: completed_output_path.map(PathBuf::from),
             };
             if job.locator.provider_id() != job.key.provider_id
                 || job.locator.remote_job_id() != job.key.remote_job_id
@@ -1121,6 +1160,8 @@ fn is_credential_field_name(name: &str) -> bool {
             | "authorization"
             | "credential"
             | "credentials"
+            | "password"
+            | "passwd"
             | "secret"
             | "token"
             | "accesstoken"
@@ -1398,6 +1439,36 @@ mod tests {
     }
 
     #[test]
+    fn password_fields_are_rejected_from_structured_and_raw_draft_state() {
+        let (_directory, store) = store();
+        for settings in [
+            json!({"adapter_options": {"password": "do-not-save"}}),
+            json!({"nested": {"passwd": "do-not-save"}}),
+        ] {
+            let mut unsafe_draft = draft();
+            unsafe_draft.settings = settings;
+            assert!(matches!(
+                store.save_draft(&unsafe_draft),
+                Err(GuiStateError::CredentialInDraft)
+            ));
+            assert_eq!(store.load_draft().expect("load rejected draft"), None);
+        }
+
+        for advanced_json_text in [r#"{"password":"do-not-save"}"#, "passwd = do-not-save"] {
+            let mut unsafe_draft = draft();
+            unsafe_draft.editor_state = Some(DraftEditorState {
+                advanced_json_text: advanced_json_text.into(),
+                ..DraftEditorState::default()
+            });
+            assert!(matches!(
+                store.save_draft(&unsafe_draft),
+                Err(GuiStateError::CredentialInDraft)
+            ));
+            assert_eq!(store.load_draft().expect("load rejected draft"), None);
+        }
+    }
+
+    #[test]
     fn credential_names_cover_provider_and_auth_conventions_without_token_controls() {
         for name in [
             "OPENROUTER_API_KEY",
@@ -1406,6 +1477,8 @@ mod tests {
             "x-api-key",
             "openRouterApiKey",
             "clientSecret",
+            "password",
+            "passwd",
             "webhookSecret",
             "accessToken",
             "customToken",
@@ -1442,6 +1515,8 @@ mod tests {
             "'x-api-key' = 'value'",
             "\"openRouterApiKey\" = \"value",
             "clientSecret: value",
+            "password: value",
+            "passwd = value",
             "accessToken = value",
             "authorizationHeader=Bearer value",
             "export OPENROUTER_API_KEY=value",
@@ -1583,6 +1658,7 @@ mod tests {
             locator,
             accepted_at: Utc::now(),
             monitoring_paused: false,
+            completed_output_path: Some(PathBuf::from("/tmp/completed.mp4")),
         };
         store.save_resumable_job(&saved).expect("save resumable");
         store
@@ -1591,6 +1667,10 @@ mod tests {
         let jobs = store.resumable_jobs().expect("load jobs");
         assert_eq!(jobs.len(), 1);
         assert!(jobs[0].monitoring_paused);
+        assert_eq!(
+            jobs[0].completed_output_path, saved.completed_output_path,
+            "pausing must preserve a downloaded output awaiting history repair"
+        );
 
         let media = vec![GenerationMediaAssociation {
             key: key.clone(),
@@ -1606,6 +1686,77 @@ mod tests {
         assert_eq!(store.generation_media(&key).expect("load media"), media);
         assert!(store.remove_resumable_job(&key).expect("remove job"));
         assert!(store.resumable_jobs().expect("load empty jobs").is_empty());
+    }
+
+    #[test]
+    fn version_one_resumable_jobs_gain_completed_output_without_losing_state() {
+        let directory = tempdir().expect("temp dir");
+        let database = directory.path().join("gui-state.sqlite3");
+        let accepted_at = Utc::now() - TimeDelta::minutes(15);
+        let locator = JobLocator::OpenRouter {
+            polling_url: "https://openrouter.ai/api/v1/videos/job-migrate".into(),
+        };
+        let connection = Connection::open(&database).expect("open legacy GUI state");
+        connection
+            .execute_batch(
+                "CREATE TABLE resumable_jobs (
+                     provider_id TEXT NOT NULL,
+                     remote_job_id TEXT NOT NULL,
+                     locator_json TEXT NOT NULL,
+                     accepted_at TEXT NOT NULL,
+                     monitoring_paused INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (provider_id, remote_job_id)
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .expect("create version-one schema");
+        connection
+            .execute(
+                "INSERT INTO resumable_jobs
+                     (provider_id, remote_job_id, locator_json, accepted_at, monitoring_paused)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    ProviderId::openrouter().as_str(),
+                    "job-migrate",
+                    serde_json::to_string(&locator).expect("serialize locator"),
+                    accepted_at.to_rfc3339(),
+                    true,
+                ],
+            )
+            .expect("seed version-one resumable job");
+        drop(connection);
+
+        let store = GuiStateStore::new(&database);
+        let mut jobs = store
+            .resumable_jobs()
+            .expect("migrate and read resumable job");
+        assert_eq!(jobs.len(), 1);
+        let mut migrated = jobs.remove(0);
+        assert_eq!(migrated.accepted_at, accepted_at);
+        assert!(migrated.monitoring_paused);
+        assert_eq!(migrated.completed_output_path, None);
+
+        let completed = directory.path().join("Videos/completed.mp4");
+        migrated.completed_output_path = Some(completed.clone());
+        store
+            .save_resumable_job(&migrated)
+            .expect("save completed recovery state");
+        let reopened = GuiStateStore::new(database);
+        assert_eq!(
+            reopened
+                .resumable_jobs()
+                .expect("round-trip migrated resumable job")[0]
+                .completed_output_path
+                .as_deref(),
+            Some(completed.as_path())
+        );
+        let connection = Connection::open(reopened.path()).expect("inspect migrated schema");
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("schema version"),
+            SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -1631,6 +1782,7 @@ mod tests {
                     },
                     accepted_at: Utc::now(),
                     monitoring_paused: true,
+                    completed_output_path: None,
                 })
                 .expect("save resumable job");
             store

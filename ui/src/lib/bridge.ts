@@ -90,6 +90,18 @@ class TauriBridge implements VideoHarnessBridge {
     return invoke('save_draft', { draft });
   }
 
+  acknowledgeCloseRequest(requestId: number): Promise<void> {
+    return invoke('acknowledge_close_request', { requestId });
+  }
+
+  cancelCloseRequest(requestId: number): Promise<void> {
+    return invoke('cancel_close_request', { requestId });
+  }
+
+  saveDraftAndClose(draft: GenerationDraft, requestId: number): Promise<void> {
+    return invoke('save_draft_and_close', { draft, requestId });
+  }
+
   pauseJob(jobId: string): Promise<void> {
     return invoke('pause_job', { jobId });
   }

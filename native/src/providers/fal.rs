@@ -24,7 +24,9 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use crate::api::{
-    DEFAULT_APP_TITLE, DownloadProgress, HttpExecutor, HttpRequest, HttpResponse, ReqwestExecutor,
+    DEFAULT_APP_TITLE, DownloadProgress, HttpExecutor, HttpRequest, HttpResponse,
+    MAX_VIDEO_DOWNLOAD_BYTES, OwnedPartialFile, PublicDnsResolver, ReqwestExecutor,
+    checked_download_length, ensure_download_space,
 };
 use crate::config::partial_path;
 use crate::domain::{
@@ -34,8 +36,10 @@ use crate::domain::{
 };
 
 use super::{
+    MAX_AUDIO_INPUTS, MAX_IMAGE_INPUTS, MAX_MEDIA_INPUTS_TOTAL, MAX_VIDEO_INPUTS,
     MediaCapabilities, MediaStager, MediaStagerDescriptor, ProviderAccount, ProviderError,
-    ProviderErrorKind, StagedVisibility, UploadProgress, VideoProvider, media_sha256,
+    ProviderErrorKind, StagedVisibility, UploadProgress, VideoProvider,
+    audio_input_requires_visual, is_seedance_2_model_id, media_sha256,
 };
 
 pub const DEFAULT_PLATFORM_URL: &str = "https://api.fal.ai/v1";
@@ -47,19 +51,24 @@ const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
 const MULTIPART_THRESHOLD: u64 = 90 * 1024 * 1024;
 const MULTIPART_CHUNK_SIZE: usize = 10 * 1024 * 1024;
+const MIN_TRANSFER_BYTES_PER_SECOND: u64 = 64 * 1024;
 const DISCOVERY_CATEGORIES: [&str; 4] = [
     "text-to-video",
     "image-to-video",
     "video-to-video",
     "audio-to-video",
 ];
-const MAX_INPUT_MEDIA: usize = 12;
-const MAX_IMAGE_INPUTS: usize = 9;
-const MAX_VIDEO_INPUTS: usize = 3;
-const MAX_AUDIO_INPUTS: usize = 3;
 const SEEDANCE_MAX_IMAGE_BYTES: u64 = 30_000_000;
 const SEEDANCE_MAX_VIDEO_BYTES: u64 = 50_000_000;
 const SEEDANCE_MAX_AUDIO_BYTES: u64 = 15_000_000;
+
+fn media_transfer_timeout(base: Duration, size_bytes: u64) -> Duration {
+    // Preserve a finite transfer deadline without treating the API's short
+    // JSON timeout as a whole-file deadline. Even a 64 KiB/s connection gets
+    // enough time for the advertised upload plus the normal response window.
+    let transfer_seconds = size_bytes.div_ceil(MIN_TRANSFER_BYTES_PER_SECOND);
+    base.saturating_add(Duration::from_secs(transfer_seconds))
+}
 
 #[derive(Debug, Clone)]
 pub struct FalOptions {
@@ -102,29 +111,37 @@ pub trait FalUploadExecutor: Send + Sync {
 
 struct ReqwestFalUploadExecutor {
     client: reqwest::Client,
+    request_timeout: Duration,
 }
 
 impl ReqwestFalUploadExecutor {
     fn new(timeout: Duration) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
-            .timeout(timeout)
+            .connect_timeout(timeout)
+            .read_timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
+            // Signed uploads need the same direct, public-address-only route
+            // as API calls; proxy-side DNS would bypass that enforcement.
+            .no_proxy()
+            .dns_resolver(PublicDnsResolver)
             .build()
             .map_err(|_| configuration("Could not configure fal CDN uploads"))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            request_timeout: timeout,
+        })
     }
 
     async fn put_bytes(&self, url: &Url, bytes: Bytes) -> Result<Value, ProviderError> {
         let mut last_error = None;
         for attempt in 0..3 {
-            let response = self
-                .client
-                .put(url.clone())
-                .body(bytes.clone())
-                .send()
-                .await;
+            let response = tokio::time::timeout(
+                media_transfer_timeout(self.request_timeout, bytes.len() as u64),
+                self.client.put(url.clone()).body(bytes.clone()).send(),
+            )
+            .await;
             match response {
-                Ok(response) if response.status().is_success() => {
+                Ok(Ok(response)) if response.status().is_success() => {
                     let mut stream = response.bytes_stream();
                     let mut body = Vec::new();
                     while let Some(chunk) = stream.next().await {
@@ -149,7 +166,7 @@ impl ReqwestFalUploadExecutor {
                             .map_err(|_| response_error("fal CDN returned invalid upload JSON"))
                     };
                 }
-                Ok(response) => {
+                Ok(Ok(response)) => {
                     last_error = Some(format!("HTTP {}", response.status().as_u16()));
                     if !response.status().is_server_error()
                         && response.status() != StatusCode::TOO_MANY_REQUESTS
@@ -157,7 +174,8 @@ impl ReqwestFalUploadExecutor {
                         break;
                     }
                 }
-                Err(_) => last_error = Some("network error".into()),
+                Ok(Err(_)) => last_error = Some("network error".into()),
+                Err(_) => last_error = Some("transfer deadline exceeded".into()),
             }
             if attempt < 2 {
                 tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
@@ -214,17 +232,19 @@ impl ReqwestFalUploadExecutor {
                     Ok(Some((Bytes::from(buffer), (file, sent, progress))))
                 },
             );
-            let response = self
-                .client
-                .put(upload_url.clone())
-                .header(CONTENT_TYPE, content_type)
-                .header(CONTENT_LENGTH, size_bytes)
-                .body(reqwest::Body::wrap_stream(stream))
-                .send()
-                .await;
+            let response = tokio::time::timeout(
+                media_transfer_timeout(self.request_timeout, size_bytes),
+                self.client
+                    .put(upload_url.clone())
+                    .header(CONTENT_TYPE, content_type)
+                    .header(CONTENT_LENGTH, size_bytes)
+                    .body(reqwest::Body::wrap_stream(stream))
+                    .send(),
+            )
+            .await;
             match response {
-                Ok(response) if response.status().is_success() => return Ok(()),
-                Ok(response)
+                Ok(Ok(response)) if response.status().is_success() => return Ok(()),
+                Ok(Ok(response))
                     if !response.status().is_server_error()
                         && response.status() != StatusCode::TOO_MANY_REQUESTS =>
                 {
@@ -309,16 +329,18 @@ impl ReqwestFalUploadExecutor {
         let complete_url = upload_child_url(upload_url, "complete")?;
         let completion = json!({"parts": parts});
         for attempt in 0..3 {
-            let response = self
-                .client
-                .post(complete_url.clone())
-                .header(CONTENT_TYPE, "application/json")
-                .json(&completion)
-                .send()
-                .await;
+            let response = tokio::time::timeout(
+                self.request_timeout,
+                self.client
+                    .post(complete_url.clone())
+                    .header(CONTENT_TYPE, "application/json")
+                    .json(&completion)
+                    .send(),
+            )
+            .await;
             match response {
-                Ok(response) if response.status().is_success() => return Ok(()),
-                Ok(response)
+                Ok(Ok(response)) if response.status().is_success() => return Ok(()),
+                Ok(Ok(response))
                     if !response.status().is_server_error()
                         && response.status() != StatusCode::TOO_MANY_REQUESTS =>
                 {
@@ -509,10 +531,47 @@ impl FalProvider {
         Ok(locator)
     }
 
+    const MAX_CATALOG_PAGES_PER_CATEGORY: usize = 100;
+
+    fn next_catalog_cursor(
+        payload: &Value,
+        seen_cursors: &mut BTreeSet<String>,
+        page_count: usize,
+    ) -> Result<Option<String>, ProviderError> {
+        if !payload
+            .get("has_more")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        if page_count >= Self::MAX_CATALOG_PAGES_PER_CATEGORY {
+            return Err(response_error(
+                "fal model pagination exceeded the safe per-category page limit",
+            ));
+        }
+        let cursor = payload
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .filter(|cursor| !cursor.is_empty())
+            .ok_or_else(|| {
+                response_error("fal model pagination reported more results without a cursor")
+            })?
+            .to_owned();
+        if !seen_cursors.insert(cursor.clone()) {
+            return Err(response_error(
+                "fal model pagination returned a repeated cursor",
+            ));
+        }
+        Ok(Some(cursor))
+    }
+
     async fn load_catalog_pages(&self) -> Result<Vec<Value>, ProviderError> {
         let mut discovered = BTreeMap::<String, Value>::new();
         for category in DISCOVERY_CATEGORIES {
             let mut cursor = None::<String>;
+            let mut seen_cursors = BTreeSet::<String>::new();
+            let mut page_count = 0usize;
             loop {
                 let mut url = self.platform_url(&["models"])?;
                 {
@@ -538,16 +597,9 @@ impl FalProvider {
                         discovered.insert(id.to_owned(), model.clone());
                     }
                 }
-                cursor = payload
-                    .get("next_cursor")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
-                if cursor.is_none()
-                    || !payload
-                        .get("has_more")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                {
+                page_count = page_count.saturating_add(1);
+                cursor = Self::next_catalog_cursor(&payload, &mut seen_cursors, page_count)?;
+                if cursor.is_none() {
                     break;
                 }
             }
@@ -784,6 +836,7 @@ impl FalProvider {
             url,
             headers,
             json_body: body,
+            stream_response: false,
         })
     }
 
@@ -850,6 +903,7 @@ impl FalProvider {
         request
             .validate()
             .map_err(|error| validation(error.to_string()))?;
+        validate_catalog_size(model, request)?;
         let mut input = request
             .adapter_options
             .as_ref()
@@ -972,6 +1026,7 @@ impl FalProvider {
                     url: url.clone(),
                     headers,
                     json_body: None,
+                    stream_response: true,
                 })
                 .await
                 .map_err(|_| download_error("Video download connection failed"))?;
@@ -1005,22 +1060,32 @@ impl FalProvider {
             .get(CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
+        if total.is_some_and(|total| total > MAX_VIDEO_DOWNLOAD_BYTES) {
+            return Err(download_error(
+                "Video download exceeds the 4 GiB safety limit",
+            ));
+        }
         let partial = partial_path(destination);
+        ensure_download_space(&partial, total).map_err(download_error)?;
+        let partial_guard: OwnedPartialFile;
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&partial)
             .await
             .map_err(|error| download_error(format!("Could not create partial video: {error}")))?;
+        partial_guard = OwnedPartialFile::new(partial.clone());
         let mut body = response.body;
         let mut written = 0u64;
         let transfer = async {
             while let Some(chunk) = body.next().await {
                 let chunk = chunk.map_err(|_| download_error("Video download was interrupted"))?;
+                written = checked_download_length(written, chunk.len()).ok_or_else(|| {
+                    download_error("Video download exceeds the 4 GiB safety limit")
+                })?;
                 file.write_all(&chunk)
                     .await
                     .map_err(|error| download_error(format!("Could not write video: {error}")))?;
-                written = written.saturating_add(chunk.len() as u64);
                 if let Some(progress) = &progress {
                     let _ = progress.send(DownloadProgress { written, total });
                 }
@@ -1035,38 +1100,29 @@ impl FalProvider {
         }
         .await;
         drop(file);
-        if let Err(error) = transfer {
-            let _ = tokio::fs::remove_file(&partial).await;
-            return Err(error);
-        }
+        transfer?;
         if written == 0 {
-            let _ = tokio::fs::remove_file(&partial).await;
             return Err(download_error("fal returned an empty video file"));
         }
         if let Some(total) = total
             && written != total
         {
-            let _ = tokio::fs::remove_file(&partial).await;
             return Err(download_error(format!(
                 "Video download size mismatch: expected {total} bytes, received {written}"
             )));
         }
         match tokio::fs::hard_link(&partial, destination).await {
             Ok(()) => {
-                let _ = tokio::fs::remove_file(&partial).await;
+                drop(partial_guard);
                 Ok(destination.to_owned())
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let _ = tokio::fs::remove_file(&partial).await;
                 Err(download_error(format!(
                     "Refusing to overwrite an existing video: {}",
                     destination.display()
                 )))
             }
-            Err(error) => {
-                let _ = tokio::fs::remove_file(&partial).await;
-                Err(download_error(format!("Could not finalize video: {error}")))
-            }
+            Err(error) => Err(download_error(format!("Could not finalize video: {error}"))),
         }
     }
 
@@ -1148,7 +1204,7 @@ impl VideoProvider for FalProvider {
         &self,
         draft: &crate::domain::GenerationDraft,
     ) -> Result<(), ProviderError> {
-        if !is_seedance_2_endpoint(&draft.model) {
+        if !is_seedance_2_model_id(&draft.model) {
             return Ok(());
         }
         let mut local_video_bytes = 0u64;
@@ -2549,7 +2605,7 @@ fn bind_media_references(
     model: &VideoModel,
     request: &VideoRequest,
 ) -> Result<(), ProviderError> {
-    let seedance = is_seedance_2_endpoint(&model.id);
+    let seedance = is_seedance_2_model_id(&model.id);
     let total = request
         .frame_images
         .len()
@@ -2565,12 +2621,12 @@ fn bind_media_references(
                     .max_items
                     .is_some_and(|maximum| maximum > media_input_limit(binding.kind))
         });
-    if total > MAX_INPUT_MEDIA && !has_explicit_higher_maximum {
+    if total > MAX_MEDIA_INPUTS_TOTAL && !has_explicit_higher_maximum {
         return Err(validation(format!(
-            "fal requests accept at most {MAX_INPUT_MEDIA} input media items"
+            "fal requests accept at most {MAX_MEDIA_INPUTS_TOTAL} input media items"
         )));
     }
-    if seedance {
+    if audio_input_requires_visual(&ProviderId::fal(), &model.id) {
         let has_audio = request
             .input_references
             .iter()
@@ -2732,11 +2788,6 @@ const fn media_input_limit(kind: MediaKind) -> usize {
     }
 }
 
-fn is_seedance_2_endpoint(endpoint_id: &str) -> bool {
-    let endpoint_id = endpoint_id.to_ascii_lowercase();
-    endpoint_id.starts_with("bytedance/seedance-2.0") || endpoint_id.contains("/seedance-2.0/")
-}
-
 fn validate_seedance_staged_media_constraints(
     draft: &crate::domain::GenerationDraft,
     staged_media: &[StagedMedia],
@@ -2747,7 +2798,7 @@ fn validate_seedance_staged_media_constraints(
         ));
     }
 
-    let seedance = is_seedance_2_endpoint(&draft.model);
+    let seedance = is_seedance_2_model_id(&draft.model);
     let mut local_video_bytes = 0u64;
     for (draft_media, staged) in draft.media.iter().zip(staged_media) {
         staged
@@ -2811,6 +2862,22 @@ fn insert_common(
     if let Some(name) = model.field_map.get(canonical) {
         input.insert(name.clone(), value);
     }
+}
+
+fn validate_catalog_size(model: &VideoModel, request: &VideoRequest) -> Result<(), ProviderError> {
+    let Some(size) = request.size.as_deref() else {
+        return Ok(());
+    };
+    if model
+        .supported_sizes
+        .iter()
+        .any(|candidate| candidate == size)
+    {
+        return Ok(());
+    }
+    Err(validation(format!(
+        "size {size} is not advertised by this fal model"
+    )))
 }
 
 fn insert_optional(
@@ -3162,6 +3229,16 @@ mod tests {
     use crate::domain::{GenerationDraft, InputReference, InputReferenceKind, MediaRole};
     use tempfile::tempdir;
 
+    #[test]
+    fn media_transfer_deadline_scales_beyond_the_json_request_timeout() {
+        let base = Duration::from_secs(60);
+        assert_eq!(media_transfer_timeout(base, 0), base);
+        assert!(
+            media_transfer_timeout(base, 90 * 1024 * 1024) > Duration::from_secs(20 * 60),
+            "a valid large upload must not inherit the 60-second JSON deadline"
+        );
+    }
+
     fn schema_model(endpoint_id: &str, category: &str, input: Value, output: Value) -> Value {
         let endpoint_path = format!("/{endpoint_id}");
         let result_path = format!("/{endpoint_id}/requests/{{request_id}}");
@@ -3315,6 +3392,48 @@ mod tests {
     }
 
     #[test]
+    fn catalog_pagination_rejects_missing_and_repeated_cursors() {
+        let mut seen = BTreeSet::new();
+        let first = FalProvider::next_catalog_cursor(
+            &json!({"has_more": true, "next_cursor": "page-two"}),
+            &mut seen,
+            1,
+        )
+        .expect("first continuation cursor");
+        assert_eq!(first.as_deref(), Some("page-two"));
+
+        let repeated = FalProvider::next_catalog_cursor(
+            &json!({"has_more": true, "next_cursor": "page-two"}),
+            &mut seen,
+            2,
+        )
+        .expect_err("repeated cursor must fail closed");
+        assert_eq!(repeated.kind, ProviderErrorKind::Response);
+        assert!(repeated.message.contains("repeated cursor"));
+
+        let missing = FalProvider::next_catalog_cursor(
+            &json!({"has_more": true, "next_cursor": null}),
+            &mut BTreeSet::new(),
+            1,
+        )
+        .expect_err("missing continuation cursor must fail closed");
+        assert_eq!(missing.kind, ProviderErrorKind::Response);
+        assert!(missing.message.contains("without a cursor"));
+    }
+
+    #[test]
+    fn catalog_pagination_enforces_a_per_category_page_limit() {
+        let error = FalProvider::next_catalog_cursor(
+            &json!({"has_more": true, "next_cursor": "one-page-too-many"}),
+            &mut BTreeSet::new(),
+            FalProvider::MAX_CATALOG_PAGES_PER_CATEGORY,
+        )
+        .expect_err("catalog pagination must be bounded");
+        assert_eq!(error.kind, ProviderErrorKind::Response);
+        assert!(error.message.contains("page limit"));
+    }
+
+    #[test]
     fn actual_inference_schema_normalizes_typed_top_level_media() {
         let raw = schema_model(
             "fal-ai/fixture/video-to-video",
@@ -3400,6 +3519,46 @@ mod tests {
             assert!(model.generated_audio.supported);
             assert_eq!(model.generated_audio.provider_default, expected);
         }
+    }
+
+    #[test]
+    fn object_sized_models_do_not_invent_string_options() {
+        let raw = schema_model(
+            "fal-ai/fixture/object-size",
+            "text-to-video",
+            json!({
+                "type": "object",
+                "required": ["prompt"],
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "video_size": {
+                        "type": "object",
+                        "required": ["width", "height"],
+                        "properties": {
+                            "width": {"type": "integer", "minimum": 1},
+                            "height": {"type": "integer", "minimum": 1}
+                        }
+                    }
+                }
+            }),
+            video_output_schema(),
+        );
+        let model = normalize_fal_model(&raw)
+            .expect("valid object-size schema")
+            .expect("video model");
+        assert!(model.supported_sizes.is_empty());
+        assert_eq!(
+            model.field_map.get("size").map(String::as_str),
+            Some("video_size")
+        );
+
+        let mut request =
+            VideoRequest::for_provider(ProviderId::fal(), &model.id, "An object-size fixture")
+                .expect("request");
+        request.size = Some("square_hd".into());
+        let error = validate_catalog_size(&model, &request)
+            .expect_err("an object schema must not be represented by an invented string size");
+        assert!(error.message.contains("not advertised"));
     }
 
     #[test]

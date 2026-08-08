@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
@@ -12,6 +14,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::{Stream, StreamExt};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue,
     LOCATION, RETRY_AFTER, USER_AGENT,
@@ -26,11 +29,16 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use crate::config::partial_path;
-use crate::domain::{DomainError, VideoCatalog, VideoJob, VideoRequest, validate_public_https_url};
+use crate::domain::{
+    DomainError, JobLocator, VideoCatalog, VideoJob, VideoRequest, ip_address_is_non_public,
+    validate_public_https_url,
+};
 
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_APP_TITLE: &str = "Video Harness";
 pub const MAX_REDIRECTS: usize = 5;
+pub const MAX_VIDEO_DOWNLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const DOWNLOAD_SPACE_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 1024 * 1024;
 const OPENROUTER_TYPED_REFERENCE_MODELS: &[&str] =
@@ -146,6 +154,22 @@ impl ApiError {
                 || self
                     .status_code
                     .is_some_and(|status| retryable_statuses().contains(&status)))
+    }
+}
+
+pub(crate) struct OwnedPartialFile {
+    path: PathBuf,
+}
+
+impl OwnedPartialFile {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for OwnedPartialFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -316,6 +340,9 @@ pub struct HttpRequest {
     pub url: Url,
     pub headers: HeaderMap,
     pub json_body: Option<Value>,
+    /// Streamed media transfers use the client's connect and per-read idle
+    /// deadlines, but no short total request deadline.
+    pub stream_response: bool,
 }
 
 impl fmt::Debug for HttpRequest {
@@ -331,6 +358,7 @@ impl fmt::Debug for HttpRequest {
             .field("url", &self.url)
             .field("header_names", &safe_headers)
             .field("json_body", &self.json_body)
+            .field("stream_response", &self.stream_response)
             .finish()
     }
 }
@@ -342,13 +370,55 @@ pub trait HttpExecutor: Send + Sync {
 
 pub struct ReqwestExecutor {
     client: reqwest::Client,
+    request_timeout: Duration,
+}
+
+/// Resolve names at connection time and expose only globally routable
+/// addresses to reqwest. This closes the gap between lexical URL validation
+/// and DNS resolution without changing TLS SNI or following redirects
+/// implicitly.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PublicDnsResolver;
+
+impl Resolve for PublicDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            let addresses = public_socket_addresses(addresses)?;
+            Ok(Box::new(addresses.into_iter()) as Addrs)
+        })
+    }
+}
+
+fn public_socket_addresses(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
+    let addresses = addresses
+        .into_iter()
+        .filter(|address| !ip_address_is_non_public(address.ip()))
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "DNS name did not resolve to a public address",
+        )));
+    }
+    Ok(addresses)
 }
 
 impl ReqwestExecutor {
     pub fn new(timeout: Duration) -> Result<Self, ApiError> {
         let client = reqwest::Client::builder()
-            .timeout(timeout)
+            .connect_timeout(timeout)
+            .read_timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
+            // A system proxy would resolve the destination itself and bypass
+            // the public-address-only resolver used to prevent DNS rebinding.
+            .no_proxy()
+            .dns_resolver(PublicDnsResolver)
             .build()
             .map_err(|_| {
                 ApiError::simple(
@@ -356,17 +426,24 @@ impl ReqwestExecutor {
                     "Could not initialize the HTTPS client",
                 )
             })?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            request_timeout: timeout,
+        })
     }
 }
 
 #[async_trait]
 impl HttpExecutor for ReqwestExecutor {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+        let stream_response = request.stream_response;
         let mut builder = self
             .client
             .request(request.method, request.url)
             .headers(request.headers);
+        if !stream_response {
+            builder = builder.timeout(self.request_timeout);
+        }
         if let Some(body) = request.json_body {
             builder = builder.json(&body);
         }
@@ -534,22 +611,34 @@ impl OpenRouterClient {
                 "OpenRouter's accepted-job response is missing id or polling_url. The job may exist; do not submit again.",
             ));
         }
-        self.resolve_polling_url(&job.polling_url).map_err(|_| {
+        let polling_url = self.resolve_polling_url(&job.polling_url).map_err(|_| {
             ApiError::simple(
                 ApiErrorKind::SubmissionUncertain,
                 "OpenRouter returned an unsafe accepted-job locator. The job may exist; do not submit again.",
             )
         })?;
+        let expected_url = self.job_url(&job.id).map_err(|_| {
+            ApiError::simple(
+                ApiErrorKind::SubmissionUncertain,
+                "OpenRouter returned an invalid accepted-job id. The job may exist; do not submit again.",
+            )
+        })?;
+        if polling_url != expected_url {
+            return Err(ApiError::simple(
+                ApiErrorKind::SubmissionUncertain,
+                "OpenRouter returned an accepted-job id that does not match its polling locator. The job may exist; do not submit again.",
+            ));
+        }
         Ok(job)
     }
 
     pub async fn poll(&self, polling_url_or_job_id: &str) -> Result<VideoJob, ApiError> {
         let url = self.resolve_polling_url(polling_url_or_job_id)?;
         let payload = self
-            .request_json(Method::GET, url, true, true, None)
+            .request_json(Method::GET, url.clone(), true, true, None)
             .await?;
         let safe_payload = redact_value(&payload, self.api_key.expose_secret());
-        let job = VideoJob::from_api(&safe_payload).map_err(|_| {
+        let mut job = VideoJob::from_api(&safe_payload).map_err(|_| {
             ApiError::simple(
                 ApiErrorKind::ResponseFormat,
                 "OpenRouter returned an invalid video job",
@@ -561,11 +650,48 @@ impl OpenRouterClient {
                 "Video status response is missing the job id",
             ));
         }
+        let expected_url = self.job_url(&job.id).map_err(|_| {
+            ApiError::simple(
+                ApiErrorKind::ResponseFormat,
+                "Video status response contains an invalid job id",
+            )
+        })?;
+        let reported_url = (!job.polling_url.is_empty())
+            .then(|| self.resolve_polling_url(&job.polling_url))
+            .transpose()
+            .map_err(|_| {
+                ApiError::simple(
+                    ApiErrorKind::ResponseFormat,
+                    "Video status response contains an invalid polling locator",
+                )
+            })?;
+        if url != expected_url || reported_url.is_some_and(|reported| reported != expected_url) {
+            return Err(ApiError::simple(
+                ApiErrorKind::ResponseFormat,
+                "Video status response does not match the requested job",
+            ));
+        }
+        if job.polling_url.is_empty() {
+            let polling_url = expected_url.to_string();
+            job.polling_url = polling_url.clone();
+            job.locator = JobLocator::OpenRouter { polling_url };
+        }
         Ok(job)
     }
 
     pub fn content_url(&self, job_id: &str, index: usize) -> Result<Url, ApiError> {
-        if job_id.trim().is_empty() {
+        let mut url = self.job_url(job_id)?;
+        url.path_segments_mut()
+            .map_err(|_| ApiError::simple(ApiErrorKind::Configuration, "Invalid API base URL"))?
+            .push("content");
+        url.query_pairs_mut()
+            .append_pair("index", &index.to_string());
+        Ok(url)
+    }
+
+    fn job_url(&self, job_id: &str) -> Result<Url, ApiError> {
+        let job_id = job_id.trim();
+        if job_id.is_empty() || job_id.chars().any(char::is_control) {
             return Err(ApiError::simple(
                 ApiErrorKind::RequestValidation,
                 "job_id is required",
@@ -578,11 +704,8 @@ impl OpenRouterClient {
             })?;
             segments.pop_if_empty();
             segments.push("videos");
-            segments.push(job_id.trim());
-            segments.push("content");
+            segments.push(job_id);
         }
-        url.query_pairs_mut()
-            .append_pair("index", &index.to_string());
         Ok(url)
     }
 
@@ -615,15 +738,17 @@ impl OpenRouterClient {
         let mut last_error = None;
         for attempt in 0..=self.options.max_retries {
             match self.download_once(url, &partial, progress.as_ref()).await {
-                Ok(()) => {
-                    let metadata = tokio::fs::metadata(&partial).await.map_err(|error| {
-                        ApiError::simple(
-                            ApiErrorKind::Download,
-                            format!("Could not inspect the downloaded video: {error}"),
-                        )
-                    })?;
+                Ok(partial_guard) => {
+                    let metadata = match tokio::fs::metadata(&partial).await {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            return Err(ApiError::simple(
+                                ApiErrorKind::Download,
+                                format!("Could not inspect the downloaded video: {error}"),
+                            ));
+                        }
+                    };
                     if metadata.len() == 0 {
-                        remove_partial(&partial).await;
                         return Err(ApiError::simple(
                             ApiErrorKind::Download,
                             "OpenRouter returned an empty video file",
@@ -631,11 +756,10 @@ impl OpenRouterClient {
                     }
                     match tokio::fs::hard_link(&partial, destination).await {
                         Ok(()) => {
-                            let _ = tokio::fs::remove_file(&partial).await;
+                            drop(partial_guard);
                             return Ok(destination.to_owned());
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                            remove_partial(&partial).await;
                             return Err(ApiError::simple(
                                 ApiErrorKind::Download,
                                 format!(
@@ -645,7 +769,6 @@ impl OpenRouterClient {
                             ));
                         }
                         Err(error) => {
-                            remove_partial(&partial).await;
                             return Err(ApiError::simple(
                                 ApiErrorKind::Download,
                                 format!("Could not save video: {error}"),
@@ -655,7 +778,6 @@ impl OpenRouterClient {
                 }
                 Err(error) => {
                     let retryable = error.is_retryable();
-                    remove_partial(&partial).await;
                     if !retryable || attempt == self.options.max_retries {
                         return Err(error);
                     }
@@ -674,9 +796,9 @@ impl OpenRouterClient {
         url: &Url,
         partial: &Path,
         progress: Option<&mpsc::UnboundedSender<DownloadProgress>>,
-    ) -> Result<(), ApiError> {
+    ) -> Result<OwnedPartialFile, ApiError> {
         let response = self.open_download_response(url).await?;
-        if response.status.is_client_error() || response.status.is_server_error() {
+        if !response.status.is_success() {
             return Err(self.error_from_http(response).await);
         }
         let total = response
@@ -684,7 +806,16 @@ impl OpenRouterClient {
             .get(CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
+        if total.is_some_and(|total| total > MAX_VIDEO_DOWNLOAD_BYTES) {
+            return Err(ApiError::simple(
+                ApiErrorKind::Download,
+                "Video download exceeds the 4 GiB safety limit",
+            ));
+        }
+        ensure_download_space(partial, total)
+            .map_err(|message| ApiError::simple(ApiErrorKind::Download, message))?;
         let mut body = response.body;
+        let partial_guard: OwnedPartialFile;
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -696,6 +827,7 @@ impl OpenRouterClient {
                     format!("Could not create the partial video file: {error}"),
                 )
             })?;
+        partial_guard = OwnedPartialFile::new(partial.to_owned());
         let mut written = 0u64;
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(|_| {
@@ -707,13 +839,18 @@ impl OpenRouterClient {
             if chunk.is_empty() {
                 continue;
             }
+            written = checked_download_length(written, chunk.len()).ok_or_else(|| {
+                ApiError::simple(
+                    ApiErrorKind::Download,
+                    "Video download exceeds the 4 GiB safety limit",
+                )
+            })?;
             file.write_all(&chunk).await.map_err(|error| {
                 ApiError::simple(
                     ApiErrorKind::Download,
                     format!("Could not save video: {error}"),
                 )
             })?;
-            written += chunk.len() as u64;
             if let Some(sender) = progress {
                 let _ = sender.send(DownloadProgress { written, total });
             }
@@ -736,7 +873,7 @@ impl OpenRouterClient {
                 "OpenRouter returned an empty video file",
             ));
         }
-        Ok(())
+        Ok(partial_guard)
     }
 
     async fn open_download_response(&self, url: &Url) -> Result<HttpResponse, ApiError> {
@@ -752,6 +889,7 @@ impl OpenRouterClient {
                 url: current.clone(),
                 headers: self.headers(&current, authorize, false)?,
                 json_body: None,
+                stream_response: true,
             };
             let response = self.executor.execute(request).await.map_err(|_| {
                 ApiError::simple(
@@ -812,6 +950,7 @@ impl OpenRouterClient {
                 url: url.clone(),
                 headers: self.headers(&url, authorize, json_body.is_some())?,
                 json_body: json_body.clone(),
+                stream_response: false,
             };
             let response = match self.executor.execute(request).await {
                 Ok(response) => response,
@@ -1260,11 +1399,127 @@ async fn path_exists(path: &Path) -> bool {
     tokio::fs::metadata(path).await.is_ok()
 }
 
-async fn remove_partial(path: &Path) {
-    let _ = tokio::fs::remove_file(path).await;
+pub(crate) fn checked_download_length(written: u64, chunk_bytes: usize) -> Option<u64> {
+    written
+        .checked_add(u64::try_from(chunk_bytes).ok()?)
+        .filter(|next| *next <= MAX_VIDEO_DOWNLOAD_BYTES)
+}
+
+pub(crate) fn ensure_download_space(
+    destination: &Path,
+    expected_bytes: Option<u64>,
+) -> Result<(), String> {
+    let Some(expected_bytes) = expected_bytes else {
+        return Ok(());
+    };
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let Ok(Some(available_bytes)) = available_download_space(parent) else {
+        // Some virtual and network filesystems do not expose free-space data.
+        // The streamed-byte ceiling and write errors remain the fail-safe bounds.
+        return Ok(());
+    };
+    if !download_space_is_sufficient(available_bytes, expected_bytes) {
+        return Err("Not enough free disk space to safely download this video".into());
+    }
+    Ok(())
+}
+
+fn download_space_is_sufficient(available_bytes: u64, expected_bytes: u64) -> bool {
+    available_bytes >= expected_bytes.saturating_add(DOWNLOAD_SPACE_RESERVE_BYTES)
+}
+
+#[cfg(unix)]
+fn available_download_space(path: &Path) -> io::Result<Option<u64>> {
+    let statistics = rustix::fs::statvfs(path).map_err(io::Error::from)?;
+    let fragment_size = if statistics.f_frsize == 0 {
+        statistics.f_bsize
+    } else {
+        statistics.f_frsize
+    };
+    Ok(Some(statistics.f_bavail.saturating_mul(fragment_size)))
+}
+
+#[cfg(windows)]
+fn available_download_space(path: &Path) -> io::Result<Option<u64>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide_path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut available_bytes = 0u64;
+    // SAFETY: `wide_path` is NUL-terminated and remains alive for the call;
+    // the only non-null output pointer refers to a valid `u64`.
+    let succeeded = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide_path.as_ptr(),
+            &mut available_bytes,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if succeeded == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(Some(available_bytes))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn available_download_space(_path: &Path) -> io::Result<Option<u64>> {
+    Ok(None)
 }
 
 #[allow(dead_code)]
 fn _utc_now() -> DateTime<Utc> {
     Utc::now()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    use super::{
+        DOWNLOAD_SPACE_RESERVE_BYTES, MAX_VIDEO_DOWNLOAD_BYTES, checked_download_length,
+        download_space_is_sufficient, public_socket_addresses,
+    };
+
+    #[test]
+    fn streamed_download_length_is_bounded_without_overflow() {
+        assert_eq!(
+            checked_download_length(MAX_VIDEO_DOWNLOAD_BYTES - 1, 1),
+            Some(MAX_VIDEO_DOWNLOAD_BYTES)
+        );
+        assert_eq!(checked_download_length(MAX_VIDEO_DOWNLOAD_BYTES, 1), None);
+        assert_eq!(checked_download_length(u64::MAX, 1), None);
+    }
+
+    #[test]
+    fn free_space_preflight_keeps_a_reserve() {
+        assert!(!download_space_is_sufficient(
+            DOWNLOAD_SPACE_RESERVE_BYTES,
+            1
+        ));
+        assert!(download_space_is_sufficient(
+            DOWNLOAD_SPACE_RESERVE_BYTES + 1,
+            1
+        ));
+    }
+
+    #[test]
+    fn dns_resolution_exposes_only_public_addresses_and_fails_closed() {
+        let public_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 443);
+        let public_v6 = SocketAddr::new(
+            IpAddr::V6("2606:4700:4700::1111".parse::<Ipv6Addr>().expect("IPv6")),
+            443,
+        );
+        let private = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+
+        assert_eq!(
+            public_socket_addresses([private, public_v4, public_v6]).expect("public DNS answers"),
+            vec![public_v4, public_v6]
+        );
+        assert!(public_socket_addresses([private]).is_err());
+    }
 }

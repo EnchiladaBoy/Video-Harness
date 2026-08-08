@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { demoSnapshot } from './mock-bridge';
-import { applySequencedEvent, applyUiEvent, reconcileSnapshot } from './state';
+import {
+  applySequencedEvent,
+  applyUiEvent,
+  reconcileSnapshot,
+  requiresImmediateHandling
+} from './state';
+import { isActivelyMonitored } from './types';
 
 describe('frontend event projection', () => {
   it('updates a provider without mutating the previous snapshot', () => {
@@ -25,6 +31,28 @@ describe('frontend event projection', () => {
 
     expect(duplicate.snapshot).toBe(snapshot);
     expect(gap.gap).toBe(true);
+    expect(gap.snapshot).toBe(snapshot);
+    expect(gap.seq).toBe(4);
+  });
+
+  it('preserves close requests as lifecycle effects across sequence resync', () => {
+    const snapshot = demoSnapshot();
+    const event = { type: 'close_requested', requestId: 41 } as const;
+    const gap = applySequencedEvent(snapshot, 4, { seq: 7, event });
+
+    expect(gap.gap).toBe(true);
+    expect(requiresImmediateHandling(event)).toBe(true);
+    expect(event.requestId).toBe(41);
+  });
+
+  it('uses monitor state as the source of truth with a legacy status fallback', () => {
+    const job = demoSnapshot().jobs[0];
+
+    expect(isActivelyMonitored({ ...job, status: 'processing', monitorState: 'recoverable' })).toBe(
+      false
+    );
+    expect(isActivelyMonitored({ ...job, status: 'paused', monitorState: 'active' })).toBe(true);
+    expect(isActivelyMonitored({ ...job, status: 'queued', monitorState: undefined })).toBe(true);
   });
 
   it('keeps snapshot data unchanged for an operation failure', () => {
@@ -89,6 +117,32 @@ describe('frontend event projection', () => {
     incoming.draftSaved = true;
 
     expect(reconcileSnapshot(current, incoming).draftSaved).toBe(true);
+  });
+
+  it('preserves a visible local job selection except during an authoritative resync', () => {
+    const current = demoSnapshot();
+    current.selectedJobId = current.jobs[2].id;
+    const incoming = demoSnapshot();
+    incoming.selectedJobId = incoming.jobs[1].id;
+
+    expect(reconcileSnapshot(current, incoming).selectedJobId).toBe(current.jobs[2].id);
+    expect(
+      reconcileSnapshot(current, incoming, { preserveSelection: false }).selectedJobId
+    ).toBe(incoming.jobs[1].id);
+  });
+
+  it('removes a disconnected provider catalog so stale models cannot be selected', () => {
+    const snapshot = demoSnapshot();
+    const fal = snapshot.providers.find((provider) => provider.id === 'fal');
+    if (!fal) throw new Error('Missing fal fixture');
+
+    const after = applyUiEvent(snapshot, {
+      type: 'provider_changed',
+      provider: { ...fal, connected: false }
+    });
+
+    expect(after.models.some((model) => model.providerId === 'fal')).toBe(false);
+    expect(after.models.some((model) => model.providerId === 'openrouter')).toBe(true);
   });
 
   it('removes a render and selects the next item when the current one is deleted', () => {

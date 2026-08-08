@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -368,8 +368,15 @@ fn host_is_non_public(host: Host<&str>) -> bool {
                 || domain.ends_with(".localhost")
                 || domain.ends_with(".local")
         }
-        Host::Ipv4(address) => ipv4_is_non_global(address),
-        Host::Ipv6(address) => ipv6_is_non_global(address),
+        Host::Ipv4(address) => ip_address_is_non_public(IpAddr::V4(address)),
+        Host::Ipv6(address) => ip_address_is_non_public(IpAddr::V6(address)),
+    }
+}
+
+pub(crate) fn ip_address_is_non_public(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => ipv4_is_non_global(address),
+        IpAddr::V6(address) => ipv6_is_non_global(address),
     }
 }
 
@@ -1124,6 +1131,59 @@ impl GenerationDraft {
     }
 }
 
+/// Returns whether a provider-owned JSON object contains a field whose name
+/// conventionally carries authentication material. Provider options are
+/// persisted in drafts and history, so this check belongs at the domain
+/// boundary rather than only in individual persistence adapters.
+pub(crate) fn json_contains_credential_field(value: &Value) -> bool {
+    fn is_credential_field_name(name: &str) -> bool {
+        let normalized = name
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .map(|character| character.to_ascii_lowercase())
+            .collect::<String>();
+
+        if matches!(
+            normalized.as_str(),
+            "apikey"
+                | "authorization"
+                | "credential"
+                | "credentials"
+                | "password"
+                | "passwd"
+                | "secret"
+                | "token"
+                | "accesstoken"
+                | "refreshtoken"
+                | "clientsecret"
+                | "secretkey"
+                | "privatekey"
+                | "authtoken"
+                | "bearertoken"
+                | "falkey"
+        ) {
+            return true;
+        }
+
+        normalized.starts_with("authorization")
+            || normalized.ends_with("apikey")
+            || normalized.ends_with("secret")
+            || (normalized.ends_with("token")
+                && !matches!(
+                    normalized.as_str(),
+                    "maxtoken" | "mintoken" | "numtoken" | "tokencount" | "tokenlimit"
+                ))
+    }
+
+    match value {
+        Value::Object(object) => object.iter().any(|(key, nested)| {
+            is_credential_field_name(key) || json_contains_credential_field(nested)
+        }),
+        Value::Array(values) => values.iter().any(json_contains_credential_field),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VideoRequest {
     pub provider_id: ProviderId,
@@ -1182,16 +1242,15 @@ impl VideoRequest {
             ));
         }
         if let Some(size) = &self.size {
-            let valid = size.split_once('x').is_some_and(|(width, height)| {
-                !width.starts_with('0')
-                    && !height.starts_with('0')
-                    && width.parse::<u32>().is_ok_and(|value| value > 0)
-                    && height.parse::<u32>().is_ok_and(|value| value > 0)
-            });
+            let valid = valid_exact_video_size(size)
+                || (self.provider_id == ProviderId::fal() && valid_fal_size_candidate(size));
             if !valid {
-                return Err(DomainError::Validation(
-                    "size must use WIDTHxHEIGHT, for example 1280x720".into(),
-                ));
+                let message = if self.provider_id == ProviderId::fal() {
+                    "fal size must be a non-empty catalog value or use WIDTHxHEIGHT"
+                } else {
+                    "size must use WIDTHxHEIGHT, for example 1280x720"
+                };
+                return Err(DomainError::Validation(message.into()));
             }
             if self.resolution.is_some() || self.aspect_ratio.is_some() {
                 return Err(DomainError::Validation(
@@ -1206,6 +1265,15 @@ impl VideoRequest {
         {
             return Err(DomainError::Validation(
                 "adapter_options must be a JSON object".into(),
+            ));
+        }
+        if self
+            .adapter_options
+            .as_ref()
+            .is_some_and(json_contains_credential_field)
+        {
+            return Err(DomainError::Validation(
+                "adapter_options must not contain credential fields".into(),
             ));
         }
         let mut first_frames = 0usize;
@@ -1438,6 +1506,25 @@ impl VideoRequest {
         request.validate()?;
         Ok(request)
     }
+}
+
+fn valid_exact_video_size(size: &str) -> bool {
+    size.split_once('x').is_some_and(|(width, height)| {
+        !width.starts_with('0')
+            && !height.starts_with('0')
+            && width.parse::<u32>().is_ok_and(|value| value > 0)
+            && height.parse::<u32>().is_ok_and(|value| value > 0)
+    })
+}
+
+/// Fal exposes symbolic size enums such as `square_hd`. Domain validation can
+/// only establish that a value is safe to carry; the provider adapter must
+/// still prove exact membership in the selected model's fetched catalog.
+fn valid_fal_size_candidate(size: &str) -> bool {
+    !size.is_empty()
+        && size.len() <= 256
+        && size.trim() == size
+        && !size.chars().any(char::is_control)
 }
 
 impl Serialize for VideoRequest {
@@ -1844,7 +1931,7 @@ impl VideoModel {
         if request.generate_audio == Some(true) && !self.generated_audio.supported {
             problems.push("audio generation is not supported".into());
         }
-        if request.seed.is_some() && self.seed == Some(false) {
+        if request.seed.is_some() && !self.supports_seed() {
             problems.push("seeded generation is not supported".into());
         }
         for frame in &request.frame_images {
@@ -1922,6 +2009,17 @@ impl VideoModel {
             None => kind == MediaKind::Image,
         };
         modality_supported && self.has_reference_transport(kind)
+    }
+
+    /// Whether the provider can represent the shared seed control for this
+    /// model. Fal requires a discovered schema field, whereas OpenRouter's
+    /// common request envelope supports seed unless the catalog opts out.
+    pub fn supports_seed(&self) -> bool {
+        if self.provider_id == ProviderId::fal() {
+            self.seed != Some(false) && self.field_map.contains_key("seed")
+        } else {
+            self.seed != Some(false)
+        }
     }
 
     fn has_reference_transport(&self, kind: MediaKind) -> bool {
@@ -2138,11 +2236,8 @@ impl VideoJob {
             Value::Null => None,
             value => Some(value_to_string(value)),
         });
-        let id = object.get("id").map(value_to_string).unwrap_or_default();
-        let polling_url = object
-            .get("polling_url")
-            .map(value_to_string)
-            .unwrap_or_default();
+        let id = required_response_string(object, "id")?;
+        let polling_url = optional_response_string(object, "polling_url")?.unwrap_or_default();
         let unsigned_urls = strings(object.get("unsigned_urls"));
         let artifacts = unsigned_urls
             .iter()
@@ -2199,6 +2294,32 @@ fn nonempty_string(value: &Value) -> Option<String> {
     } else {
         let value = value_to_string(value);
         (!value.is_empty()).then_some(value)
+    }
+}
+
+fn required_response_string(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<String, DomainError> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            DomainError::Validation(format!("video job response {field} must be a string"))
+        })
+}
+
+fn optional_response_string(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>, DomainError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(DomainError::Validation(format!(
+            "video job response {field} must be a string"
+        ))),
     }
 }
 
@@ -2689,6 +2810,18 @@ mod tests {
         .expect("fal frame-only model");
         assert!(!fal_frame_only.supports_media_kind(MediaKind::Image));
         assert!(!fal_frame_only.supports_media_kind(MediaKind::Video));
+        assert!(!fal_frame_only.supports_seed());
+
+        let fal_with_seed = VideoModel::from_provider_api(
+            ProviderId::fal(),
+            &json!({
+                "id": "fal/seeded",
+                "field_map": {"seed": "seed"}
+            }),
+        )
+        .expect("fal model with a seed binding");
+        assert!(fal_with_seed.supports_seed());
+        assert!(unknown.supports_seed());
 
         let fal_legacy_references = VideoModel::from_provider_api(
             ProviderId::fal(),
