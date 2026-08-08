@@ -1108,26 +1108,31 @@ async fn pausing_a_completed_jobs_local_download_reports_remote_finished() {
         })
         .await
         .expect("pause download");
-    assert!(matches!(
-        event_matching(&mut service, |event| {
-            matches!(event, ServiceEvent::MonitorPaused { op_id: 14, .. })
-        })
-        .await,
-        ServiceEvent::MonitorPaused {
-            remote_continues: false,
-            ..
+    // The monitor task can observe its cancellation while the actor is still
+    // persisting the pause acknowledgement. Both events are authoritative,
+    // but their relative order is deliberately not part of the protocol.
+    let mut pause_remote_continues = None;
+    let mut cancel_remote_continues = None;
+    while pause_remote_continues.is_none() || cancel_remote_continues.is_none() {
+        match next_event(&mut service).await {
+            ServiceEvent::MonitorPaused {
+                op_id: 14,
+                remote_continues,
+                ..
+            } => pause_remote_continues = Some(remote_continues),
+            ServiceEvent::Cancelled {
+                op_id: 13,
+                remote_continues,
+                ..
+            } => cancel_remote_continues = Some(remote_continues),
+            ServiceEvent::Error { message, .. } => {
+                panic!("unexpected workflow error: {message}")
+            }
+            _ => {}
         }
-    ));
-    assert!(matches!(
-        event_matching(&mut service, |event| {
-            matches!(event, ServiceEvent::Cancelled { op_id: 13, .. })
-        })
-        .await,
-        ServiceEvent::Cancelled {
-            remote_continues: false,
-            ..
-        }
-    ));
+    }
+    assert_eq!(pause_remote_continues, Some(false));
+    assert_eq!(cancel_remote_continues, Some(false));
     shutdown(&mut service).await;
 }
 
