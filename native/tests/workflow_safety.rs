@@ -936,7 +936,11 @@ async fn generate_surfaces_id_then_persists_polls_and_downloads_with_one_post() 
     let ServiceEvent::Downloaded { path, record, .. } = downloaded else {
         unreachable!()
     };
-    assert_eq!(path.parent(), Some(paths.videos_dir.as_path()));
+    let canonical_videos = paths
+        .videos_dir
+        .canonicalize()
+        .expect("canonical Videos directory");
+    assert_eq!(path.parent(), Some(canonical_videos.as_path()));
     assert_eq!(
         fs::read(&path).expect("downloaded video"),
         b"generated video bytes"
