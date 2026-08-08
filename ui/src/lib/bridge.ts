@@ -110,6 +110,14 @@ class TauriBridge implements VideoHarnessBridge {
     return invoke('resume_job', { jobId });
   }
 
+  pauseAllJobs(): Promise<void> {
+    return invoke('pause_all_jobs');
+  }
+
+  resumeAllJobs(): Promise<void> {
+    return invoke('resume_all_jobs');
+  }
+
   deleteRender(jobId: string, deleteOutput: boolean): Promise<void> {
     return invoke('delete_render', { jobId, deleteOutput });
   }

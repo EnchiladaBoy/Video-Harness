@@ -1,14 +1,17 @@
 use std::process::ExitCode;
 
-const HELP: &str = "Video Harness
+const HELP: &str = "Video Harness legacy GTK frontend
 
-Usage: video-harness [OPTIONS]
+Usage: video-harness-gtk [OPTIONS]
 
 Options:
   -h, --help       Print help
   -V, --version    Print version
 
-Run without arguments to launch the graphical interface.";
+This maintenance-only frontend is deprecated. The supported Video Harness
+desktop application is the Tauri/Svelte executable named `video-harness`.
+
+Run without arguments to launch the legacy GTK interface.";
 
 fn main() -> ExitCode {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -19,7 +22,10 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         [argument] if argument == "-V" || argument == "--version" => {
-            println!("video-harness {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "video-harness-gtk {} (legacy frontend; deprecated)",
+                env!("CARGO_PKG_VERSION")
+            );
             return ExitCode::SUCCESS;
         }
         [argument, ..] => {
@@ -30,10 +36,11 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    #[allow(deprecated)]
     match video_harness::gui::run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("Video Harness could not start: {error}");
+            eprintln!("Video Harness legacy GTK frontend could not start: {error}");
             ExitCode::FAILURE
         }
     }

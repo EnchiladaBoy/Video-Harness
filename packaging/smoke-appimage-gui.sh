@@ -14,6 +14,8 @@ if [[ "${1:-}" == --inside-session ]]; then
     LOG_FILE="${EXTRACT_ROOT}/gui-smoke.log"
     APP_PID=
 
+    # Invoked indirectly by the EXIT trap below.
+    # shellcheck disable=SC2329
     cleanup() {
         if [[ -n "${APP_PID}" ]] && kill -0 "${APP_PID}" 2>/dev/null; then
             kill "${APP_PID}" 2>/dev/null || true

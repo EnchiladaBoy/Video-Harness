@@ -173,6 +173,11 @@ export type UiEvent =
   | { type: 'draft_saved'; revision: number }
   | { type: 'close_requested'; requestId: number }
   | {
+      type: 'bulk_monitor_acknowledged';
+      action: 'pause' | 'resume';
+      targetJobIds: string[];
+    }
+  | {
       type: 'operation_failed';
       operation: 'preparation' | 'submission';
       message: string;
@@ -230,6 +235,8 @@ export interface VideoHarnessBridge {
   saveDraftAndClose(draft: GenerationDraft, requestId: number): Promise<void>;
   pauseJob(jobId: string): Promise<void>;
   resumeJob(jobId: string): Promise<void>;
+  pauseAllJobs(): Promise<void>;
+  resumeAllJobs(): Promise<void>;
   deleteRender(jobId: string, deleteOutput: boolean): Promise<void>;
   openOutput(jobId: string): Promise<void>;
   grantPlayback(jobId: string): Promise<PlaybackGrant>;

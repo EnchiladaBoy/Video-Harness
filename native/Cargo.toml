@@ -1,6 +1,6 @@
 [package]
 name = "video-harness"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 rust-version = "1.95"
 description = "A multi-provider desktop workspace for AI video generation"
@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/EnchiladaBoy/Video-Harness"
 keywords = ["video", "ai", "desktop", "openrouter", "fal"]
 categories = ["multimedia::video"]
-default-run = "video-harness"
+autobins = false
 publish = false
 
 [lib]
@@ -16,12 +16,12 @@ name = "video_harness"
 path = "src/lib.rs"
 
 [[bin]]
-name = "video-harness"
-path = "src/bin/video-harness.rs"
+name = "video-harness-gtk"
+path = "src/bin/video-harness-gtk.rs"
 required-features = ["legacy-gtk"]
 
 [features]
-default = ["legacy-gtk"]
+default = []
 legacy-gtk = ["dep:adw", "dep:gtk"]
 
 [dependencies]

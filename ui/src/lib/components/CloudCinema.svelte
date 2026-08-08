@@ -194,7 +194,7 @@
     context.font = `700 ${Math.max(8, 10 * scale)}px ui-monospace, SFMono-Regular, Menlo, monospace`;
     context.textAlign = 'center';
     context.textBaseline = 'middle';
-    context.fillText('TINY CLOUD CINEMA', width / 2 + bodyWidth * 0.05, bodyY + bodyHeight * 0.54);
+    context.fillText('VIDEO HARNESS', width / 2 + bodyWidth * 0.05, bodyY + bodyHeight * 0.54);
 
     const groundY = height - Math.max(12, 17 * scale);
     for (let x = width / 2 - bodyWidth * 0.72; x < width / 2 + bodyWidth * 0.72; x += 12 * scale) {
@@ -252,7 +252,7 @@
   <canvas bind:this={canvas} class="cinema__canvas" aria-hidden="true"></canvas>
   <div class="cinema__telemetry">
     <div>
-      <p class="micro-label">On the projector</p>
+      <p class="micro-label">Current status</p>
       <h3 id="cloud-cinema-status">{status}</h3>
       {#if detail}<p class="cinema__detail">{detail}</p>{/if}
     </div>

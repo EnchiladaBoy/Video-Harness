@@ -193,17 +193,17 @@ function containsCredentialField(value: unknown): boolean {
 export function advancedJsonIssue(value: string | undefined): string | undefined {
   const trimmed = value?.trim() ?? '';
   if (!trimmed) return undefined;
-  if (value && value.length > 100_000) return 'Extra model settings are too large.';
+  if (value && value.length > 100_000) return 'Advanced settings are too large.';
   try {
     const parsed: unknown = JSON.parse(trimmed);
     if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
-      return 'Extra model settings must be a JSON object.';
+      return 'Advanced settings must be a JSON object.';
     }
     if (containsCredentialField(parsed)) {
-      return 'Extra model settings may not contain credential fields.';
+      return 'Advanced settings may not contain credential fields.';
     }
   } catch {
-    return 'Fix the JSON in Extra model settings.';
+    return 'Fix the JSON in Advanced settings.';
   }
   return undefined;
 }
@@ -220,7 +220,7 @@ function unsupportedOption(
 export function reviewReadinessIssue(snapshot: AppSnapshot, ready: boolean): string | undefined {
   if (!ready) return 'Video Harness is still opening.';
   const provider = snapshot.providers.find((item) => item.id === snapshot.draft.providerId);
-  if (!provider?.connected) return `Connect ${provider?.name ?? 'a provider'} backstage.`;
+  if (!provider?.connected) return `Connect ${provider?.name ?? 'a video service'} under Connections.`;
   if (!snapshot.draft.prompt.trim()) return 'Add your idea above.';
 
   const model = modelById(snapshot, snapshot.draft.providerId, snapshot.draft.modelId);
@@ -228,7 +228,7 @@ export function reviewReadinessIssue(snapshot: AppSnapshot, ready: boolean): str
     const hasProviderModels = snapshot.models.some(
       (item) => item.providerId === snapshot.draft.providerId
     );
-    return hasProviderModels ? 'Pick a model.' : 'No models are available for this provider yet.';
+    return hasProviderModels ? 'Choose a video model.' : 'No models are available for this service yet.';
   }
 
   if (snapshot.draft.media.length > MAX_MEDIA_ITEMS) {
@@ -377,7 +377,7 @@ export function reviewReadinessIssue(snapshot: AppSnapshot, ready: boolean): str
     snapshot.draft.media.some((item) => item.source === 'local');
   const falProvider = snapshot.providers.find((item) => item.id === 'fal');
   if (requiresOpenRouterUpload && !falProvider?.connected) {
-    return 'Connect fal.ai backstage to carry these files to OpenRouter.';
+    return 'Connect fal.ai under Connections to upload these files for OpenRouter.';
   }
   return undefined;
 }

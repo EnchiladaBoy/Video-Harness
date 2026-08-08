@@ -280,13 +280,13 @@ impl CredentialStore {
             .map(|entry| Box::new(entry) as Box<dyn CredentialEntry>);
         let status = if entry.is_some() {
             CredentialStatus {
-                backend: "system keyring".into(),
+                backend: platform_keyring_name().into(),
                 available: true,
                 persistent: true,
-                message: "API key will be stored in the system keyring".into(),
+                message: platform_keyring_message().into(),
             }
         } else {
-            memory_status("System keyring unavailable; key will be kept in memory for this session")
+            memory_status(platform_keyring_unavailable_message())
         };
         Self {
             service_name,
@@ -368,8 +368,51 @@ impl CredentialStore {
 
     fn degrade_to_memory(&mut self) {
         self.entry = None;
-        self.status =
-            memory_status("System keyring failed; key is kept in memory for this session only");
+        self.status = memory_status(platform_keyring_failure_message());
+    }
+}
+
+/// Use the platform's familiar product name in renderer-facing status rather
+/// than exposing the implementation crate or an ambiguous generic backend.
+/// The service and account identifiers remain unchanged, so existing saved
+/// credentials continue to be found after an upgrade.
+pub const fn platform_keyring_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows Credential Manager"
+    } else if cfg!(target_os = "macos") {
+        "macOS Keychain"
+    } else {
+        "system keyring"
+    }
+}
+
+const fn platform_keyring_message() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "API key will be saved securely in Windows Credential Manager"
+    } else if cfg!(target_os = "macos") {
+        "API key will be saved securely in macOS Keychain"
+    } else {
+        "API key will be stored in the system keyring"
+    }
+}
+
+const fn platform_keyring_unavailable_message() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows Credential Manager is unavailable; key will stay in memory for this session"
+    } else if cfg!(target_os = "macos") {
+        "macOS Keychain is unavailable; key will stay in memory for this session"
+    } else {
+        "System keyring unavailable; key will be kept in memory for this session"
+    }
+}
+
+const fn platform_keyring_failure_message() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows Credential Manager stopped responding; key is kept in memory for this session only"
+    } else if cfg!(target_os = "macos") {
+        "macOS Keychain stopped responding; key is kept in memory for this session only"
+    } else {
+        "System keyring failed; key is kept in memory for this session only"
     }
 }
 
@@ -405,6 +448,20 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex};
 
     use super::*;
+
+    #[test]
+    fn credential_status_names_the_native_platform_store() {
+        let (expected_backend, expected_message) = if cfg!(target_os = "windows") {
+            ("Windows Credential Manager", "Windows Credential Manager")
+        } else if cfg!(target_os = "macos") {
+            ("macOS Keychain", "macOS Keychain")
+        } else {
+            ("system keyring", "system keyring")
+        };
+
+        assert_eq!(platform_keyring_name(), expected_backend);
+        assert!(platform_keyring_message().contains(expected_message));
+    }
 
     #[derive(Default)]
     struct Gate {

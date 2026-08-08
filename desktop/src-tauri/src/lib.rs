@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
-use tauri_plugin_opener::OpenerExt;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -37,6 +36,7 @@ const HISTORY_LIMIT: usize = 200;
 const CLOSE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const CLOSE_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const CROSS_PROVIDER_DISCLOSURE: &str = "Your local references will be uploaded to fal.ai as public-by-link files with a requested 24-hour expiry, then their URLs will be shared with OpenRouter and the selected model provider.";
+const DIRECT_FAL_DISCLOSURE: &str = "Your local references will be uploaded to fal.ai as public-by-link files with a requested 24-hour expiry, then used by the selected fal.ai model.";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -325,6 +325,11 @@ enum UiEvent {
         tone: String,
         message: String,
     },
+    BulkMonitorAcknowledged {
+        action: String,
+        #[serde(rename = "targetJobIds")]
+        target_job_ids: Vec<String>,
+    },
     CloseRequested {
         #[serde(rename = "requestId")]
         request_id: u64,
@@ -430,6 +435,39 @@ impl PreservedDraftFields {
 enum DraftPurpose {
     Review,
     Autosave,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalMediaUploadPlan {
+    requires_consent: bool,
+    staging_provider_id: Option<ProviderId>,
+    disclosure: Option<&'static str>,
+}
+
+fn local_media_upload_plan(
+    provider_id: &ProviderId,
+    has_local_media: bool,
+) -> LocalMediaUploadPlan {
+    if !has_local_media {
+        return LocalMediaUploadPlan {
+            requires_consent: false,
+            staging_provider_id: None,
+            disclosure: None,
+        };
+    }
+    if provider_id == &ProviderId::openrouter() {
+        LocalMediaUploadPlan {
+            requires_consent: true,
+            staging_provider_id: Some(ProviderId::fal()),
+            disclosure: Some(CROSS_PROVIDER_DISCLOSURE),
+        }
+    } else {
+        LocalMediaUploadPlan {
+            requires_consent: true,
+            staging_provider_id: None,
+            disclosure: Some(DIRECT_FAL_DISCLOSURE),
+        }
+    }
 }
 
 struct Shared {
@@ -1554,12 +1592,12 @@ fn status_projection(status: &CoreJobStatus, has_output: bool) -> (String, Strin
         CoreJobStatus::Pending => (
             "queued".into(),
             "Waiting in line".into(),
-            "Your render is queued with the provider.".into(),
+            "Your video job is queued with the provider.".into(),
         ),
         CoreJobStatus::InProgress => (
             "processing".into(),
             "Making your video".into(),
-            "Tiny Cloud Cinema is keeping watch while the model works.".into(),
+            "Video Harness is checking the provider while the model works.".into(),
         ),
         CoreJobStatus::Completed if has_output => (
             "completed".into(),
@@ -1568,23 +1606,23 @@ fn status_projection(status: &CoreJobStatus, has_output: bool) -> (String, Strin
         ),
         CoreJobStatus::Completed => (
             "downloading".into(),
-            "Saving the final cut".into(),
-            "The render is done. Video Harness is tucking it into your Videos folder.".into(),
+            "Saving your video".into(),
+            "The video is ready. Video Harness is saving it to your Videos folder.".into(),
         ),
         CoreJobStatus::Failed => (
             "attention".into(),
-            "Render needs attention".into(),
+            "Video job needs attention".into(),
             "The provider couldn’t finish this one.".into(),
         ),
         CoreJobStatus::Cancelled => (
             "attention".into(),
-            "Render cancelled".into(),
-            "This render was cancelled.".into(),
+            "Video job cancelled".into(),
+            "This video job was cancelled.".into(),
         ),
         CoreJobStatus::Expired => (
             "attention".into(),
-            "Render expired".into(),
-            "The provider no longer has this render.".into(),
+            "Video job expired".into(),
+            "The provider no longer has this video job.".into(),
         ),
         CoreJobStatus::Unknown(_) => (
             "processing".into(),
@@ -1687,6 +1725,32 @@ fn set_recovery_stop_pending(job: &mut JobSummary, remote_continues: bool) {
 
 fn pause_projection_allowed(job: &JobSummary) -> bool {
     job.monitor_state != MonitorState::Terminal
+}
+
+fn apply_pause_all_projection(shared: &mut Shared, remote_continues: bool) -> usize {
+    let keys = shared.active_monitors.iter().cloned().collect::<Vec<_>>();
+    let mut projected = 0;
+    for key in keys {
+        shared.active_monitors.remove(&key);
+        shared.stopping_monitors.remove(&key);
+        shared
+            .pausing_monitors
+            .insert(key.clone(), remote_continues);
+        let Some(id) = shared.job_ids.get(&key) else {
+            continue;
+        };
+        let Some(index) = shared.snapshot.jobs.iter().position(|job| &job.id == id) else {
+            continue;
+        };
+        let job = &mut shared.snapshot.jobs[index];
+        if pause_projection_allowed(job) {
+            set_pause_pending_projection(job, remote_continues);
+            projected += 1;
+        } else {
+            shared.pausing_monitors.remove(&key);
+        }
+    }
+    projected
 }
 
 fn redact_url_secrets(value: &str) -> String {
@@ -2408,6 +2472,79 @@ async fn service_events(
                 state.snapshot.jobs[index] = job.clone();
                 Some(UiEvent::JobUpdated { job })
             }),
+            ServiceEvent::MonitorsPaused {
+                count,
+                remote_continue,
+                keys,
+                ..
+            } => {
+                let target_job_ids = shared
+                    .lock()
+                    .ok()
+                    .map(|state| {
+                        keys.iter()
+                            .filter_map(|key| state.job_ids.get(key).cloned())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                mutate_and_broadcast(&shared, |state| {
+                    apply_pause_all_projection(state, remote_continue);
+                    Some(UiEvent::SnapshotChanged {
+                        snapshot: Box::new(state.snapshot.clone()),
+                    })
+                });
+                broadcast(
+                    &shared,
+                    UiEvent::Notice {
+                        tone: "neutral".into(),
+                        message: if remote_continue {
+                            format!(
+                                "Pausing {count} local monitor(s). Provider jobs continue remotely."
+                            )
+                        } else {
+                            format!("Pausing {count} local monitor(s).")
+                        },
+                    },
+                );
+                broadcast(
+                    &shared,
+                    UiEvent::BulkMonitorAcknowledged {
+                        action: "pause".into(),
+                        target_job_ids,
+                    },
+                );
+            }
+            ServiceEvent::ResumeAllStarted {
+                started,
+                skipped,
+                started_keys,
+                ..
+            } => {
+                let target_job_ids = shared
+                    .lock()
+                    .ok()
+                    .map(|state| {
+                        started_keys
+                            .iter()
+                            .filter_map(|key| state.job_ids.get(key).cloned())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                broadcast(
+                    &shared,
+                    UiEvent::BulkMonitorAcknowledged {
+                        action: "resume".into(),
+                        target_job_ids,
+                    },
+                );
+                broadcast(
+                    &shared,
+                    UiEvent::Notice {
+                        tone: if skipped > 0 { "warning" } else { "neutral" }.into(),
+                        message: format!("Resumed {started} job(s); skipped {skipped}."),
+                    },
+                );
+            }
             ServiceEvent::Cancelled {
                 provider_id: Some(provider_id),
                 job_id: Some(job_id),
@@ -3025,12 +3162,10 @@ fn add_remote_media(
 #[tauri::command]
 fn prepare_generation(
     draft: GenerationDraft,
-    allow_cross_provider_upload: Option<bool>,
     local_media_upload_confirmed: Option<bool>,
     state: State<'_, DesktopState>,
 ) -> Result<(), String> {
-    let allowed = allow_cross_provider_upload.unwrap_or(false)
-        || local_media_upload_confirmed.unwrap_or(false);
+    let local_media_upload_confirmed = local_media_upload_confirmed.unwrap_or(false);
     let mut shared = state
         .shared
         .lock()
@@ -3045,17 +3180,15 @@ fn prepare_generation(
         .media
         .iter()
         .any(|media| matches!(media.source, MediaSource::LocalFile { .. }));
-    let needs_cross_provider_upload = core.provider_id == ProviderId::openrouter() && has_local;
-    if needs_cross_provider_upload && !allowed {
-        return Err("Local-media staging was not confirmed. No files were uploaded.".into());
+    let upload_plan = local_media_upload_plan(&core.provider_id, has_local);
+    if upload_plan.requires_consent && !local_media_upload_confirmed {
+        return Err("Local-media upload was not confirmed. No files were uploaded.".into());
     }
-    let staging_provider_id = needs_cross_provider_upload.then(ProviderId::fal);
+    let staging_provider_id = upload_plan.staging_provider_id;
     let op_id = next_op_id();
     shared.pending_drafts.insert(op_id, draft.clone());
-    if needs_cross_provider_upload {
-        shared
-            .pending_disclosures
-            .insert(op_id, CROSS_PROVIDER_DISCLOSURE.into());
+    if let Some(disclosure) = upload_plan.disclosure {
+        shared.pending_disclosures.insert(op_id, disclosure.into());
     } else {
         shared.pending_disclosures.remove(&op_id);
     }
@@ -3255,7 +3388,7 @@ fn job_command(state: &DesktopState, job_id: &str, resume: bool) -> Result<Servi
         .jobs
         .iter()
         .find(|job| job.id == job_id)
-        .ok_or_else(|| "That render is no longer on the reel.".to_string())?;
+        .ok_or_else(|| "That video job is no longer in My videos.".to_string())?;
     if resume && !job.can_resume {
         return Err("That job is not currently resumable.".into());
     }
@@ -3285,9 +3418,50 @@ fn resume_job(job_id: String, state: State<'_, DesktopState>) -> Result<(), Stri
     queue(&state, job_command(&state, &job_id, true)?)
 }
 
+fn bulk_job_command(state: &DesktopState, resume: bool) -> Result<ServiceCommand, String> {
+    let shared = state
+        .shared
+        .lock()
+        .map_err(|_| "The desktop session is unavailable.".to_string())?;
+    let eligible = shared.snapshot.jobs.iter().any(|job| {
+        if resume {
+            job.can_resume
+        } else {
+            job.can_pause
+        }
+    });
+    if !eligible {
+        return Err(if resume {
+            "There are no paused or recoverable jobs to resume."
+        } else {
+            "There are no active monitors to pause."
+        }
+        .into());
+    }
+    Ok(if resume {
+        ServiceCommand::ResumeAll {
+            op_id: next_op_id(),
+        }
+    } else {
+        ServiceCommand::PauseAll {
+            op_id: next_op_id(),
+        }
+    })
+}
+
+#[tauri::command]
+fn pause_all_jobs(state: State<'_, DesktopState>) -> Result<(), String> {
+    queue(&state, bulk_job_command(&state, false)?)
+}
+
+#[tauri::command]
+fn resume_all_jobs(state: State<'_, DesktopState>) -> Result<(), String> {
+    queue(&state, bulk_job_command(&state, true)?)
+}
+
 fn verified_output(shared: &Shared, job_id: &str) -> Result<PathBuf, String> {
     if shared.deletion_pending.contains(job_id) {
-        return Err("This render is being removed from the reel.".into());
+        return Err("This video job is being removed from My videos.".into());
     }
     let path = shared
         .jobs
@@ -3325,19 +3499,19 @@ async fn delete_render(
             .jobs
             .iter()
             .find(|job| job.id == job_id)
-            .ok_or_else(|| "That render is no longer on the reel.".to_string())?;
+            .ok_or_else(|| "That video job is no longer in My videos.".to_string())?;
         if !job.deletable {
-            return Err("Only finished renders can be removed from the reel.".into());
+            return Err("Only finished video jobs can be removed from My videos.".into());
         }
         if shared.deletion_pending.contains(&job_id) {
-            return Err("That render is already being removed.".into());
+            return Err("That video job is already being removed.".into());
         }
         if shared
             .playback_grants
             .values()
             .any(|grant| grant.job_id == job_id)
         {
-            return Err("Stop the in-app video before removing this render.".into());
+            return Err("Stop the in-app video before removing this video job.".into());
         }
         let key = shared
             .jobs
@@ -3366,15 +3540,11 @@ async fn delete_render(
 
     reply_rx
         .await
-        .map_err(|_| "The render service stopped before confirming cleanup.".to_string())?
+        .map_err(|_| "The background service stopped before confirming cleanup.".to_string())?
 }
 
 #[tauri::command]
-fn open_output(
-    app: AppHandle,
-    job_id: String,
-    state: State<'_, DesktopState>,
-) -> Result<(), String> {
+fn open_output(job_id: String, state: State<'_, DesktopState>) -> Result<(), String> {
     let path = {
         let shared = state
             .shared
@@ -3382,8 +3552,9 @@ fn open_output(
             .map_err(|_| "The desktop session is unavailable.".to_string())?;
         verified_output(&shared, &job_id)?
     };
-    app.opener()
-        .open_path(path.to_string_lossy().into_owned(), None::<String>)
+    // The plugin's free Rust API accepts an OS path. Avoid converting through
+    // UTF-8 so Windows UTF-16 paths and unusual Unix file names remain exact.
+    tauri_plugin_opener::open_path(&path, None::<&str>)
         .map_err(|_| "The system could not open that video.".into())
 }
 
@@ -3416,6 +3587,45 @@ fn remove_playback_file(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// Materialize a renderer-scoped playback file without ever overwriting an
+/// existing path. Hard links are effectively free, but Windows users often
+/// redirect Videos to another volume and macOS users may keep it on external
+/// storage. In those cases a private cache copy keeps in-app playback working.
+fn materialize_playback_file(source: &Path, target: &Path) -> io::Result<()> {
+    match std::fs::hard_link(source, target) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Err(error),
+        Err(_) => {}
+    }
+
+    copy_playback_file(source, target)
+}
+
+fn copy_playback_file(source: &Path, target: &Path) -> io::Result<()> {
+    let mut created = false;
+    let result = (|| -> io::Result<()> {
+        let mut input = std::fs::File::open(source)?;
+        let expected_length = input.metadata()?.len();
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)?;
+        created = true;
+        let copied = io::copy(&mut input, &mut output)?;
+        if copied != expected_length {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the playback copy changed length while it was being prepared",
+            ));
+        }
+        output.sync_all()
+    })();
+    if result.is_err() && created {
+        let _ = remove_playback_file(target);
+    }
+    result
 }
 
 /// Removes hard links left behind by a previous process without following
@@ -3498,12 +3708,12 @@ fn finish_playback_release(shared: &mut Shared, grant_id: &str, path: &Path) -> 
 }
 
 #[tauri::command]
-fn grant_playback(
+async fn grant_playback(
     app: AppHandle,
     job_id: String,
     state: State<'_, DesktopState>,
 ) -> Result<PlaybackGrant, String> {
-    let (grant_id, link) = {
+    let (grant_id, source, link) = {
         let mut shared = state
             .shared
             .lock()
@@ -3524,10 +3734,6 @@ fn grant_playback(
             .and_then(|value| value.to_str())
             .unwrap_or("mp4");
         let link = shared.playback_dir.join(format!("{grant_id}.{extension}"));
-        std::fs::hard_link(&source, &link).map_err(|_| {
-            "Secure inline playback is unavailable for this filesystem; use Open file instead."
-                .to_string()
-        })?;
         shared.playback_grants.insert(
             grant_id.clone(),
             PlaybackGrantState {
@@ -3535,8 +3741,36 @@ fn grant_playback(
                 job_id: job_id.clone(),
             },
         );
-        (grant_id, link)
+        (grant_id, source, link)
     };
+
+    let source_for_copy = source.clone();
+    let link_for_copy = link.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        materialize_playback_file(&source_for_copy, &link_for_copy)
+    })
+    .await
+    .map_err(|_| io::Error::other("the playback worker stopped unexpectedly"))
+    .and_then(|result| result);
+    if prepared.is_err() {
+        // `materialize_playback_file` removes only a partial it created. Do
+        // not remove `link` here: an AlreadyExists failure means that path
+        // predated this request and is not ours to destroy.
+        state
+            .shared
+            .lock()
+            .map_err(|_| "The desktop session is unavailable.".to_string())
+            .map(|mut shared| {
+                if shared
+                    .playback_grants
+                    .get(&grant_id)
+                    .is_some_and(|registered| registered.path == link)
+                {
+                    shared.playback_grants.remove(&grant_id);
+                }
+            })?;
+        return Err("Secure inline playback could not be prepared; use Open file instead.".into());
+    }
     if app.asset_protocol_scope().allow_file(&link).is_err() {
         let rollback = state
             .shared
@@ -3591,6 +3825,80 @@ fn release_playback(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_local_media_path_requires_provider_specific_upload_consent() {
+        let direct_fal = local_media_upload_plan(&ProviderId::fal(), true);
+        assert!(direct_fal.requires_consent);
+        assert_eq!(direct_fal.staging_provider_id, None);
+        assert_eq!(direct_fal.disclosure, Some(DIRECT_FAL_DISCLOSURE));
+
+        let openrouter = local_media_upload_plan(&ProviderId::openrouter(), true);
+        assert!(openrouter.requires_consent);
+        assert_eq!(openrouter.staging_provider_id, Some(ProviderId::fal()));
+        assert_eq!(openrouter.disclosure, Some(CROSS_PROVIDER_DISCLOSURE));
+
+        let remote_only = local_media_upload_plan(&ProviderId::fal(), false);
+        assert!(!remote_only.requires_consent);
+        assert_eq!(remote_only.staging_provider_id, None);
+        assert_eq!(remote_only.disclosure, None);
+    }
+
+    fn command_set(source: &str, start: &str, end: &str, quoted: bool) -> HashSet<String> {
+        // This test's own source contains the invoke-handler marker as a
+        // string literal. Select the final occurrence so we parse the real
+        // application registration below, not this helper call.
+        let section = source
+            .rsplit_once(start)
+            .unwrap_or_else(|| panic!("missing command-list start marker: {start}"))
+            .1
+            .split_once(end)
+            .unwrap_or_else(|| panic!("missing command-list end marker: {end}"))
+            .0;
+        section
+            .lines()
+            .filter_map(|line| {
+                let item = line.trim().trim_end_matches(',');
+                if item.is_empty() || item.starts_with("//") {
+                    return None;
+                }
+                let item = if quoted {
+                    item.strip_prefix('"')?.strip_suffix('"')?
+                } else {
+                    item
+                };
+                Some(item.to_owned())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ipc_handler_build_manifest_and_permission_allowlist_stay_in_lockstep() {
+        let handler = command_set(
+            include_str!("lib.rs"),
+            ".invoke_handler(tauri::generate_handler![",
+            "])",
+            false,
+        );
+        let build_manifest = command_set(
+            include_str!("../build.rs"),
+            "const IPC_COMMANDS: &[&str] = &[",
+            "];",
+            true,
+        );
+        let permission = command_set(
+            include_str!("../permissions/service-facade.toml"),
+            "commands.allow = [",
+            "]",
+            true,
+        );
+
+        assert_eq!(
+            handler, build_manifest,
+            "invoke handler and build ACL differ"
+        );
+        assert_eq!(handler, permission, "invoke handler and permission differ");
+    }
 
     #[test]
     fn renderer_messages_remove_url_tokens_credentials_and_controls() {
@@ -3827,6 +4135,28 @@ mod tests {
         assert!(
             !pause_projection_allowed(&terminal),
             "a late pause acknowledgement must not regress a terminal job"
+        );
+    }
+
+    #[test]
+    fn pause_all_projection_waits_for_actor_stop_before_enabling_resume() {
+        let mut shared = Shared::new(PathBuf::from("videos"), PathBuf::from("playback"));
+        let record = record_fixture("processing", None);
+        let key = record.key();
+        shared.active_monitors.insert(key.clone());
+        let job = job_from_record(&mut shared, &record);
+        shared.snapshot.jobs.push(job);
+
+        assert_eq!(apply_pause_all_projection(&mut shared, true), 1);
+        assert!(!shared.active_monitors.contains(&key));
+        assert_eq!(shared.pausing_monitors.get(&key), Some(&true));
+        let projected = &shared.snapshot.jobs[0];
+        assert_eq!(projected.status_label, "Pausing monitoring");
+        assert_eq!(projected.monitor_state, MonitorState::Paused);
+        assert!(!projected.can_pause);
+        assert!(
+            !projected.can_resume,
+            "only MonitorStopped may make a paused job resumable"
         );
     }
 
@@ -4190,6 +4520,50 @@ mod tests {
     }
 
     #[test]
+    fn playback_copy_fallback_is_complete_and_never_overwrites() {
+        let root = std::env::temp_dir().join(format!("video-harness-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create fixture directory");
+        let source = root.join("finished.mp4");
+        let target = root.join("playback-copy.mp4");
+        let occupied = root.join("playback-owned-by-someone-else.mp4");
+        std::fs::write(&source, b"cross-volume-video-fixture").expect("create source video");
+
+        copy_playback_file(&source, &target).expect("copy playback fallback");
+        assert_eq!(
+            std::fs::read(&target).expect("read playback copy"),
+            b"cross-volume-video-fixture"
+        );
+
+        std::fs::write(&occupied, b"keep-this-file").expect("create occupied path");
+        assert_eq!(
+            copy_playback_file(&source, &occupied)
+                .expect_err("an existing path must not be overwritten")
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            std::fs::read(&occupied).expect("read occupied path"),
+            b"keep-this-file"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn playback_urls_match_the_tauri_asset_protocol_for_this_platform() {
+        let path = Path::new("Video Harness/test clip.mp4");
+        let url = playback_url(path);
+        if cfg!(windows) {
+            assert_eq!(
+                url,
+                "http://asset.localhost/Video%20Harness%2Ftest%20clip%2Emp4"
+            );
+        } else {
+            assert_eq!(url, "asset://localhost/Video%20Harness%2Ftest%20clip%2Emp4");
+        }
+    }
+
+    #[test]
     fn failed_playback_release_keeps_the_handle_for_retry() {
         let root = std::env::temp_dir().join(format!("video-harness-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create fixture directory");
@@ -4418,9 +4792,9 @@ pub fn run() {
         .setup(|app| {
             let resolver = app.path();
             let videos_dir = resolver.video_dir()?;
-            // Existing Linux releases deliberately keep their historical XDG
-            // storage identity so history, drafts, upload receipts, and
-            // keyring records remain available during the shell migration.
+            // Linux releases keep their historical XDG storage identity so
+            // history, drafts, upload receipts, and keyring records remain
+            // available across desktop-shell upgrades.
             #[cfg(target_os = "linux")]
             let paths = AppPaths::new(
                 resolver.data_dir()?.join(APP_NAME),
@@ -4484,6 +4858,8 @@ pub fn run() {
             save_draft_and_close,
             pause_job,
             resume_job,
+            pause_all_jobs,
+            resume_all_jobs,
             delete_render,
             open_output,
             grant_playback,

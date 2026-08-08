@@ -1,4 +1,4 @@
-name: Portable Linux release
+name: Signed desktop release
 
 on:
   push:
@@ -16,17 +16,21 @@ jobs:
   verify:
     name: Verify release tag, CI, and metadata
     runs-on: ubuntu-24.04
-    timeout-minutes: 100
+    timeout-minutes: 130
+    outputs:
+      tag_commit: ${{ steps.release_tag.outputs.tag_commit }}
+      tag_object: ${{ steps.release_tag.outputs.tag_object }}
     permissions:
       actions: read
       contents: read
     steps:
       - name: Check out source and tag
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - name: Require an unsigned annotated tag from main
+      - name: Require an annotated tag from main
+        id: release_tag
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
@@ -47,9 +51,13 @@ jobs:
           TAG_REASON="$(gh api \
             "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT}" \
             --jq '.verification.reason')"
-          if [[ "${TAG_REASON}" != unsigned ]]; then
-            fail "${RELEASE_TAG} must be unsigned; GitHub reports ${TAG_REASON}"
-          fi
+          case "${TAG_REASON}" in
+            valid) echo "GitHub verified the release tag signature." ;;
+            unsigned)
+              echo "::warning title=Unsigned release tag::Repository tag protection and the protected release environment remain mandatory."
+              ;;
+            *) fail "${RELEASE_TAG} tag verification failed: ${TAG_REASON}" ;;
+          esac
           TAG_TARGET_TYPE="$(gh api \
             "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT}" \
             --jq '.object.type')"
@@ -63,7 +71,14 @@ jobs:
           if ! git merge-base --is-ancestor "${TAG_COMMIT}" FETCH_HEAD; then
             fail "${RELEASE_TAG} is not attached to a commit on main"
           fi
+          git checkout --detach "${TAG_COMMIT}"
+          [[ "$(git rev-parse HEAD)" == "${TAG_COMMIT}" ]] \
+            || fail "could not check out the verified release commit"
           echo "TAG_COMMIT=${TAG_COMMIT}" >>"${GITHUB_ENV}"
+          {
+            echo "tag_commit=${TAG_COMMIT}"
+            echo "tag_object=${TAG_OBJECT}"
+          } >>"${GITHUB_OUTPUT}"
 
       - name: Require successful full CI for the exact tagged commit
         env:
@@ -83,19 +98,24 @@ jobs:
               --jq '.workflow_runs
                 | sort_by(.run_number)
                 | last // empty
-                | "\(.id)\t\(.head_sha)\t\(.status)\t\(.conclusion // \"\")\t\(.html_url)"')"
+                | "\(.id)\t\(.head_sha)\t\(.status)\t\(.conclusion // \"pending\")\t\(.updated_at)\t\(.html_url)"')"
             if [[ -z "${run_record}" ]]; then
               echo "Waiting for a CI push run for ${TAG_COMMIT}..."
               sleep 15
               continue
             fi
-            IFS=$'\t' read -r run_id run_sha run_status run_conclusion run_url \
+            IFS=$'\t' read -r run_id run_sha run_status run_conclusion run_updated_at run_url \
               <<<"${run_record}"
             [[ "${run_sha}" == "${TAG_COMMIT}" ]] \
               || fail "GitHub returned CI for unexpected commit ${run_sha}"
             if [[ "${run_status}" == completed ]]; then
               [[ "${run_conclusion}" == success ]] \
                 || fail "CI run ${run_id} concluded ${run_conclusion}: ${run_url}"
+              run_updated_epoch="$(date --date="${run_updated_at}" +%s)" \
+                || fail "CI run ${run_id} has an invalid updated_at value"
+              oldest_allowed_epoch="$(( $(date -u +%s) - 7 * 24 * 60 * 60 ))"
+              (( run_updated_epoch >= oldest_allowed_epoch )) \
+                || fail "CI run ${run_id} is older than seven days; rerun it before releasing: ${run_url}"
               echo "Exact tagged commit passed full CI: ${run_url}"
               exit 0
             fi
@@ -113,6 +133,33 @@ jobs:
       - name: Match tag and release metadata
         run: packaging/check-release-version.sh "${GITHUB_REF_NAME}"
 
+      - name: Install Rust 1.95 for the release-time advisory check
+        run: rustup toolchain install 1.95 --profile minimal
+
+      - name: Install pinned cargo-audit
+        env:
+          RUSTUP_TOOLCHAIN: "1.95"
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit both locked Rust dependency graphs again
+        env:
+          RUSTUP_TOOLCHAIN: "1.95"
+        run: |
+          .github/scripts/audit-rust-lockfile.sh native/Cargo.toml native/Cargo.lock
+          .github/scripts/audit-rust-lockfile.sh \
+            desktop/src-tauri/Cargo.toml desktop/src-tauri/Cargo.lock
+
+      - name: Install Node.js 24.18.0 for the release-time advisory check
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Audit the locked UI dependency graph again
+        working-directory: ui
+        run: npm audit --package-lock-only --audit-level=high
+
       - name: Refuse to replace an existing release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -123,7 +170,7 @@ jobs:
             exit 1
           fi
 
-  build:
+  build-linux:
     name: Build portable Linux executable (${{ matrix.arch }})
     needs: verify
     strategy:
@@ -140,13 +187,16 @@ jobs:
       contents: read
     steps:
       - name: Check out source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.tag_commit }}
 
       - name: Install AppImage build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential \
+            curl \
             file \
             gstreamer1.0-libav \
             gstreamer1.0-plugins-bad \
@@ -168,7 +218,7 @@ jobs:
         run: rustup toolchain install 1.95 --profile minimal
 
       - name: Install Node.js 24.18.0
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24.18.0
           cache: npm
@@ -191,16 +241,367 @@ jobs:
             desktop/src-tauri/Cargo.lock native/Cargo.lock ui/package-lock.json
 
       - name: Upload portable executable
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: appimage-${{ matrix.arch }}
+          name: release-linux-${{ matrix.arch }}
           path: dist/Video-Harness-*-linux-${{ matrix.arch }}.AppImage
           if-no-files-found: error
           retention-days: 7
 
+  build-windows:
+    name: Signed Windows installers (x86_64)
+    needs: verify
+    runs-on: windows-2025
+    timeout-minutes: 90
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.tag_commit }}
+
+      - name: Install Rust 1.95
+        run: rustup toolchain install 1.95 --profile minimal
+
+      - name: Install Node.js 24.18.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build locked desktop UI
+        working-directory: ui
+        run: npm ci && npm run build
+
+      - name: Import the Authenticode certificate
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)) {
+            throw "release secret WINDOWS_CERTIFICATE is not configured"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            throw "release secret WINDOWS_CERTIFICATE_PASSWORD is not configured"
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP "video-harness-signing.pfx"
+          $configPath = Join-Path $env:RUNNER_TEMP "tauri-signing.json"
+          "WINDOWS_PFX_PATH=$pfxPath" | Out-File `
+            -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WINDOWS_TAURI_CONFIG=$configPath" | Out-File `
+            -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $bytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          [IO.File]::WriteAllBytes($pfxPath, $bytes)
+          $password = ConvertTo-SecureString `
+            $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $imported = @()
+          try {
+            $imported = @(Import-PfxCertificate -FilePath $pfxPath `
+              -CertStoreLocation "Cert:\CurrentUser\My" -Password $password)
+            $thumbprints = ($imported | ForEach-Object { $_.Thumbprint }) -join ","
+            "WINDOWS_IMPORTED_THUMBPRINTS=$thumbprints" | Out-File `
+              -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } catch {
+            foreach ($certificate in $imported) {
+              Remove-Item -LiteralPath `
+                "Cert:\CurrentUser\My\$($certificate.Thumbprint)" `
+                -Force -ErrorAction SilentlyContinue
+            }
+            Remove-Item -LiteralPath $pfxPath, $configPath `
+              -Force -ErrorAction SilentlyContinue
+            throw
+          }
+          $certificate = $imported | Where-Object { $_.HasPrivateKey } | Select-Object -First 1
+          if ($null -eq $certificate) {
+            throw "the imported PFX contains no code-signing private key"
+          }
+          $codeSigningOid = "1.3.6.1.5.5.7.3.3"
+          if ($certificate.NotBefore -gt (Get-Date) -or $certificate.NotAfter -le (Get-Date)) {
+            throw "the Authenticode certificate is not currently valid"
+          }
+          if ($certificate.EnhancedKeyUsageList.ObjectId.Value -notcontains $codeSigningOid) {
+            throw "the imported certificate is not valid for code signing"
+          }
+          $config = @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $certificate.Thumbprint
+              }
+            }
+          } | ConvertTo-Json -Depth 4
+          [IO.File]::WriteAllText($configPath, $config)
+
+      - name: Build signed NSIS and MSI installers
+        working-directory: desktop
+        shell: bash
+        run: >-
+          ../ui/node_modules/.bin/tauri build
+          --ci --bundles nsis,msi
+          --config "${WINDOWS_TAURI_CONFIG}" -- --locked
+
+      - name: Verify the bundled Microsoft WebView2 runtime
+        shell: pwsh
+        run: >-
+          ./packaging/verify-webview2-offline-installer.ps1
+          -TargetDirectory desktop/src-tauri/target
+
+      - name: Verify signatures and collect Windows release assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $binary = Get-Item `
+            "desktop/src-tauri/target/release/video-harness.exe"
+          $nsis = @(Get-ChildItem `
+            "desktop/src-tauri/target/release/bundle/nsis" `
+            -File -Filter "*.exe")
+          $msi = @(Get-ChildItem `
+            "desktop/src-tauri/target/release/bundle/msi" `
+            -File -Filter "*.msi")
+          if ($nsis.Count -ne 1 -or $msi.Count -ne 1) {
+            throw "expected one signed NSIS installer and one signed MSI"
+          }
+          & $binary.FullName --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "signed release executable version smoke failed"
+          }
+          foreach ($file in @($binary) + $nsis + $msi) {
+            $signature = Get-AuthenticodeSignature -FilePath $file.FullName
+            if ($signature.Status -ne "Valid") {
+              throw "$($file.Name) has invalid Authenticode status: $($signature.Status) $($signature.StatusMessage)"
+            }
+            if ($null -eq $signature.TimeStamperCertificate) {
+              throw "$($file.Name) has no trusted Authenticode timestamp"
+            }
+          }
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          $destination = Join-Path $env:RUNNER_TEMP "windows-release"
+          New-Item -ItemType Directory -Force $destination | Out-Null
+          Copy-Item -LiteralPath $nsis[0].FullName -Destination `
+            (Join-Path $destination "Video-Harness-$version-windows-x86_64-setup.exe")
+          Copy-Item -LiteralPath $msi[0].FullName -Destination `
+            (Join-Path $destination "Video-Harness-$version-windows-x86_64.msi")
+
+      - name: Require reproducible lockfiles
+        shell: bash
+        run: >-
+          git diff --exit-code --
+          desktop/src-tauri/Cargo.lock
+          native/Cargo.lock
+          ui/package-lock.json
+
+      - name: Upload signed Windows installers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-windows-x86_64
+          path: ${{ runner.temp }}/windows-release/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove imported Windows signing material
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:WINDOWS_IMPORTED_THUMBPRINTS) {
+            foreach ($thumbprint in $env:WINDOWS_IMPORTED_THUMBPRINTS.Split(',')) {
+              $path = "Cert:\CurrentUser\My\$thumbprint"
+              if (Test-Path -LiteralPath $path) {
+                Remove-Item -LiteralPath $path -Force
+              }
+            }
+          }
+          Remove-Item -LiteralPath `
+            ($env:WINDOWS_PFX_PATH ?? (Join-Path $env:RUNNER_TEMP "video-harness-signing.pfx")) `
+            -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath `
+            ($env:WINDOWS_TAURI_CONFIG ?? (Join-Path $env:RUNNER_TEMP "tauri-signing.json")) `
+            -Force -ErrorAction SilentlyContinue
+
+  build-macos:
+    name: Signed and notarized macOS disk image (${{ matrix.arch }})
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-26-intel
+          - arch: aarch64
+            runner: macos-26
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.tag_commit }}
+
+      - name: Install Rust 1.95
+        run: rustup toolchain install 1.95 --profile minimal
+
+      - name: Install Node.js 24.18.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build locked desktop UI
+        working-directory: ui
+        run: npm ci && npm run build
+
+      - name: Import the Developer ID certificate and notarization key
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          set -euo pipefail
+          require_secret() {
+            local name="$1"
+            local value="$2"
+            if [[ -z "${value}" ]]; then
+              echo "::error title=Release signing is not configured::Missing secret: ${name}"
+              exit 1
+            fi
+          }
+          require_secret APPLE_CERTIFICATE "${APPLE_CERTIFICATE}"
+          require_secret APPLE_CERTIFICATE_PASSWORD "${APPLE_CERTIFICATE_PASSWORD}"
+          require_secret APPLE_SIGNING_IDENTITY "${APPLE_SIGNING_IDENTITY}"
+          require_secret APPLE_API_ISSUER "${APPLE_API_ISSUER}"
+          require_secret APPLE_API_KEY "${APPLE_API_KEY}"
+          require_secret APPLE_API_KEY_CONTENT "${APPLE_API_KEY_CONTENT}"
+          if [[ ! "${APPLE_API_KEY}" =~ ^[[:alnum:]]{10}$ ]]; then
+            echo "::error title=Release signing is invalid::APPLE_API_KEY must be a 10-character App Store Connect key ID"
+            exit 1
+          fi
+          if [[ ! "${APPLE_API_ISSUER}" =~ ^[[:xdigit:]-]{36}$ ]]; then
+            echo "::error title=Release signing is invalid::APPLE_API_ISSUER must be an App Store Connect issuer UUID"
+            exit 1
+          fi
+          p12_path="${RUNNER_TEMP}/video-harness-signing.p12"
+          api_key_path="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY}.p8"
+          keychain_path="${RUNNER_TEMP}/video-harness-signing.keychain-db"
+          original_keychains="${RUNNER_TEMP}/original-keychains.txt"
+          {
+            echo "APPLE_API_KEY_PATH=${api_key_path}"
+            echo "APPLE_TEMP_KEYCHAIN=${keychain_path}"
+            echo "APPLE_P12_PATH=${p12_path}"
+            echo "APPLE_ORIGINAL_KEYCHAINS=${original_keychains}"
+          } >>"${GITHUB_ENV}"
+          P12_PATH="${p12_path}" python3 -c \
+            'import base64, os; data="".join(os.environ["APPLE_CERTIFICATE"].split()); open(os.environ["P12_PATH"], "wb").write(base64.b64decode(data, validate=True))'
+          API_KEY_PATH="${api_key_path}" python3 -c \
+            'import base64, os; data="".join(os.environ["APPLE_API_KEY_CONTENT"].split()); open(os.environ["API_KEY_PATH"], "wb").write(base64.b64decode(data, validate=True))'
+          chmod 600 "${p12_path}" "${api_key_path}"
+          security list-keychains -d user \
+            | tr -d '"' \
+            | sed 's/^[[:space:]]*//' >"${original_keychains}"
+          keychain_password="$(openssl rand -hex 32)"
+          echo "::add-mask::${keychain_password}"
+          security create-keychain -p "${keychain_password}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${keychain_password}" "${keychain_path}"
+          existing_keychains=()
+          while IFS= read -r existing; do
+            [[ -n "${existing}" ]] && existing_keychains+=("${existing}")
+          done <"${original_keychains}"
+          security list-keychains -d user -s \
+            "${keychain_path}" "${existing_keychains[@]}"
+          security import "${p12_path}" \
+            -k "${keychain_path}" \
+            -P "${APPLE_CERTIFICATE_PASSWORD}" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "${keychain_password}" "${keychain_path}"
+          security find-identity -v -p codesigning "${keychain_path}" \
+            | grep -F -- "${APPLE_SIGNING_IDENTITY}"
+
+      - name: Build, sign, notarize, and staple the macOS release
+        working-directory: desktop
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: >-
+          ../ui/node_modules/.bin/tauri build
+          --ci --bundles app,dmg -- --locked
+
+      - name: Verify notarization and collect the macOS release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          apps=(desktop/src-tauri/target/release/bundle/macos/*.app)
+          images=(desktop/src-tauri/target/release/bundle/dmg/*.dmg)
+          [[ "${#apps[@]}" -eq 1 && -d "${apps[0]}" ]]
+          [[ "${#images[@]}" -eq 1 && -f "${images[0]}" ]]
+          app_path="${apps[0]}"
+          dmg_path="${images[0]}"
+          "${app_path}/Contents/MacOS/video-harness" --version
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+          spctl --assess --type execute --verbose=2 "${app_path}"
+          xcrun stapler validate "${app_path}"
+          xcrun stapler validate "${dmg_path}"
+          hdiutil verify "${dmg_path}"
+          destination="${RUNNER_TEMP}/macos-release"
+          mkdir -p "${destination}"
+          cp "${dmg_path}" \
+            "${destination}/Video-Harness-${GITHUB_REF_NAME#v}-macos-${{ matrix.arch }}.dmg"
+
+      - name: Require reproducible lockfiles
+        shell: bash
+        run: >-
+          git diff --exit-code --
+          desktop/src-tauri/Cargo.lock
+          native/Cargo.lock
+          ui/package-lock.json
+
+      - name: Upload signed and notarized macOS disk image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-macos-${{ matrix.arch }}
+          path: ${{ runner.temp }}/macos-release/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove imported Apple signing material
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [[ -f "${APPLE_ORIGINAL_KEYCHAINS:-}" ]]; then
+            existing_keychains=()
+            while IFS= read -r existing; do
+              [[ -n "${existing}" ]] && existing_keychains+=("${existing}")
+            done <"${APPLE_ORIGINAL_KEYCHAINS}"
+            if (( ${#existing_keychains[@]} > 0 )); then
+              security list-keychains -d user -s "${existing_keychains[@]}"
+            fi
+          fi
+          [[ -n "${APPLE_TEMP_KEYCHAIN:-}" ]] \
+            && security delete-keychain "${APPLE_TEMP_KEYCHAIN}"
+          rm -f \
+            "${APPLE_P12_PATH:-${RUNNER_TEMP}/video-harness-signing.p12}" \
+            "${APPLE_API_KEY_PATH:-}" \
+            "${APPLE_ORIGINAL_KEYCHAINS:-}"
+
   runtime-smoke:
     name: Clean AppImage runtime (${{ matrix.arch }})
-    needs: build
+    needs: [verify, build-linux]
     strategy:
       fail-fast: false
       matrix:
@@ -252,12 +653,14 @@ jobs:
             zlib1g
 
       - name: Check out smoke-test script
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.tag_commit }}
 
       - name: Download matching portable executable
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: appimage-${{ matrix.arch }}
+          name: release-linux-${{ matrix.arch }}
           path: appimage-under-test
 
       - name: Decode bundled media and require a visible application window
@@ -279,9 +682,35 @@ jobs:
             packaging/smoke-appimage-gui.sh \
               appimage-under-test/Video-Harness-*.AppImage
 
+  release-publication-approval:
+    name: Approve publication after signed hardware checks
+    needs:
+      - verify
+      - build-linux
+      - runtime-smoke
+      - build-windows
+      - build-macos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Record the protected publication approval
+        run: >-
+          echo "Signed installers are built and verified; the protected
+          environment reviewer approved publication after the documented
+          real-hardware checks."
+
   publish:
-    name: Publish portable executables
-    needs: [verify, build, runtime-smoke]
+    name: Publish verified desktop installers
+    needs:
+      - verify
+      - build-linux
+      - runtime-smoke
+      - build-windows
+      - build-macos
+      - release-publication-approval
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -290,14 +719,15 @@ jobs:
       attestations: write
     steps:
       - name: Check out the exact release source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.verify.outputs.tag_commit }}
           persist-credentials: false
 
-      - name: Download both architecture builds
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - name: Download all verified platform builds
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: appimage-*
+          pattern: release-*
           path: release-assets
           merge-multiple: true
 
@@ -313,11 +743,20 @@ jobs:
 
       - name: Validate release inputs and write checksums
         run: |
+          set -euo pipefail
           mapfile -t appimages < <(find release-assets -maxdepth 1 \
             -type f -name 'Video-Harness-*.AppImage' -print | sort)
           [[ "${#appimages[@]}" -eq 2 ]]
           test -f "release-assets/Video-Harness-${GITHUB_REF_NAME#v}-linux-x86_64.AppImage"
           test -f "release-assets/Video-Harness-${GITHUB_REF_NAME#v}-linux-aarch64.AppImage"
+          test -f "release-assets/Video-Harness-${GITHUB_REF_NAME#v}-windows-x86_64-setup.exe"
+          test -f "release-assets/Video-Harness-${GITHUB_REF_NAME#v}-windows-x86_64.msi"
+          test -f "release-assets/Video-Harness-${GITHUB_REF_NAME#v}-macos-x86_64.dmg"
+          test -f "release-assets/Video-Harness-${GITHUB_REF_NAME#v}-macos-aarch64.dmg"
+          installer_count="$(find release-assets -maxdepth 1 -type f \
+            \( -name '*.AppImage' -o -name '*.exe' -o -name '*.msi' -o -name '*.dmg' \) \
+            -print | wc -l)"
+          [[ "${installer_count}" -eq 6 ]]
           test -s "release-assets/Video-Harness-${GITHUB_REF_NAME}.spdx.json"
           (
             cd release-assets
@@ -325,16 +764,35 @@ jobs:
           )
 
       - name: Attest release artifacts
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: release-assets/*
 
       - name: Create GitHub release
         env:
+          EXPECTED_TAG_COMMIT: ${{ needs.verify.outputs.tag_commit }}
+          EXPECTED_TAG_OBJECT: ${{ needs.verify.outputs.tag_object }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" release-assets/* \
+          set -euo pipefail
+          current_object="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
+            --jq '.object.sha')"
+          current_commit="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/tags/${current_object}" \
+            --jq '.object.sha')"
+          [[ "${current_object}" == "${EXPECTED_TAG_OBJECT}" ]] || {
+            echo "::error title=Release tag changed::${RELEASE_TAG} moved after verification"
+            exit 1
+          }
+          [[ "${current_commit}" == "${EXPECTED_TAG_COMMIT}" ]] || {
+            echo "::error title=Release commit changed::${RELEASE_TAG} no longer names the verified commit"
+            exit 1
+          }
+          [[ "$(git rev-parse HEAD)" == "${EXPECTED_TAG_COMMIT}" ]]
+          gh release create "${RELEASE_TAG}" release-assets/* \
             --verify-tag \
-            --title "Video Harness ${GITHUB_REF_NAME#v}" \
+            --title "Video Harness ${RELEASE_TAG#v}" \
             --generate-notes

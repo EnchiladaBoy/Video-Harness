@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Video Harness",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "identifier": "io.github.EnchiladaBoy.VideoHarness",
   "build": {
     "frontendDist": "../../ui/dist"
@@ -31,6 +31,10 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "useLocalToolsDir": true,
+    "publisher": "EnchiladaBoy",
+    "homepage": "https://github.com/EnchiladaBoy/Video-Harness",
+    "license": "MIT",
     "icon": [
       "icons/icon.png",
       "icons/32x32.png",
@@ -42,6 +46,7 @@
     ],
     "category": "Video",
     "shortDescription": "Create AI videos across providers",
+    "longDescription": "A local-first desktop workspace for creating and safely tracking AI video generations across providers.",
     "linux": {
       "appimage": {
         "bundleMediaFramework": true

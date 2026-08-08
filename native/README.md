@@ -2,13 +2,13 @@
 
 This directory contains the provider workflows, safety checks, persistence,
 downloads, and platform-neutral application services used by Video Harness
-v0.7.0. The stable desktop interface lives in [`../ui`](../ui) and is hosted by
+v0.7.1. The stable desktop interface lives in [`../ui`](../ui) and is hosted by
 Tauri from [`../desktop/src-tauri`](../desktop/src-tauri).
 
 The older GTK4/libadwaita frontend is retained behind the `legacy-gtk` feature
-as a compatibility and developer fallback. It is not the stable v0.7.0
-frontend or the default release package. See the
-[project README](../README.md) for installation and normal desktop development.
+as a deprecated, maintenance-only developer tool. It is not a supported
+release frontend. See [LEGACY-GTK.md](LEGACY-GTK.md) for the parity audit and
+removal policy, and the [project README](../README.md) for normal desktop use.
 
 ## Build and test the portable engine
 
@@ -23,14 +23,15 @@ cargo clippy --locked --lib --tests --no-default-features -- -D warnings
 cargo test --locked --lib --tests --no-default-features
 ```
 
-These are the core commands used for Linux, Windows x64, and macOS x64 checks.
-Only x86_64 and aarch64 Linux are packaged release targets today.
+These are the core commands used for Linux, Windows x64, macOS Intel, and
+macOS Apple Silicon checks. Supported packages are produced by the canonical
+Tauri/Svelte application, not this crate's legacy frontend.
 
 Tests use temporary databases, deterministic transports, and in-memory
 credentials. They do not read the user's keyring, contact a paid inference
 endpoint, or submit a real generation.
 
-## Legacy GTK fallback
+## Deprecated GTK frontend
 
 Building the compatibility frontend requires a C toolchain, GTK 4.10 or newer,
 and libadwaita 1.6 or newer. Package names vary by distribution:
@@ -49,8 +50,8 @@ sudo pacman -S base-devel gtk4 libadwaita
 Build, run, or test it explicitly with the `legacy-gtk` feature:
 
 ```bash
-cargo build --release --locked --features legacy-gtk --bin video-harness
-cargo run --locked --features legacy-gtk --bin video-harness
+cargo build --release --locked --features legacy-gtk --bin video-harness-gtk
+cargo run --locked --features legacy-gtk --bin video-harness-gtk
 cargo test --all-targets --locked --features legacy-gtk
 ```
 

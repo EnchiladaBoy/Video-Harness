@@ -296,7 +296,7 @@ describe('Review readiness', () => {
     snapshot.draft.settings.seed = '';
     snapshot.draft.settings.advancedJson = '[1, 2]';
     expect(reviewReadinessIssue(snapshot, true)).toBe(
-      'Extra model settings must be a JSON object.'
+      'Advanced settings must be a JSON object.'
     );
     expect(advancedJsonIssue('{"guidance": 4}')).toBeUndefined();
   });
@@ -311,16 +311,16 @@ describe('Review readiness', () => {
       })
     );
 
-    expect(issue).toBe('Extra model settings may not contain credential fields.');
+    expect(issue).toBe('Advanced settings may not contain credential fields.');
     expect(issue).not.toContain(sensitiveValue);
     expect(advancedJsonIssue('{"nested":{"client_secret":"redacted"}}')).toBe(
-      'Extra model settings may not contain credential fields.'
+      'Advanced settings may not contain credential fields.'
     );
     expect(advancedJsonIssue('{"nested":{"password":"redacted"}}')).toBe(
-      'Extra model settings may not contain credential fields.'
+      'Advanced settings may not contain credential fields.'
     );
     expect(advancedJsonIssue('{"database":{"passwd":"redacted"}}')).toBe(
-      'Extra model settings may not contain credential fields.'
+      'Advanced settings may not contain credential fields.'
     );
   });
 

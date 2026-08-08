@@ -948,6 +948,20 @@ input::placeholder {
   outline: none;
 }
 
+.jobs-heading__actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 1rem;
+}
+
+.bulk-monitor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.45rem;
+}
+
 .job-summary {
   display: grid;
   grid-template-columns: auto auto;
@@ -2091,6 +2105,16 @@ dialog::backdrop {
 
   .save-state {
     align-self: flex-start;
+  }
+
+  .jobs-heading__actions {
+    width: 100%;
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .bulk-monitor-actions {
+    justify-content: flex-start;
   }
 
   .prompt-card,

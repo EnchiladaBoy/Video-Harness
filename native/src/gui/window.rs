@@ -24,10 +24,6 @@ use crate::gui_state::{
     DraftEditorState, UncertainSubmissionRecord, generation_draft_fingerprint_candidates,
 };
 use crate::history::JobRecord;
-use crate::migration::{
-    LegacyMigration, LegacyMigrationConsent, LegacyMigrationEligibility, LegacyMigrationError,
-    LegacyMigrationInventory, LegacyMigrationOutcome, LegacyMigrationSkipReason, RelinkRequired,
-};
 use crate::workflow::{
     PreparedGenerationId, ProviderConnection, RecoveryStore, ServiceCommand, ServiceConfig,
     ServiceEvent, ServiceHandle, spawn_service,
@@ -54,38 +50,20 @@ pub fn present(
     runtime: Arc<Runtime>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let paths = AppPaths::discover()?;
-    let migration = LegacyMigration::discover(paths.clone())?;
-    match migration.assess() {
-        Ok(LegacyMigrationEligibility::NeedsConsent(inventory)) => {
-            present_migration_consent(application, runtime, paths, migration, inventory);
-            return Ok(());
-        }
-        Err(error) => {
-            present_migration_failure(application, runtime, paths, migration, error.to_string());
-            return Ok(());
-        }
-        Ok(_) => {}
-    }
-    present_main(application, runtime, paths, Some(migration))
+    present_main(application, runtime, paths)
 }
 
 fn present_main(
     application: &adw::Application,
     runtime: Arc<Runtime>,
     paths: AppPaths,
-    migration: Option<LegacyMigration>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let paths = paths.ensure()?;
     let handle = {
         let _guard = runtime.enter();
         spawn_service(paths.clone(), ServiceConfig::default())?
     };
-    let relinks = migration
-        .as_ref()
-        .map(LegacyMigration::pending_relinks)
-        .transpose()?
-        .unwrap_or_default();
-    let window = HarnessWindow::new(application, runtime, handle, migration, relinks);
+    let window = HarnessWindow::new(application, runtime, handle);
     // GTK owns the visible widgets, but signal handlers intentionally keep
     // only weak controller references. Retain the controller until the
     // service confirms its local state is safe, then break this cycle in the
@@ -95,158 +73,10 @@ fn present_main(
     Ok(())
 }
 
-fn migration_window(application: &adw::Application, description: &str) -> adw::ApplicationWindow {
-    let window = adw::ApplicationWindow::builder()
-        .application(application)
-        .title("Video Harness")
-        .default_width(620)
-        .default_height(420)
-        .build();
-    let page = adw::StatusPage::builder()
-        .icon_name("folder-videos-symbolic")
-        .title("Bring your Video Harness workspace with you")
-        .description(description)
-        .build();
-    window.set_content(Some(&page));
-    window.present();
-    window
-}
-
-fn finish_migration_attempt(
-    application: &adw::Application,
-    runtime: Arc<Runtime>,
-    paths: AppPaths,
-    migration: LegacyMigration,
-    result: Result<LegacyMigrationOutcome, LegacyMigrationError>,
-) {
-    match result {
-        Ok(
-            LegacyMigrationOutcome::Imported(_)
-            | LegacyMigrationOutcome::Declined(_)
-            | LegacyMigrationOutcome::AlreadyDecided(_),
-        ) => {
-            if let Err(error) = present_main(application, runtime, paths, Some(migration)) {
-                present_startup_error(application, &error.to_string());
-            }
-        }
-        Ok(LegacyMigrationOutcome::Skipped(reason)) => {
-            let message = match reason {
-                LegacyMigrationSkipReason::NotFlatpak => {
-                    "The migration was interrupted because this process is no longer running inside the Video Harness Flatpak.".to_owned()
-                }
-                LegacyMigrationSkipReason::TargetContainsData(path) => format!(
-                    "The Flatpak workspace changed before migration completed at {}. It was not opened automatically.",
-                    path.display()
-                ),
-                LegacyMigrationSkipReason::NoLegacyData => {
-                    "The legacy workspace disappeared before migration completed. It was not treated as an imported or declined workspace.".to_owned()
-                }
-            };
-            present_migration_failure(application, runtime, paths, migration, message);
-        }
-        Err(error) => {
-            present_migration_failure(application, runtime, paths, migration, error.to_string());
-        }
-    }
-}
-
-fn present_migration_consent(
-    application: &adw::Application,
-    runtime: Arc<Runtime>,
-    paths: AppPaths,
-    migration: LegacyMigration,
-    inventory: LegacyMigrationInventory,
-) {
-    let description = format!(
-        "A pre-Flatpak workspace was found: {} history database, {} draft database, {} settings file(s), and {} cached catalog file(s). The originals stay untouched and API keys are never copied.",
-        usize::from(inventory.history_database),
-        usize::from(inventory.gui_state_database),
-        inventory.config_file_count,
-        inventory.cache_file_count,
-    );
-    let startup = migration_window(application, &description);
-    let dialog = adw::AlertDialog::builder()
-        .heading("Import existing workspace?")
-        .body("Import copies compatible databases with SQLite's backup API. Local media outside the sandbox will be marked for relinking.")
-        .build();
-    dialog.add_response("cancel", "Not now");
-    dialog.add_response("clean", "Start clean");
-    dialog.add_response("import", "Import workspace");
-    dialog.set_close_response("cancel");
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_response_appearance("import", adw::ResponseAppearance::Suggested);
-    let app = application.clone();
-    let response_window = startup.clone();
-    dialog.connect_response(None, move |_, response| {
-        if response == "cancel" {
-            response_window.close();
-            return;
-        }
-        let consent = if response == "import" {
-            LegacyMigrationConsent::Import
-        } else {
-            LegacyMigrationConsent::StartClean
-        };
-        let result = migration.run(consent);
-        response_window.close();
-        finish_migration_attempt(
-            &app,
-            Arc::clone(&runtime),
-            paths.clone(),
-            migration.clone(),
-            result,
-        );
-    });
-    dialog.present(Some(&startup));
-}
-
-fn present_migration_failure(
-    application: &adw::Application,
-    runtime: Arc<Runtime>,
-    paths: AppPaths,
-    migration: LegacyMigration,
-    message: String,
-) {
-    let startup = migration_window(
-        application,
-        "The old workspace was not changed and no partial Flatpak workspace was kept.",
-    );
-    let dialog = adw::AlertDialog::builder()
-        .heading("Workspace import needs attention")
-        .body(&message)
-        .build();
-    dialog.add_response("cancel", "Not now");
-    dialog.add_response("retry", "Retry import");
-    dialog.add_response("clean", "Start clean");
-    dialog.set_close_response("cancel");
-    dialog.set_default_response(Some("retry"));
-    let app = application.clone();
-    let response_window = startup.clone();
-    dialog.connect_response(None, move |_, response| {
-        response_window.close();
-        let consent = match response {
-            "clean" => Some(LegacyMigrationConsent::StartClean),
-            "retry" => Some(LegacyMigrationConsent::Import),
-            _ => None,
-        };
-        if let Some(consent) = consent {
-            let result = migration.run(consent);
-            finish_migration_attempt(
-                &app,
-                Arc::clone(&runtime),
-                paths.clone(),
-                migration.clone(),
-                result,
-            );
-        }
-    });
-    dialog.present(Some(&startup));
-}
-
 pub fn present_startup_error(application: &adw::Application, message: &str) {
     let window = adw::ApplicationWindow::builder()
         .application(application)
-        .title("Video Harness")
+        .title("Video Harness — Legacy GTK")
         .default_width(620)
         .default_height(420)
         .build();
@@ -339,13 +169,9 @@ struct JobWidgets {
     open: gtk::Button,
     local_path: RefCell<Option<PathBuf>>,
     active: Cell<bool>,
+    terminal: Cell<bool>,
     observed_since: Instant,
     next_poll_at: RefCell<Option<Instant>>,
-}
-
-struct RelinkCandidate {
-    path: PathBuf,
-    revision: u64,
 }
 
 struct PreparedReview {
@@ -386,10 +212,6 @@ struct HarnessWindow {
     service_disconnected: Cell<bool>,
     allow_close: Cell<bool>,
     keep_alive: RefCell<Option<Rc<HarnessWindow>>>,
-    legacy_migration: Option<LegacyMigration>,
-    pending_relinks: RefCell<Vec<RelinkRequired>>,
-    relink_candidates: RefCell<Vec<RelinkCandidate>>,
-    relink_removals: RefCell<BTreeMap<(String, String), u64>>,
 
     view_stack: adw::ViewStack,
     prompt: gtk::TextView,
@@ -432,6 +254,9 @@ struct HarnessWindow {
     selected_job: RefCell<Option<ProviderJobKey>>,
     jobs: RefCell<HashMap<ProviderJobKey, Rc<JobWidgets>>>,
     active_jobs: RefCell<HashSet<ProviderJobKey>>,
+    registered_monitors: RefCell<HashSet<ProviderJobKey>>,
+    pausing_jobs: RefCell<HashMap<ProviderJobKey, bool>>,
+    stopping_jobs: RefCell<HashSet<ProviderJobKey>>,
     latest_video: RefCell<Option<PathBuf>>,
     job_detail_timer: RefCell<Option<glib::SourceId>>,
 
@@ -444,12 +269,10 @@ impl HarnessWindow {
         application: &adw::Application,
         runtime: Arc<Runtime>,
         handle: ServiceHandle,
-        legacy_migration: Option<LegacyMigration>,
-        pending_relinks: Vec<RelinkRequired>,
     ) -> Rc<Self> {
         let window = adw::ApplicationWindow::builder()
             .application(application)
-            .title("Video Harness")
+            .title("Video Harness — Legacy GTK")
             .default_width(1100)
             .default_height(790)
             .build();
@@ -471,7 +294,7 @@ impl HarnessWindow {
         let wide_switcher = adw::ViewSwitcher::new();
         wide_switcher.set_stack(Some(&view_stack));
         wide_switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
-        let narrow_title = adw::WindowTitle::new("New Generation", "Video Harness");
+        let narrow_title = adw::WindowTitle::new("New Generation", "Legacy GTK frontend");
         let title_stack = gtk::Stack::new();
         title_stack.add_named(&wide_switcher, Some("wide"));
         title_stack.add_named(&narrow_title, Some("narrow"));
@@ -485,6 +308,11 @@ impl HarnessWindow {
 
         toast_overlay.set_child(Some(&view_stack));
         let toolbar = adw::ToolbarView::new();
+        let legacy_banner = adw::Banner::builder()
+            .title(super::LEGACY_FRONTEND_NOTICE)
+            .revealed(true)
+            .build();
+        toolbar.add_top_bar(&legacy_banner);
         toolbar.add_top_bar(&header);
         toolbar.set_content(Some(&toast_overlay));
         toolbar.add_bottom_bar(&switcher);
@@ -553,10 +381,6 @@ impl HarnessWindow {
             service_disconnected: Cell::new(false),
             allow_close: Cell::new(false),
             keep_alive: RefCell::new(None),
-            legacy_migration,
-            pending_relinks: RefCell::new(pending_relinks),
-            relink_candidates: RefCell::new(Vec::new()),
-            relink_removals: RefCell::new(BTreeMap::new()),
             view_stack,
             prompt: compose.prompt,
             provider: compose.provider,
@@ -597,6 +421,9 @@ impl HarnessWindow {
             selected_job: RefCell::new(None),
             jobs: RefCell::new(HashMap::new()),
             active_jobs: RefCell::new(HashSet::new()),
+            registered_monitors: RefCell::new(HashSet::new()),
+            pausing_jobs: RefCell::new(HashMap::new()),
+            stopping_jobs: RefCell::new(HashSet::new()),
             latest_video: RefCell::new(None),
             job_detail_timer: RefCell::new(None),
             provider_widgets: providers.providers,
@@ -801,7 +628,6 @@ impl HarnessWindow {
             if !added_paths.is_empty() {
                 this.rebuild_media();
                 this.draft_changed();
-                this.record_relink_candidates(added_paths);
                 if rejected > 0 {
                     this.toast(
                         &format!("Skipped {rejected} unsupported file(s)."),
@@ -831,19 +657,26 @@ impl HarnessWindow {
         let weak = Self::weak(self);
         resume_all.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
+                if !this.send(ServiceCommand::ResumeAll {
+                    op_id: this.op_id(),
+                }) {
+                    return;
+                }
                 for (key, widgets) in this.jobs.borrow().iter() {
                     if widgets.resume.is_sensitive() {
                         widgets.next_poll_at.replace(None);
                         widgets.active.set(true);
-                        widgets.pause.set_sensitive(true);
+                        // Pause is addressable only after MonitorStarted
+                        // confirms that the actor registered the new task.
+                        widgets.pause.set_sensitive(false);
                         widgets.resume.set_sensitive(false);
                         widgets.status.set_text("resuming");
+                        this.registered_monitors.borrow_mut().remove(key);
+                        this.pausing_jobs.borrow_mut().remove(key);
+                        this.stopping_jobs.borrow_mut().remove(key);
                         this.active_jobs.borrow_mut().insert(key.clone());
                     }
                 }
-                this.send(ServiceCommand::ResumeAll {
-                    op_id: this.op_id(),
-                });
                 this.apply_job_filters();
                 this.sync_selected_job_detail();
                 this.toast(
@@ -1372,82 +1205,6 @@ impl HarnessWindow {
         let _ = self.queue_draft_save();
     }
 
-    fn record_relink_candidates(&self, paths: Vec<PathBuf>) {
-        if paths.is_empty() || self.pending_relinks.borrow().is_empty() {
-            return;
-        }
-        let revision = self.revision.get();
-        self.relink_candidates.borrow_mut().extend(
-            paths
-                .into_iter()
-                .map(|path| RelinkCandidate { path, revision }),
-        );
-    }
-
-    fn record_relink_removal(&self, path: &Path) {
-        let revision = self.revision.get();
-        let pending = self.pending_relinks.borrow();
-        let mut removals = self.relink_removals.borrow_mut();
-        if let Some(item) = pending.iter().find(|item| {
-            item.path == path
-                && !removals.contains_key(&(item.draft_id.clone(), item.media_id.clone()))
-        }) {
-            removals.insert((item.draft_id.clone(), item.media_id.clone()), revision);
-        }
-    }
-
-    fn acknowledge_resolved_relinks(&self, saved_revision: u64) {
-        let Some(migration) = &self.legacy_migration else {
-            return;
-        };
-        let current_paths = self
-            .media
-            .borrow()
-            .iter()
-            .filter_map(|item| match &item.source {
-                MediaSource::LocalFile { path } => Some(path.clone()),
-                MediaSource::RemoteUrl { .. } => None,
-            })
-            .collect::<HashSet<_>>();
-
-        let mut candidates = std::mem::take(&mut *self.relink_candidates.borrow_mut());
-        let mut removals = std::mem::take(&mut *self.relink_removals.borrow_mut());
-        let pending = std::mem::take(&mut *self.pending_relinks.borrow_mut());
-        let mut remaining = Vec::with_capacity(pending.len());
-        for item in pending {
-            let key = (item.draft_id.clone(), item.media_id.clone());
-            let candidate = ready_relink_candidate(
-                removals.get(&key).copied(),
-                &candidates,
-                &current_paths,
-                saved_revision,
-            );
-            let Some(candidate) = candidate else {
-                remaining.push(item);
-                continue;
-            };
-            if migration
-                .acknowledge_relink(&item.draft_id, &item.media_id)
-                .unwrap_or(false)
-            {
-                candidates.remove(candidate);
-                removals.remove(&key);
-            } else {
-                remaining.push(item);
-            }
-        }
-        candidates.retain(|candidate| {
-            candidate.revision > saved_revision || current_paths.contains(&candidate.path)
-        });
-        if remaining.is_empty() {
-            candidates.clear();
-            removals.clear();
-        }
-        self.pending_relinks.replace(remaining);
-        self.relink_candidates.replace(candidates);
-        self.relink_removals.replace(removals);
-    }
-
     fn prepare_review(self: &Rc<Self>) {
         if self.pending_review_preparation.get().is_some() || self.staging_confirmation_active.get()
         {
@@ -1652,18 +1409,6 @@ impl HarnessWindow {
                     "harness-warning",
                 );
             }
-            return;
-        }
-        let relink_count = self.pending_relinks.borrow().len();
-        if relink_count > 0 {
-            self.review.set_sensitive(false);
-            self.review.set_label("Relink imported media");
-            self.show_compatibility(
-                &format!(
-                    "{relink_count} imported local media item(s) are outside the Flatpak sandbox. Remove each unavailable row and choose the file again before Review."
-                ),
-                "harness-warning",
-            );
             return;
         }
         if let Some(record) = self.current_uncertain_submission() {
@@ -1898,7 +1643,6 @@ impl HarnessWindow {
                 if !added_paths.is_empty() {
                     this.rebuild_media();
                     this.draft_changed();
-                    this.record_relink_candidates(added_paths);
                 }
                 if rejected > 0 {
                     this.toast(
@@ -2190,10 +1934,6 @@ impl HarnessWindow {
             remove.set_tooltip_text(Some(&remove_label));
             remove.update_property(&[gtk::accessible::Property::Label(&remove_label)]);
             remove.add_css_class("flat");
-            let removed_path = match &item.source {
-                MediaSource::LocalFile { path } => Some(path.clone()),
-                MediaSource::RemoteUrl { .. } => None,
-            };
             let weak = Self::weak(self);
             remove.connect_clicked(move |_| {
                 let Some(this) = weak.upgrade() else { return };
@@ -2201,9 +1941,6 @@ impl HarnessWindow {
                     this.media.borrow_mut().remove(index);
                     this.rebuild_media();
                     this.draft_changed();
-                    if let Some(path) = &removed_path {
-                        this.record_relink_removal(path);
-                    }
                 }
             });
             body.append(&remove);
@@ -3417,10 +3154,16 @@ impl HarnessWindow {
                     .detail
                     .set_text("Accepted. Saving the recovery record locally…");
                 widgets.active.set(!job.terminal());
-                widgets.pause.set_sensitive(!job.terminal());
+                widgets.terminal.set(job.terminal());
+                // MonitorStarted is the authoritative point at which Pause
+                // can address the task in the actor registry.
+                widgets.pause.set_sensitive(false);
                 widgets.resume.set_sensitive(false);
                 if job.terminal() {
                     self.active_jobs.borrow_mut().remove(&key);
+                    self.registered_monitors.borrow_mut().remove(&key);
+                    self.pausing_jobs.borrow_mut().remove(&key);
+                    self.stopping_jobs.borrow_mut().remove(&key);
                 } else {
                     self.active_jobs.borrow_mut().insert(key);
                 }
@@ -3471,6 +3214,7 @@ impl HarnessWindow {
                         "The provider accepted this job, but its recovery record could not be saved. Copy the remote ID now.",
                     );
                     widgets.active.set(false);
+                    widgets.terminal.set(true);
                     widgets.pause.set_sensitive(false);
                     widgets.resume.set_sensitive(false);
                 }
@@ -3523,11 +3267,19 @@ impl HarnessWindow {
                 });
                 let active = !job.terminal();
                 widgets.active.set(active);
-                widgets.pause.set_sensitive(active);
+                widgets.terminal.set(job.terminal());
+                widgets.pause.set_sensitive(
+                    active && self.registered_monitors.borrow().contains(&job.key()),
+                );
+                widgets.resume.set_sensitive(false);
                 if active {
                     self.active_jobs.borrow_mut().insert(job.key());
                 } else {
-                    self.active_jobs.borrow_mut().remove(&job.key());
+                    let key = job.key();
+                    self.active_jobs.borrow_mut().remove(&key);
+                    self.registered_monitors.borrow_mut().remove(&key);
+                    self.pausing_jobs.borrow_mut().remove(&key);
+                    self.stopping_jobs.borrow_mut().remove(&key);
                     widgets
                         .animation
                         .set_text(if job.successful() { "✓" } else { "!" });
@@ -3552,6 +3304,11 @@ impl HarnessWindow {
                     next_in.as_secs()
                 ));
                 widgets.active.set(true);
+                widgets.terminal.set(false);
+                widgets
+                    .pause
+                    .set_sensitive(self.registered_monitors.borrow().contains(&key));
+                widgets.resume.set_sensitive(false);
                 widgets.next_poll_at.replace(Some(Instant::now() + next_in));
                 self.active_jobs.borrow_mut().insert(key);
             }
@@ -3584,6 +3341,11 @@ impl HarnessWindow {
                     widgets.progress.set_visible(false);
                 }
                 widgets.active.set(true);
+                widgets.terminal.set(false);
+                widgets
+                    .pause
+                    .set_sensitive(self.registered_monitors.borrow().contains(&key));
+                widgets.resume.set_sensitive(false);
                 self.active_jobs.borrow_mut().insert(key);
             }
             ServiceEvent::Downloaded {
@@ -3602,6 +3364,7 @@ impl HarnessWindow {
                 widgets.progress.set_visible(true);
                 widgets.animation.set_text("✓");
                 widgets.active.set(false);
+                widgets.terminal.set(true);
                 widgets.pause.set_sensitive(false);
                 widgets.resume.set_sensitive(false);
                 widgets.open.set_sensitive(true);
@@ -3609,6 +3372,9 @@ impl HarnessWindow {
                 self.latest_video
                     .replace(widgets.local_path.borrow().clone());
                 self.active_jobs.borrow_mut().remove(&job.key());
+                self.registered_monitors.borrow_mut().remove(&job.key());
+                self.pausing_jobs.borrow_mut().remove(&job.key());
+                self.stopping_jobs.borrow_mut().remove(&job.key());
                 self.toast(
                     "Your video is ready in the Videos folder.",
                     "folder-videos-symbolic",
@@ -3619,45 +3385,82 @@ impl HarnessWindow {
                     self.restore_record(record);
                 }
             }
+            ServiceEvent::MonitorStarted { key, .. } => {
+                self.pausing_jobs.borrow_mut().remove(&key);
+                self.stopping_jobs.borrow_mut().remove(&key);
+                let widgets = self.jobs.borrow().get(&key).cloned();
+                if widgets
+                    .as_ref()
+                    .is_some_and(|widgets| widgets.terminal.get())
+                {
+                    // A terminal result can win the race with this queued
+                    // acknowledgement. Never regress it to a live monitor.
+                    self.registered_monitors.borrow_mut().remove(&key);
+                } else {
+                    self.registered_monitors.borrow_mut().insert(key.clone());
+                    self.active_jobs.borrow_mut().insert(key);
+                    if let Some(widgets) = widgets {
+                        widgets.active.set(true);
+                        widgets.pause.set_sensitive(true);
+                        widgets.resume.set_sensitive(false);
+                    }
+                }
+            }
             ServiceEvent::MonitorPaused {
                 key,
                 remote_continues,
                 ..
             } => {
-                if let Some(widgets) = self.jobs.borrow().get(&key) {
+                self.registered_monitors.borrow_mut().remove(&key);
+                let widgets = self.jobs.borrow().get(&key).cloned();
+                if widgets
+                    .as_ref()
+                    .is_none_or(|widgets| !widgets.terminal.get())
+                {
+                    self.pausing_jobs
+                        .borrow_mut()
+                        .insert(key.clone(), remote_continues);
+                }
+                if let Some(widgets) = widgets
+                    && !widgets.terminal.get()
+                {
                     widgets.next_poll_at.replace(None);
                     widgets.active.set(false);
                     widgets.pause.set_sensitive(false);
-                    widgets.resume.set_sensitive(true);
-                    widgets.status.set_text("monitoring paused");
+                    // The task still owns its actor-registry slot. Resume is
+                    // enabled only after MonitorStopped acknowledges removal.
+                    widgets.resume.set_sensitive(false);
+                    widgets.status.set_text("pausing monitoring");
                     widgets.animation.set_text("Ⅱ");
                     widgets.detail.set_text(if remote_continues {
-                        "Local checks paused; the provider continues remotely"
+                        "Finishing the current provider check before local monitoring pauses"
                     } else {
-                        "Monitoring paused"
+                        "Finishing the current local step before monitoring pauses"
                     });
                 }
-                self.active_jobs.borrow_mut().remove(&key);
             }
             ServiceEvent::MonitorsPaused {
                 count,
                 remote_continue,
                 ..
             } => {
-                for widgets in self.jobs.borrow().values() {
+                for (key, widgets) in self.jobs.borrow().iter() {
                     widgets.next_poll_at.replace(None);
-                    if widgets.active.replace(false) {
+                    if widgets.active.replace(false) && !widgets.terminal.get() {
+                        self.pausing_jobs
+                            .borrow_mut()
+                            .insert(key.clone(), remote_continue);
                         widgets.pause.set_sensitive(false);
-                        widgets.resume.set_sensitive(true);
-                        widgets.status.set_text("monitoring paused");
+                        widgets.resume.set_sensitive(false);
+                        widgets.status.set_text("pausing monitoring");
                         widgets.animation.set_text("Ⅱ");
                     }
                 }
-                self.active_jobs.borrow_mut().clear();
+                self.registered_monitors.borrow_mut().clear();
                 let message = if remote_continue {
-                    format!("Paused {count} monitor(s). Remote jobs continue.")
+                    format!("Pausing {count} monitor(s). Remote jobs continue.")
                 } else {
-                    format!("Paused {count} monitor(s).")
+                    format!("Pausing {count} monitor(s).")
                 };
                 self.toast(&message, "media-playback-pause-symbolic");
                 if self.pause_before_shutdown.replace(false) {
@@ -3676,6 +3479,9 @@ impl HarnessWindow {
                 for job in jobs {
                     let widgets = self.ensure_job(job.key.clone(), "Saved remote job");
                     widgets.next_poll_at.replace(None);
+                    widgets.active.set(false);
+                    widgets.terminal.set(false);
+                    widgets.pause.set_sensitive(false);
                     widgets.status.set_text(if job.monitoring_paused {
                         "monitoring paused"
                     } else {
@@ -3698,23 +3504,78 @@ impl HarnessWindow {
                         provider_id,
                         remote_job_id: job_id,
                     };
-                    if let Some(widgets) = self.jobs.borrow().get(&key) {
+                    self.registered_monitors.borrow_mut().remove(&key);
+                    let widgets = self.jobs.borrow().get(&key).cloned();
+                    if widgets
+                        .as_ref()
+                        .is_none_or(|widgets| !widgets.terminal.get())
+                    {
+                        self.pausing_jobs
+                            .borrow_mut()
+                            .insert(key.clone(), remote_continues);
+                    }
+                    if let Some(widgets) = widgets
+                        && !widgets.terminal.get()
+                    {
                         widgets.next_poll_at.replace(None);
                         widgets.active.set(false);
-                        widgets.status.set_text("monitoring stopped");
+                        widgets.pause.set_sensitive(false);
+                        widgets.resume.set_sensitive(false);
+                        widgets.status.set_text("pausing monitoring");
                         widgets.detail.set_text(if remote_continues {
-                            "Local monitoring stopped; the provider job continues"
+                            "Finishing the current provider check before local monitoring pauses"
                         } else {
-                            "Stopped"
+                            "Finishing the current local step before monitoring pauses"
                         });
                     }
-                    self.active_jobs.borrow_mut().remove(&key);
+                }
+            }
+            ServiceEvent::MonitorStopped { key, .. } => {
+                let was_active = self.active_jobs.borrow_mut().remove(&key);
+                self.registered_monitors.borrow_mut().remove(&key);
+                let paused = self.pausing_jobs.borrow_mut().remove(&key);
+                let was_stopping = self.stopping_jobs.borrow_mut().remove(&key);
+                let widgets = self.jobs.borrow().get(&key).cloned();
+                let terminal = widgets
+                    .as_ref()
+                    .is_some_and(|widgets| widgets.terminal.get());
+                let projection =
+                    monitor_stop_projection(terminal, paused, was_stopping, was_active);
+                if let Some(widgets) = widgets {
+                    widgets.next_poll_at.replace(None);
+                    widgets.active.set(false);
+                    widgets.pause.set_sensitive(false);
+                    match projection {
+                        MonitorStopProjection::Unchanged => {}
+                        MonitorStopProjection::Paused { remote_continues } => {
+                            widgets.resume.set_sensitive(true);
+                            widgets.status.set_text("monitoring paused");
+                            widgets.animation.set_text("Ⅱ");
+                            widgets.detail.set_text(if remote_continues {
+                                "Local checks paused; the provider continues remotely"
+                            } else {
+                                "The provider finished; resume local follow-up when ready"
+                            });
+                        }
+                        MonitorStopProjection::RecoverableFailure => {
+                            // Keep the preceding error text, now that retry is
+                            // authoritative and cannot collide with the task.
+                            widgets.resume.set_sensitive(true);
+                        }
+                        MonitorStopProjection::UnexpectedStop => {
+                            widgets.resume.set_sensitive(true);
+                            widgets.status.set_text("monitoring stopped");
+                            widgets.detail.set_text(
+                                "Local monitoring ended before the remote job reached a final state",
+                            );
+                            widgets.animation.set_text("!");
+                        }
+                    }
                 }
             }
             ServiceEvent::DraftSaved {
                 op_id, revision, ..
             } => {
-                self.acknowledge_resolved_relinks(revision);
                 self.update_compatibility();
                 if self.pending_close_draft_op.get() == Some(op_id) {
                     self.pending_close_draft_op.set(None);
@@ -3760,15 +3621,27 @@ impl HarnessWindow {
                                 .as_ref()
                                 .is_none_or(|provider| provider == &key.provider_id)
                         {
+                            let monitor_stop_pending = self.active_jobs.borrow().contains(key)
+                                || self.registered_monitors.borrow().contains(key)
+                                || self.pausing_jobs.borrow().contains_key(key);
+                            self.registered_monitors.borrow_mut().remove(key);
+                            self.pausing_jobs.borrow_mut().remove(key);
                             widgets.next_poll_at.replace(None);
                             widgets.status.set_text("needs attention");
                             widgets.detail.set_text(&message);
                             widgets.active.set(false);
+                            widgets.terminal.set(!recoverable);
                             widgets.pause.set_sensitive(false);
-                            widgets.resume.set_sensitive(recoverable);
-                            if recoverable {
-                                // The remote job may still be running; retain the close warning.
-                                self.active_jobs.borrow_mut().insert(key.clone());
+                            if recoverable && monitor_stop_pending {
+                                // The task has reported its error but may
+                                // still own the actor-registry slot. Wait for
+                                // MonitorStopped before offering Resume.
+                                widgets.resume.set_sensitive(false);
+                                self.stopping_jobs.borrow_mut().insert(key.clone());
+                            } else {
+                                widgets.resume.set_sensitive(recoverable);
+                                self.stopping_jobs.borrow_mut().remove(key);
+                                self.active_jobs.borrow_mut().remove(key);
                             }
                         }
                     }
@@ -4091,6 +3964,7 @@ impl HarnessWindow {
             open,
             local_path: RefCell::new(None),
             active: Cell::new(false),
+            terminal: Cell::new(false),
             observed_since: Instant::now(),
             next_poll_at: RefCell::new(None),
         });
@@ -4108,18 +3982,27 @@ impl HarnessWindow {
         let key_for_resume = key.clone();
         widgets.resume.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
-                this.send(ServiceCommand::Resume {
+                if !this.send(ServiceCommand::Resume {
                     op_id: this.op_id(),
                     key: key_for_resume.clone(),
-                });
+                }) {
+                    return;
+                }
                 if let Some(widgets) = this.jobs.borrow().get(&key_for_resume) {
                     widgets.next_poll_at.replace(None);
                     widgets.active.set(true);
-                    widgets.pause.set_sensitive(true);
+                    // Do not expose Pause until the actor acknowledges the
+                    // replacement monitor through MonitorStarted.
+                    widgets.pause.set_sensitive(false);
                     widgets.resume.set_sensitive(false);
                     widgets.status.set_text("resuming");
                     widgets.detail.set_text("Connecting to the provider…");
                 }
+                this.registered_monitors
+                    .borrow_mut()
+                    .remove(&key_for_resume);
+                this.pausing_jobs.borrow_mut().remove(&key_for_resume);
+                this.stopping_jobs.borrow_mut().remove(&key_for_resume);
                 this.active_jobs.borrow_mut().insert(key_for_resume.clone());
                 this.apply_job_filters();
                 this.sync_selected_job_detail();
@@ -4147,6 +4030,10 @@ impl HarnessWindow {
         let title = job_title(&record).unwrap_or_else(|| "Saved video generation".into());
         let widgets = self.ensure_job(key.clone(), &title);
         widgets.status.set_text(&record.status.replace('_', " "));
+        widgets.active.set(false);
+        widgets.terminal.set(record.terminal());
+        widgets.pause.set_sensitive(false);
+        widgets.resume.set_sensitive(false);
         if let Some(error) = &record.error {
             widgets.detail.set_text(error);
         } else if let Some(path) = &record.output_path {
@@ -5457,6 +5344,33 @@ fn byte_size(bytes: u64) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MonitorStopProjection {
+    Unchanged,
+    Paused { remote_continues: bool },
+    RecoverableFailure,
+    UnexpectedStop,
+}
+
+fn monitor_stop_projection(
+    terminal: bool,
+    paused: Option<bool>,
+    was_stopping: bool,
+    was_active: bool,
+) -> MonitorStopProjection {
+    if terminal {
+        MonitorStopProjection::Unchanged
+    } else if let Some(remote_continues) = paused {
+        MonitorStopProjection::Paused { remote_continues }
+    } else if was_stopping {
+        MonitorStopProjection::RecoverableFailure
+    } else if was_active {
+        MonitorStopProjection::UnexpectedStop
+    } else {
+        MonitorStopProjection::Unchanged
+    }
+}
+
 fn remaining_poll_time(status: &str, deadline: Option<Instant>, now: Instant) -> Option<Duration> {
     if status != "monitoring" {
         return None;
@@ -5464,20 +5378,6 @@ fn remaining_poll_time(status: &str, deadline: Option<Instant>, now: Instant) ->
     deadline?
         .checked_duration_since(now)
         .filter(|remaining| !remaining.is_zero())
-}
-
-fn ready_relink_candidate(
-    removed_at: Option<u64>,
-    candidates: &[RelinkCandidate],
-    current_paths: &HashSet<PathBuf>,
-    saved_revision: u64,
-) -> Option<usize> {
-    if removed_at.is_none_or(|revision| revision > saved_revision) {
-        return None;
-    }
-    candidates.iter().position(|candidate| {
-        candidate.revision <= saved_revision && current_paths.contains(&candidate.path)
-    })
 }
 
 fn pending_review_matches(pending: PendingReviewPreparation, op_id: u64) -> bool {
@@ -5689,31 +5589,28 @@ mod tests {
     }
 
     #[test]
-    fn relink_requires_a_saved_selected_replacement() {
-        let replacement = PathBuf::from("/run/user/1000/doc/portal/replacement.png");
-        let mut current = HashSet::new();
-
-        assert_eq!(ready_relink_candidate(Some(7), &[], &current, 7), None);
-
-        current.insert(replacement.clone());
-        let candidates = vec![RelinkCandidate {
-            path: replacement,
-            revision: 8,
-        }];
-        assert_eq!(ready_relink_candidate(None, &candidates, &current, 8), None);
+    fn monitor_stop_waits_for_authoritative_registry_removal() {
         assert_eq!(
-            ready_relink_candidate(Some(8), &candidates, &current, 7),
-            None
+            monitor_stop_projection(false, Some(true), false, true),
+            MonitorStopProjection::Paused {
+                remote_continues: true,
+            }
         );
         assert_eq!(
-            ready_relink_candidate(Some(8), &candidates, &current, 8),
-            Some(0)
+            monitor_stop_projection(false, None, true, true),
+            MonitorStopProjection::RecoverableFailure
         );
-
-        current.clear();
         assert_eq!(
-            ready_relink_candidate(Some(8), &candidates, &current, 8),
-            None
+            monitor_stop_projection(false, None, false, true),
+            MonitorStopProjection::UnexpectedStop
+        );
+    }
+
+    #[test]
+    fn monitor_stop_never_regresses_a_terminal_result() {
+        assert_eq!(
+            monitor_stop_projection(true, Some(true), true, true),
+            MonitorStopProjection::Unchanged
         );
     }
 

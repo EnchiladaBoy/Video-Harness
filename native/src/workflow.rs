@@ -19,6 +19,7 @@ use crate::config::{
 };
 use crate::credentials::{
     CREDENTIAL_OPERATION_TIMEOUT, CredentialStatus, CredentialWorker, CredentialWorkerError,
+    platform_keyring_name,
 };
 use crate::domain::{
     CostQuote, DraftMedia, GenerationDraft, InputReferenceKind, JobLocator, JobStatus, MediaRole,
@@ -427,11 +428,13 @@ pub enum ServiceEvent {
         op_id: u64,
         count: usize,
         remote_continue: bool,
+        keys: Vec<ProviderJobKey>,
     },
     ResumeAllStarted {
         op_id: u64,
         started: usize,
         skipped: usize,
+        started_keys: Vec<ProviderJobKey>,
     },
     ResumableJobsLoaded {
         op_id: u64,
@@ -1665,6 +1668,7 @@ async fn run_service(
                             op_id,
                             count: keys.len(),
                             remote_continue,
+                            keys,
                         });
                     }
                     ServiceCommand::Generate { op_id, provider_id, mut request } => {
@@ -1847,6 +1851,38 @@ async fn run_service(
                             },
                         );
                         monitors.insert(monitor_key.clone(), task_id);
+                        let saved_state = gui_state.clone();
+                        let saved_key = monitor_key.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            saved_state.set_monitoring_paused(&saved_key, false)
+                        })
+                        .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                eprintln!("Could not persist resumed monitoring state: {error}");
+                                emit_error(
+                                    &events,
+                                    op_id,
+                                    None,
+                                    ServiceScope::Generation,
+                                    "Monitoring resumed, but that state could not be saved. It may appear paused again after restart."
+                                        .into(),
+                                    true,
+                                    None,
+                                );
+                            }
+                            Err(_) => emit_error(
+                                &events,
+                                op_id,
+                                None,
+                                ServiceScope::Generation,
+                                "Monitoring resumed, but the state-save task stopped. It may appear paused again after restart."
+                                    .into(),
+                                true,
+                                None,
+                            ),
+                        }
                         let _ = events.send(ServiceEvent::MonitorStarted {
                             op_id,
                             key: monitor_key,
@@ -1867,6 +1903,8 @@ async fn run_service(
                         };
                         let total = jobs.len();
                         let mut started = 0usize;
+                        let mut started_keys = Vec::new();
+                        let mut state_save_failures = 0usize;
                         for job in jobs {
                             if monitors.contains_key(&job.key) {
                                 continue;
@@ -1916,10 +1954,47 @@ async fn run_service(
                                 key: task_key.clone(),
                             });
                             let state = gui_state.clone();
-                            let _ = tokio::task::spawn_blocking(move || state.set_monitoring_paused(&task_key, false)).await;
+                            match tokio::task::spawn_blocking(move || {
+                                state.set_monitoring_paused(&task_key, false)
+                            })
+                            .await
+                            {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(error)) => {
+                                    state_save_failures += 1;
+                                    eprintln!(
+                                        "Could not persist Resume All monitoring state: {error}"
+                                    );
+                                }
+                                Err(_) => state_save_failures += 1,
+                            }
                             started += 1;
+                            started_keys.push(job.key);
                         }
-                        let _ = events.send(ServiceEvent::ResumeAllStarted { op_id, started, skipped: total.saturating_sub(started) });
+                        if state_save_failures > 0 {
+                            let noun = if state_save_failures == 1 {
+                                "job"
+                            } else {
+                                "jobs"
+                            };
+                            emit_error(
+                                &events,
+                                op_id,
+                                None,
+                                ServiceScope::Generation,
+                                format!(
+                                    "Monitoring resumed, but the state could not be saved for {state_save_failures} {noun}. Affected jobs may appear paused again after restart."
+                                ),
+                                true,
+                                None,
+                            );
+                        }
+                        let _ = events.send(ServiceEvent::ResumeAllStarted {
+                            op_id,
+                            started,
+                            skipped: total.saturating_sub(started),
+                            started_keys,
+                        });
                     }
                     ServiceCommand::Import { op_id, provider_id, locator } => {
                         if locator.provider_id() != provider_id {
@@ -2231,7 +2306,7 @@ fn unavailable_credential_status(
     operation: &'static str,
 ) -> CredentialStatus {
     CredentialStatus {
-        backend: "system keyring".into(),
+        backend: platform_keyring_name().into(),
         available: false,
         persistent: false,
         message: format!(

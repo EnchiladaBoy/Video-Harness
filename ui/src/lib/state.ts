@@ -86,6 +86,7 @@ export function applyUiEvent(snapshot: AppSnapshot, event: UiEvent): AppSnapshot
     case 'draft_saved':
       return { ...snapshot, draftSaved: event.revision === snapshot.draft.revision };
     case 'close_requested':
+    case 'bulk_monitor_acknowledged':
       return snapshot;
     case 'operation_failed':
       return event.operation === 'submission'

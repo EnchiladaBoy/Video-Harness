@@ -1254,26 +1254,61 @@ async fn duplicate_resume_is_rejected_and_monitor_can_pause_without_posting() {
     let (_root, paths) = fixture_paths();
     let request = VideoRequest::new("example/video", "A resumable fixture").expect("request");
     let pending = VideoJob::from_api(&pending_job("job-resume")).expect("pending job");
+    let key = pending.key();
     HistoryStore::new(paths.history_db())
         .create_job(&request, &pending)
         .expect("seed pending history");
+    GuiStateStore::new(paths.gui_state_db())
+        .save_resumable_job(&ResumableJob {
+            key: key.clone(),
+            locator: pending.locator.clone(),
+            accepted_at: Utc::now(),
+            monitoring_paused: true,
+            completed_output_path: None,
+        })
+        .expect("seed paused recovery state");
+    let poll_started = Arc::new(Notify::new());
+    let release_poll = Arc::new(Notify::new());
     let executor = WorkflowExecutor::scripted([
         Reply::Json(StatusCode::OK, json!({"data": {"label": "fixture"}})),
-        Reply::Json(StatusCode::OK, pending_job("job-resume")),
+        Reply::WaitJson {
+            status: StatusCode::OK,
+            value: pending_job("job-resume"),
+            started: Arc::clone(&poll_started),
+            release: Arc::clone(&release_poll),
+        },
     ]);
-    let mut service =
-        spawn_service_with_executor(paths, config(Duration::from_secs(30)), executor.clone())
-            .expect("spawn service");
+    let mut service = spawn_service_with_executor(
+        paths.clone(),
+        config(Duration::from_secs(30)),
+        executor.clone(),
+    )
+    .expect("spawn service");
     connect_fixture_key(&mut service, 1).await;
     service
         .commands
         .send(ServiceCommand::Resume {
             op_id: 30,
-            key: ProviderJobKey::new(ProviderId::openrouter(), "job-resume")
-                .expect("provider job key"),
+            key: key.clone(),
         })
         .await
         .expect("send resume command");
+    event_matching(&mut service, |event| {
+        matches!(event, ServiceEvent::MonitorStarted { op_id: 30, .. })
+    })
+    .await;
+    poll_started.notified().await;
+    let saved = GuiStateStore::new(paths.gui_state_db())
+        .resumable_jobs()
+        .expect("load recovery state")
+        .into_iter()
+        .find(|job| job.key == key)
+        .expect("saved recovery job");
+    assert!(
+        !saved.monitoring_paused,
+        "single-job Resume must durably clear the paused flag before its first poll completes"
+    );
+    release_poll.notify_one();
     event_matching(&mut service, |event| {
         matches!(event, ServiceEvent::PollWaiting { op_id: 30, .. })
     })
@@ -1281,11 +1316,7 @@ async fn duplicate_resume_is_rejected_and_monitor_can_pause_without_posting() {
 
     service
         .commands
-        .send(ServiceCommand::Resume {
-            op_id: 31,
-            key: ProviderJobKey::new(ProviderId::openrouter(), "job-resume")
-                .expect("provider job key"),
-        })
+        .send(ServiceCommand::Resume { op_id: 31, key })
         .await
         .expect("send duplicate resume");
     let active_error = event_matching(&mut service, |event| {
@@ -1317,6 +1348,181 @@ async fn duplicate_resume_is_rejected_and_monitor_can_pause_without_posting() {
             ..
         } if value == "job-resume"
     ));
+    assert!(
+        executor
+            .requests()
+            .iter()
+            .all(|request| request.method == Method::GET)
+    );
+    shutdown(&mut service).await;
+}
+
+#[tokio::test]
+async fn resume_all_reports_state_save_failures_without_stopping_monitors() {
+    let (_root, paths) = fixture_paths();
+    let request =
+        VideoRequest::new("example/video", "Resume All persistence fixture").expect("request");
+    let pending =
+        VideoJob::from_api(&pending_job("job-resume-all-save-failure")).expect("pending job");
+    let key = pending.key();
+    HistoryStore::new(paths.history_db())
+        .create_job(&request, &pending)
+        .expect("seed pending history");
+    GuiStateStore::new(paths.gui_state_db())
+        .save_resumable_job(&ResumableJob {
+            key: key.clone(),
+            locator: pending.locator.clone(),
+            accepted_at: Utc::now(),
+            monitoring_paused: true,
+            completed_output_path: None,
+        })
+        .expect("seed paused recovery state");
+    rusqlite::Connection::open(paths.gui_state_db())
+        .expect("open GUI state database")
+        .execute_batch(
+            "CREATE TRIGGER fail_resume_all_state_save
+             BEFORE UPDATE OF monitoring_paused ON resumable_jobs
+             WHEN NEW.monitoring_paused = 0
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced Resume All state-save failure');
+             END;",
+        )
+        .expect("install state-save failure trigger");
+
+    let poll_started = Arc::new(Notify::new());
+    let release_poll = Arc::new(Notify::new());
+    let executor = WorkflowExecutor::scripted([
+        Reply::Json(StatusCode::OK, json!({"data": {"label": "fixture"}})),
+        Reply::WaitJson {
+            status: StatusCode::OK,
+            value: pending_job("job-resume-all-save-failure"),
+            started: Arc::clone(&poll_started),
+            release: Arc::clone(&release_poll),
+        },
+    ]);
+    let mut service = spawn_service_with_executor(
+        paths.clone(),
+        config(Duration::from_secs(30)),
+        executor.clone(),
+    )
+    .expect("spawn service");
+    connect_fixture_key(&mut service, 1).await;
+
+    service
+        .commands
+        .send(ServiceCommand::ResumeAll { op_id: 33 })
+        .await
+        .expect("send Resume All command");
+    let mut monitor_started = false;
+    let mut warning_seen = false;
+    let mut summary_seen = false;
+    while !(monitor_started && warning_seen && summary_seen) {
+        match next_event(&mut service).await {
+            ServiceEvent::MonitorStarted {
+                op_id: 33,
+                key: started_key,
+            } => {
+                assert_eq!(started_key, key);
+                monitor_started = true;
+            }
+            ServiceEvent::Error {
+                op_id: 33,
+                provider_id: None,
+                scope: ServiceScope::Generation,
+                ref message,
+                recoverable: true,
+                job_id: None,
+                remote_continues: None,
+            } if message.contains("state could not be saved for 1 job") => {
+                warning_seen = true;
+            }
+            ServiceEvent::ResumeAllStarted {
+                op_id: 33,
+                started: 1,
+                skipped: 0,
+                started_keys,
+            } => {
+                assert_eq!(started_keys, vec![key.clone()]);
+                summary_seen = true;
+            }
+            ServiceEvent::Error {
+                op_id: 33,
+                scope: ServiceScope::History,
+                ref message,
+                ..
+            } if message.contains("forced Resume All state-save failure") => {}
+            event @ ServiceEvent::Error { .. } => {
+                panic!("unexpected workflow error: {event:?}")
+            }
+            _ => {}
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(5), poll_started.notified())
+        .await
+        .expect("resumed monitor did not poll");
+    let saved = GuiStateStore::new(paths.gui_state_db())
+        .resumable_jobs()
+        .expect("load recovery state")
+        .into_iter()
+        .find(|job| job.key == key)
+        .expect("saved recovery job");
+    assert!(
+        saved.monitoring_paused,
+        "the forced state-save failure should leave the durable paused flag unchanged"
+    );
+
+    service
+        .commands
+        .send(ServiceCommand::Resume {
+            op_id: 34,
+            key: key.clone(),
+        })
+        .await
+        .expect("try duplicate resume");
+    loop {
+        match next_event(&mut service).await {
+            ServiceEvent::Error {
+                op_id: 34,
+                ref message,
+                ..
+            } => {
+                assert!(message.contains("already being monitored"));
+                break;
+            }
+            ServiceEvent::Error {
+                op_id: 33,
+                scope: ServiceScope::History,
+                ref message,
+                ..
+            } if message.contains("forced Resume All state-save failure") => {}
+            event @ ServiceEvent::Error { .. } => {
+                panic!("unexpected workflow error: {event:?}")
+            }
+            _ => {}
+        }
+    }
+
+    service
+        .commands
+        .send(ServiceCommand::CancelCurrent { op_id: 35 })
+        .await
+        .expect("pause resumed monitor");
+    release_poll.notify_one();
+    loop {
+        match next_event(&mut service).await {
+            ServiceEvent::Cancelled { op_id: 33, .. } => break,
+            ServiceEvent::Error {
+                op_id: 33,
+                scope: ServiceScope::History,
+                ref message,
+                ..
+            } if message.contains("forced Resume All state-save failure") => {}
+            event @ ServiceEvent::Error { .. } => {
+                panic!("unexpected workflow error: {event:?}")
+            }
+            _ => {}
+        }
+    }
     assert!(
         executor
             .requests()

@@ -39,6 +39,112 @@ describe('creative draft input', () => {
     expect(size).toHaveValue('');
   });
 
+  it('keeps local files on device when upload review is cancelled', async () => {
+    const bridge = createMockBridge();
+    const snapshot = demoSnapshot();
+    snapshot.providers = snapshot.providers.map((provider) =>
+      provider.id === 'fal' ? { ...provider, connected: true } : provider
+    );
+    vi.spyOn(bridge, 'openSession').mockResolvedValue({
+      seq: 0,
+      snapshot,
+      preparing: false,
+      submitting: false
+    });
+    const prepare = vi.spyOn(bridge, 'prepareGeneration');
+
+    render(App, { bridge });
+    const review = await screen.findByRole('button', { name: 'Review price & details' });
+    await fireEvent.click(review);
+
+    expect(
+      screen.getByRole('dialog', { name: 'Upload local files to create shareable links?' })
+    ).toBeVisible();
+    expect(prepare).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole('button', { name: 'Cancel — keep files local' }));
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it('requires explicit upload approval for direct fal.ai local media', async () => {
+    const bridge = createMockBridge();
+    const snapshot = demoSnapshot();
+    snapshot.providers = snapshot.providers.map((provider) =>
+      provider.id === 'fal' ? { ...provider, connected: true } : provider
+    );
+    snapshot.draft = {
+      ...snapshot.draft,
+      providerId: 'fal',
+      modelId: 'fal-ai/kling-video/v2.1/master/image-to-video',
+      media: snapshot.draft.media.map((item) => ({ ...item, role: 'start_frame' })),
+      settings: {
+        ...snapshot.draft.settings,
+        duration: '5 seconds',
+        aspectRatio: 'Use source',
+        generatedAudio: 'provider_default'
+      }
+    };
+    vi.spyOn(bridge, 'openSession').mockResolvedValue({
+      seq: 0,
+      snapshot,
+      preparing: false,
+      submitting: false
+    });
+    const prepare = vi.spyOn(bridge, 'prepareGeneration').mockResolvedValue(undefined);
+
+    render(App, { bridge });
+    const review = await screen.findByRole('button', { name: 'Review price & details' });
+    await fireEvent.click(review);
+
+    expect(screen.getByText(/selected fal\.ai model needs your local references/i)).toBeVisible();
+    expect(screen.getByText(/used only by the selected fal\.ai model/i)).toBeVisible();
+    expect(prepare).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole('button', { name: 'Cancel — keep files local' }));
+    expect(prepare).not.toHaveBeenCalled();
+
+    await fireEvent.click(review);
+    await fireEvent.click(screen.getByRole('button', { name: 'Upload files for review' }));
+    await waitFor(() =>
+      expect(prepare).toHaveBeenCalledWith(
+        expect.objectContaining({ providerId: 'fal' }),
+        { localMediaUploadConfirmed: true }
+      )
+    );
+  });
+
+  it('requires a separate explicit paid action after review', async () => {
+    const bridge = createMockBridge();
+    const snapshot = demoSnapshot();
+    snapshot.preparedReview = {
+      preparedId: 91,
+      revision: snapshot.draft.revision,
+      providerId: snapshot.draft.providerId,
+      providerName: 'OpenRouter',
+      modelId: snapshot.draft.modelId,
+      modelName: 'FLUX 3 Video',
+      prompt: snapshot.draft.prompt,
+      settings: { ...snapshot.draft.settings },
+      media: snapshot.draft.media.map((item) => ({ ...item })),
+      estimatedCost: '$0.32',
+      expiresAt: new Date(Date.now() + 60_000).toISOString()
+    };
+    vi.spyOn(bridge, 'openSession').mockResolvedValue({
+      seq: 0,
+      snapshot,
+      preparing: false,
+      submitting: false
+    });
+    const submit = vi.spyOn(bridge, 'submitPrepared').mockResolvedValue(undefined);
+
+    render(App, { bridge });
+    expect(
+      await screen.findByRole('dialog', { name: 'Review price and details.' })
+    ).toBeVisible();
+    expect(screen.getByText('This sends one paid provider request')).toBeInTheDocument();
+    expect(submit).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole('button', { name: 'Generate video — paid' }));
+    expect(submit).toHaveBeenCalledWith(91);
+  });
+
   it('acknowledges buffered close edges and safely retains failed cancellations', async () => {
     const bridge = createMockBridge();
     Object.defineProperty(bridge, 'mode', { value: 'tauri' });
@@ -78,7 +184,7 @@ describe('creative draft input', () => {
         submitting: false
       })
     );
-    const dialog = await screen.findByRole('dialog', { name: 'Save this scene safely?' });
+    const dialog = await screen.findByRole('dialog', { name: 'Save before closing?' });
     await waitFor(() =>
       expect(saveAndClose).toHaveBeenCalledWith(expect.any(Object), 73)
     );
@@ -204,9 +310,9 @@ describe('creative draft input', () => {
     });
 
     render(App, { bridge });
-    const preparing = await screen.findByRole('button', { name: 'Preparing Review…' });
+    const preparing = await screen.findByRole('button', { name: 'Checking settings & price…' });
     expect(preparing).toBeDisabled();
-    expect(screen.getByText('Model catalog')).toBeInTheDocument();
+    expect(screen.getByText('Available models')).toBeInTheDocument();
 
     const routineSnapshot = demoSnapshot();
     routineSnapshot.jobs = [
@@ -224,10 +330,10 @@ describe('creative draft input', () => {
       })
     );
 
-    expect(screen.getByRole('heading', { name: 'Make a little movie magic.' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Preparing Review…' })).toBeDisabled();
+    expect(screen.getByRole('heading', { name: 'Create a video.' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Checking settings & price…' })).toBeDisabled();
     expect(
-      screen.queryByRole('heading', { name: 'Your films, taking shape.' })
+      screen.queryByRole('heading', { name: 'Track and play your videos.' })
     ).not.toBeInTheDocument();
   });
 
@@ -247,7 +353,7 @@ describe('creative draft input', () => {
 
     render(App, { bridge });
     await waitFor(() => expect(receiveEvent).toBeDefined());
-    await fireEvent.click(screen.getByRole('button', { name: /Renders/ }));
+    await fireEvent.click(screen.getByRole('button', { name: /My videos/ }));
     await fireEvent.click(screen.getByRole('button', { name: 'Pause updates' }));
     expect(screen.getByRole('button', { name: 'Updating…' })).toBeDisabled();
 
@@ -282,6 +388,63 @@ describe('creative draft input', () => {
     expect(screen.getByRole('button', { name: 'Resume updates' })).toBeEnabled();
   });
 
+  it('unlocks bulk resume immediately when the actor skips every candidate', async () => {
+    const bridge = createMockBridge();
+    let receiveEvent: ((event: UiEventEnvelope) => void) | undefined;
+    vi.spyOn(bridge, 'openSession').mockImplementation(async (onEvent) => {
+      receiveEvent = onEvent;
+      return {
+        seq: 0,
+        snapshot: demoSnapshot(),
+        preparing: false,
+        submitting: false
+      };
+    });
+    const resumeAll = vi.spyOn(bridge, 'resumeAllJobs').mockResolvedValue(undefined);
+
+    render(App, { bridge });
+    await waitFor(() => expect(receiveEvent).toBeDefined());
+    await fireEvent.click(screen.getByRole('button', { name: /My videos/ }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Resume all (1)' }));
+    expect(resumeAll).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: 'Resuming all…' })).toBeDisabled();
+
+    await act(() =>
+      receiveEvent?.({
+        seq: 1,
+        event: {
+          type: 'bulk_monitor_acknowledged',
+          action: 'resume',
+          targetJobIds: []
+        }
+      })
+    );
+
+    expect(screen.getByRole('button', { name: 'Resume all (1)' })).toBeEnabled();
+  });
+
+  it('surfaces recovered jobs without resuming them automatically', async () => {
+    const bridge = createMockBridge();
+    Object.defineProperty(bridge, 'mode', { value: 'tauri' });
+    vi.spyOn(bridge, 'openSession').mockResolvedValue({
+      seq: 0,
+      snapshot: demoSnapshot(),
+      preparing: false,
+      submitting: false
+    });
+    const resumeAll = vi.spyOn(bridge, 'resumeAllJobs');
+
+    render(App, { bridge });
+
+    expect(
+      await screen.findByText(
+        'Recovered 1 provider job. Open My videos and choose Resume all to continue checking it.'
+      )
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText('1 active, 1 ready to resume')).toHaveTextContent('2');
+    expect(resumeAll).not.toHaveBeenCalled();
+  });
+
   it('shows a complete copyable provider ID and safe render cleanup choices', async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, 'clipboard', {
@@ -289,7 +452,7 @@ describe('creative draft input', () => {
       value: { writeText }
     });
     render(App);
-    await fireEvent.click(screen.getByRole('button', { name: /Renders/ }));
+    await fireEvent.click(screen.getByRole('button', { name: /My videos/ }));
     await fireEvent.click(
       screen.getByRole('button', { name: /Macro wildflowers swaying in a soft summer storm/i })
     );
@@ -307,13 +470,13 @@ describe('creative draft input', () => {
     expect((await screen.findAllByText('Demo mode has no real file to open.')).length).toBeGreaterThan(0);
     expect(screen.queryByText(/Handed off to your system player/)).not.toBeInTheDocument();
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Delete render' }));
-    expect(screen.getByRole('dialog', { name: 'Remove this render?' })).toBeVisible();
-    expect(screen.getByRole('button', { name: 'Remove, keep video' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Delete video too/ })).toBeInTheDocument();
-    expect(screen.getByText(/fal\.ai keeps its own copy and job record/i)).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: 'Remove video job' }));
+    expect(screen.getByRole('dialog', { name: 'Remove this item from Video Harness?' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Remove job, keep file' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Remove job & delete file/ })).toBeInTheDocument();
+    expect(screen.getByText(/fal\.ai keeps its remote job and any provider-side copy/i)).toBeInTheDocument();
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Remove, keep video' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Remove job, keep file' }));
     await waitFor(() =>
       expect(
         screen.queryByRole('button', {
@@ -321,12 +484,12 @@ describe('creative draft input', () => {
         })
       ).not.toBeInTheDocument()
     );
-    expect(screen.getAllByText('Render cleared from your reel.').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Video job removed; saved file kept.').length).toBeGreaterThan(0);
   });
 
   it('keeps the selected render and detail pane synchronized when filters change', async () => {
     render(App);
-    await fireEvent.click(screen.getByRole('button', { name: /Renders/ }));
+    await fireEvent.click(screen.getByRole('button', { name: /My videos/ }));
 
     await fireEvent.change(screen.getByLabelText('Filter jobs'), {
       target: { value: 'completed' }
@@ -345,7 +508,7 @@ describe('creative draft input', () => {
 
   it('clears unsupported provider-specific controls when switching models', async () => {
     render(App);
-    const provider = screen.getByLabelText('Provider');
+    const provider = screen.getByLabelText('Video service');
     await waitFor(() => expect(provider).not.toBeDisabled());
 
     await fireEvent.change(provider, { target: { value: 'fal' } });
@@ -354,6 +517,11 @@ describe('creative draft input', () => {
     expect(screen.getByLabelText(/Generated audio/)).toBeDisabled();
     expect(screen.getByLabelText(/Seed/)).toHaveValue('');
     expect(screen.getByLabelText(/Seed/)).toBeDisabled();
-    expect(screen.getByText(/Connect fal\.ai backstage/)).toBeInTheDocument();
+    expect(screen.getByText(/Connect fal\.ai under Connections/)).toBeInTheDocument();
+    const connect = screen.getByRole('button', { name: 'Connect fal.ai' });
+    await fireEvent.click(connect);
+    expect(
+      screen.getByRole('heading', { name: 'Video services & API keys' })
+    ).toBeInTheDocument();
   });
 });

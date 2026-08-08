@@ -1,7 +1,13 @@
-# Native bundle notes
+# Canonical Tauri desktop bundle
 
-This archive is a best-effort fallback package for its named CPU architecture.
-The single-file AppImage is the primary portable Linux release.
+This archive contains the supported Tauri/Svelte desktop application for its
+named CPU architecture. It is a best-effort fallback package; the single-file
+AppImage remains the primary portable Linux release.
+
+Despite the historical "native bundle" name, this is not the deprecated
+Rust/GTK frontend from `native/src/gui`. Release archives always contain the
+canonical `video-harness` executable. The opt-in legacy executable is named
+`video-harness-gtk` and is never staged by this packaging flow.
 
 The release binary is built in the official Rust 1.95 Debian 13 (Trixie)
 container. It embeds the Svelte interface and dynamically uses the host's

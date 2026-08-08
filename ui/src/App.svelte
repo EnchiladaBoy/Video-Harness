@@ -90,6 +90,7 @@
   let holdBusy = $state<Record<string, boolean>>({});
   type MonitorAction = 'pause' | 'resume';
   let monitorBusy = $state<Record<string, MonitorAction | undefined>>({});
+  let bulkMonitorBusy = $state<MonitorAction>();
   let confirmedSafetyHolds = $state<Record<string, boolean>>({});
   let playbackUrl = $state('');
   let playbackReleaseError = $state('');
@@ -129,6 +130,7 @@
   let pendingSave: { revision: number; promise: Promise<void> } | undefined;
   let selectionEpoch = 0;
   let monitorTimers: Record<string, number> = {};
+  let bulkMonitorTimer: number | undefined;
 
   let providerModels = $derived(
     snapshot.models.filter((model) => model.providerId === snapshot.draft.providerId)
@@ -136,12 +138,19 @@
   let selectedModel = $derived(
     modelById(snapshot, snapshot.draft.providerId, snapshot.draft.modelId)
   );
+  let selectedProvider = $derived(
+    snapshot.providers.find((provider) => provider.id === snapshot.draft.providerId)
+  );
   let selectedJob = $derived(snapshot.jobs.find((job) => job.id === snapshot.selectedJobId));
   let selectedJobIdentifier = $derived(selectedJob?.providerJobId ?? selectedJob?.id ?? '');
   let activeJobCount = $derived(snapshot.jobs.filter(isActivelyMonitored).length);
-  let requiresOpenRouterUpload = $derived(
-    snapshot.draft.providerId === 'openrouter' &&
-      snapshot.draft.media.some((item) => item.source === 'local')
+  let pausableJobCount = $derived(snapshot.jobs.filter(canPauseMonitoring).length);
+  let resumableJobCount = $derived(snapshot.jobs.filter(canResumeMonitoring).length);
+  let monitoredJobCount = $derived(
+    snapshot.jobs.filter((job) => isActivelyMonitored(job) || canResumeMonitoring(job)).length
+  );
+  let requiresLocalMediaUpload = $derived(
+    snapshot.draft.media.some((item) => item.source === 'local')
   );
   let readinessIssue = $derived(reviewReadinessIssue(snapshot, ready));
   let canReview = $derived(
@@ -249,11 +258,11 @@
         void bridge
           .invalidatePrepared(snapshot.draft.revision)
           .catch((error) => showNotice(errorMessage(error), 'danger'));
-        showNotice('That Review belonged to an older edit. Prepare the latest scene instead.', 'warning');
+        showNotice('That review was for an older edit. Review the latest version instead.', 'warning');
         return;
       }
       reviewError = '';
-      announce('Review ready. Nothing paid happens until you press Generate.');
+      announce('Review ready. Nothing has been submitted or billed yet.');
       window.setTimeout(() => reviewDialog?.showModal(), 0);
     } else if (event.type === 'job_added') {
       isSubmitting = false;
@@ -262,7 +271,7 @@
       jobSearch = '';
       jobFilter = 'all';
       activeView = 'jobs';
-      announce('The provider accepted your request. Tiny Cloud Cinema is keeping watch.');
+      announce('The provider accepted your request. Video Harness is tracking it.');
       void focusJobsHeading();
       resumeDeferredClose();
     } else if (event.type === 'review_invalidated') {
@@ -286,6 +295,12 @@
       deleteDialog?.close();
       deleteError = '';
       void ensureVisibleJobSelection();
+    } else if (event.type === 'bulk_monitor_acknowledged') {
+      const targets = new Set(event.targetJobIds);
+      for (const [jobId, action] of Object.entries(monitorBusy)) {
+        if (action === event.action && !targets.has(jobId)) clearMonitorBusy(jobId);
+      }
+      settleBulkMonitorBusy();
     } else if (event.type === 'draft_saved') {
       if (latestDraft?.revision === event.revision && snapshot.draft.revision === event.revision) {
         latestDraft = undefined;
@@ -357,7 +372,7 @@
       } else if (review) {
         const reviewChanged = previous.preparedReview?.preparedId !== review.preparedId;
         if (reviewChanged && !isPreparing && !isSubmitting) {
-          announce('Review restored after refreshing the desktop session.');
+          announce('Your review was restored after the app refreshed.');
           window.setTimeout(() => {
             if (!reviewDialog?.open) reviewDialog?.showModal();
           }, 0);
@@ -382,7 +397,7 @@
       jobSearch = '';
       jobFilter = 'all';
       activeView = 'jobs';
-      announce('A render was recovered after refreshing the desktop session.');
+      announce('A video job was recovered after the app refreshed.');
       void focusJobsHeading();
     }
 
@@ -404,6 +419,7 @@
         settleMonitorBusy(after);
       }
     }
+    settleBulkMonitorBusy();
     void ensureVisibleJobSelection();
   }
 
@@ -429,6 +445,12 @@
           detectAddedJob: false,
           operations: session
         });
+        if (bridge.mode === 'tauri' && resumableJobCount > 0) {
+          showNotice(
+            `Recovered ${resumableJobCount} provider ${resumableJobCount === 1 ? 'job' : 'jobs'}. Open My videos and choose Resume all to continue checking ${resumableJobCount === 1 ? 'it' : 'them'}.`,
+            'warning'
+          );
+        }
         replayBufferedEvents();
         if (activeCloseRequestId !== undefined && !closeCommitted) {
           handleCloseRequest(activeCloseRequestId);
@@ -474,6 +496,7 @@
       if (copyTimer) window.clearTimeout(copyTimer);
       if (announceTimer) window.clearTimeout(announceTimer);
       for (const timer of Object.values(monitorTimers)) window.clearTimeout(timer);
+      if (bulkMonitorTimer) window.clearTimeout(bulkMonitorTimer);
       playbackEpoch += 1;
       void releasePlayback();
     };
@@ -538,7 +561,7 @@
     if (requestId === undefined) return;
     if (isSubmitting) {
       closeRequestedAfterSubmission = true;
-      announce('Close requested. Waiting for the paid submission outcome first.');
+      announce('Close requested. Waiting for the paid request to finish safely first.');
       return;
     }
     uploadDialog?.close();
@@ -741,13 +764,13 @@
     if (skipped > 0) {
       showNotice(
         accepted.length > 0
-          ? `${accepted.length} added; ${skipped} skipped to stay within this model’s media limits.`
-          : 'No references were added because this model or draft has no room for them.',
+          ? `${accepted.length} added; ${skipped} skipped because this model cannot accept more.`
+          : 'No references were added because this model cannot accept them.',
         'warning'
       );
     } else {
       showNotice(
-        `${accepted.length} ${accepted.length === 1 ? 'reference' : 'references'} tucked in.`,
+        `${accepted.length} ${accepted.length === 1 ? 'reference' : 'references'} added.`,
         'good'
       );
     }
@@ -829,6 +852,7 @@
     }
   }
 
+
   function removeMedia(handle: string): void {
     editDraft((draft) => {
       draft.media = draft.media.filter((item) => item.handle !== handle);
@@ -853,7 +877,7 @@
 
   function beginReview(): void {
     if (!canReview) return;
-    if (requiresOpenRouterUpload) uploadDialog.showModal();
+    if (requiresLocalMediaUpload) uploadDialog.showModal();
     else void prepareReview(false);
   }
 
@@ -861,7 +885,7 @@
     uploadDialog?.close();
     isPreparing = true;
     reviewError = '';
-    announce('Preparing your Review and a fresh price estimate.');
+    announce('Checking your settings and getting a fresh price estimate.');
     if (saveTimer) {
       window.clearTimeout(saveTimer);
       saveTimer = undefined;
@@ -874,7 +898,7 @@
       await queueDraftSave(reviewedDraft, false);
       if (snapshot.draft.revision !== reviewedDraft.revision) {
         isPreparing = false;
-        showNotice('The scene changed while saving. Review the latest take instead.', 'warning');
+        showNotice('Your draft changed while it was saving. Review the latest version instead.', 'warning');
         return;
       }
       await bridge.prepareGeneration(reviewedDraft, { localMediaUploadConfirmed });
@@ -900,7 +924,7 @@
 
   function closeReview(): void {
     if (isSubmitting) {
-      reviewError = 'The paid request is already being submitted. Keep this window open until its outcome is known.';
+      reviewError = 'The paid request is already being sent. Keep this window open until the provider responds.';
       return;
     }
     reviewError = '';
@@ -942,7 +966,7 @@
     holdBusy[handle] = true;
     try {
       await bridge.acknowledgeSafetyHold(handle);
-      showNotice('Dashboard check sent. You can Review this exact request once the hold clears.', 'good');
+      showNotice('The block was cleared. You can review this request again.', 'good');
     } catch (error) {
       showNotice(errorMessage(error), 'danger');
     } finally {
@@ -1002,6 +1026,50 @@
         ? canResumeMonitoring(job)
         : job.monitorState === 'active' && canPauseMonitoring(job);
     if (terminal || reachedTarget) clearMonitorBusy(job.id);
+    settleBulkMonitorBusy();
+  }
+
+  function clearBulkMonitorBusy(clearJobs = false): void {
+    const action = bulkMonitorBusy;
+    bulkMonitorBusy = undefined;
+    if (bulkMonitorTimer) window.clearTimeout(bulkMonitorTimer);
+    bulkMonitorTimer = undefined;
+    if (clearJobs && action) {
+      for (const [jobId, pending] of Object.entries(monitorBusy)) {
+        if (pending === action) clearMonitorBusy(jobId);
+      }
+    }
+  }
+
+  function settleBulkMonitorBusy(): void {
+    const action = bulkMonitorBusy;
+    if (action && !Object.values(monitorBusy).some((pending) => pending === action)) {
+      clearBulkMonitorBusy();
+    }
+  }
+
+  async function changeAllMonitoring(action: MonitorAction): Promise<void> {
+    if (bulkMonitorBusy || Object.keys(monitorBusy).length > 0) return;
+    const candidates = snapshot.jobs.filter((job) =>
+      action === 'pause' ? canPauseMonitoring(job) : canResumeMonitoring(job)
+    );
+    if (candidates.length === 0) return;
+    bulkMonitorBusy = action;
+    for (const job of candidates) monitorBusy[job.id] = action;
+    bulkMonitorTimer = window.setTimeout(() => {
+      clearBulkMonitorBusy(true);
+      showNotice(
+        'Some monitoring changes are taking longer than expected. Check the latest job statuses.',
+        'warning'
+      );
+    }, 15_000);
+    try {
+      if (action === 'pause') await bridge.pauseAllJobs();
+      else await bridge.resumeAllJobs();
+    } catch (error) {
+      clearBulkMonitorBusy(true);
+      showNotice(errorMessage(error), 'danger');
+    }
   }
 
   async function toggleJobMonitoring(): Promise<void> {
@@ -1113,7 +1181,7 @@
       const playback = videoElement?.play();
       if (playback) await playback;
     } catch {
-      showNotice('Your film is loaded—press play when you’re ready.', 'neutral');
+      showNotice('Your video is loaded—press play when you’re ready.', 'neutral');
     }
   }
 
@@ -1197,9 +1265,9 @@
       }
       await bridge.deleteRender(job.id, deleteOutput);
       deleteDialog.close();
-      announce('Render removed from your reel.');
+      announce('Video job removed from Video Harness.');
       showNotice(
-        deleteOutput ? 'Render and saved video deleted.' : 'Render cleared from your reel.',
+        deleteOutput ? 'Video job and saved file deleted.' : 'Video job removed; saved file kept.',
         'good'
       );
     } catch (error) {
@@ -1239,9 +1307,9 @@
   }
 
   function compatibilityMessage(): string {
-    if (isSubmitting) return 'Submitting the paid request once…';
-    if (isPreparing) return 'Preparing a fresh Review…';
-    return readinessIssue ?? 'All set for Review.';
+    if (isSubmitting) return 'Sending one paid request…';
+    if (isPreparing) return 'Checking settings and price…';
+    return readinessIssue ?? 'Ready to review price and details.';
   }
 </script>
 
@@ -1251,7 +1319,7 @@
   <header class="topbar">
     <button class="brand" aria-label="Video Harness home" onclick={() => setView('create')}>
       <span class="brand__mark" aria-hidden="true"><span></span><span></span></span>
-      <span class="brand__words"><strong>Video Harness</strong><small>Tiny movie studio</small></span>
+      <span class="brand__words"><strong>Video Harness</strong><small>Create AI videos safely</small></span>
     </button>
 
     <nav class="primary-nav" aria-label="Workspace">
@@ -1259,11 +1327,11 @@
         <Icon name="spark" size={17} /><span>Create</span>
       </button>
       <button class:active={activeView === 'jobs'} aria-current={activeView === 'jobs' ? 'page' : undefined} onclick={() => setView('jobs')}>
-        <Icon name="film" size={17} /><span>Renders</span>
-        {#if activeJobCount > 0}<span class="nav-count" aria-label={`${activeJobCount} active jobs`}>{activeJobCount}</span>{/if}
+        <Icon name="film" size={17} /><span>My videos</span>
+        {#if monitoredJobCount > 0}<span class="nav-count" aria-label={`${activeJobCount} active, ${resumableJobCount} ready to resume`}>{monitoredJobCount}</span>{/if}
       </button>
       <button class:active={activeView === 'providers'} aria-current={activeView === 'providers' ? 'page' : undefined} onclick={() => setView('providers')}>
-        <Icon name="plug" size={17} /><span>Providers</span>
+        <Icon name="plug" size={17} /><span>Connections</span>
       </button>
     </nav>
 
@@ -1291,9 +1359,9 @@
     <main class="workspace create-page">
       <section class="page-heading">
         <div>
-          <p class="eyebrow">New scene</p>
-          <h1>Make a little movie magic.</h1>
-          <p>Set the scene, add a clue or two, then check everything before the paid part.</p>
+          <p class="eyebrow">New video</p>
+          <h1>Create a video.</h1>
+          <p>Describe what you want, add references if they help, then review the price and details before anything is submitted.</p>
         </div>
         <span class:unsaved={!snapshot.draftSaved} class="save-state">
           <span aria-hidden="true">{snapshot.draftSaved ? '●' : '○'}</span>
@@ -1306,8 +1374,8 @@
           <section class="card prompt-card" aria-labelledby="prompt-heading">
             <div class="card-heading">
               <div>
-                <p class="step-label">01 / THE SCENE</p>
-                <h2 id="prompt-heading">Set the scene.</h2>
+                <p class="step-label">1 / DESCRIBE</p>
+                <h2 id="prompt-heading">What should the video show?</h2>
               </div>
               <span class="character-count">{snapshot.draft.prompt.length.toLocaleString()} / 8,000</span>
             </div>
@@ -1323,16 +1391,16 @@
               onblur={() => void flushLatestDraft().catch(() => undefined)}
             ></textarea>
             <div class="prompt-footnote">
-              <p>Motion, light, framing, pace—the little things make the shot.</p>
+              <p>Try describing the subject, movement, setting, lighting, and camera style.</p>
             </div>
           </section>
 
           <section class="card media-card" aria-labelledby="media-heading">
             <div class="card-heading">
               <div>
-                <p class="step-label">02 / LITTLE CLUES</p>
-                <h2 id="media-heading">Bring a few clues.</h2>
-                <p>Guide the shot with a frame, clip, or sound.</p>
+                <p class="step-label">2 / REFERENCES · OPTIONAL</p>
+                <h2 id="media-heading">Add images, video, or audio.</h2>
+                <p>Reference files can guide the look, motion, first or last frame, or sound.</p>
               </div>
               {#if snapshot.draft.media.length > 0}<span class="count-pill">{snapshot.draft.media.length}</span>{/if}
             </div>
@@ -1350,8 +1418,8 @@
             >
               <div class="drop-zone__icon" aria-hidden="true"><Icon name="paperclip" size={24} /></div>
               <div>
-                <strong>{dropActive ? 'That’s it—drop them here' : 'Drop a frame, clip, or sound'}</strong>
-                <p>Nothing leaves your device until you approve an upload in Review.</p>
+                <strong>{dropActive ? 'Drop the files here' : 'Drop reference files here'}</strong>
+                <p>Files stay on this device unless you explicitly approve an upload during review.</p>
               </div>
               <button class="button button--secondary" disabled={mediaBusy} onclick={chooseMedia}>
                 <Icon name="plus" size={16} /> {mediaBusy ? 'Checking…' : 'Choose files'}
@@ -1442,9 +1510,9 @@
 
         <aside class="compose-inspector" aria-label="Provider and generation settings">
           <section class="card inspector-card">
-            <div class="inspector-title"><span class="step-label">03 / THE CAMERA</span><span class="live-catalog">Model catalog</span></div>
+            <div class="inspector-title"><span class="step-label">3 / SETTINGS</span><span class="live-catalog">Available models</span></div>
             <label class="field">
-              <span>Provider</span>
+              <span>Video service</span>
               <select value={snapshot.draft.providerId} onchange={(event) => changeProvider(event.currentTarget.value as ProviderId)}>
                 {#each snapshot.providers as provider (provider.id)}
                   <option value={provider.id}>{provider.name}{provider.connected ? ' · Connected' : ' · Needs key'}</option>
@@ -1453,7 +1521,7 @@
             </label>
 
             <label class="field model-field">
-              <span>Model</span>
+              <span>Video model</span>
               <select title={selectedModel?.name} value={snapshot.draft.modelId} onchange={(event) => changeModel(event.currentTarget.value)}>
                 {#if providerModels.length === 0}<option value="">{ready ? 'No models available' : 'Loading models…'}</option>{/if}
                 {#each providerModels as model (model.id)}<option value={model.id}>{model.name}</option>{/each}
@@ -1482,10 +1550,10 @@
               <label class="field"><span>Generated audio</span><select disabled={!selectedModel || (!selectedModel.capabilities.generatedAudio && snapshot.draft.settings.generatedAudio === 'provider_default')} value={snapshot.draft.settings.generatedAudio} onchange={(event) => editDraft((draft) => (draft.settings.generatedAudio = event.currentTarget.value as GenerationDraft['settings']['generatedAudio']))}><option value="provider_default">Provider default</option><option value="on" disabled={!selectedModel?.capabilities.generatedAudio}>On</option><option value="off" disabled={!selectedModel?.capabilities.generatedAudio}>Off</option></select></label>
               <label class="field field--wide"><span>Seed <small>{selectedModel?.capabilities.seed === false ? 'not supported' : 'optional'}</small></span><input inputmode="numeric" maxlength="20" disabled={selectedModel?.capabilities.seed === false && !snapshot.draft.settings.seed} placeholder="Random" value={snapshot.draft.settings.seed} oninput={(event) => editDraft((draft) => (draft.settings.seed = event.currentTarget.value))} onblur={() => void flushLatestDraft().catch(() => undefined)} /></label>
               <details class="advanced-settings field--wide">
-                <summary>Extra model settings <small>JSON · optional</small></summary>
+                <summary>Advanced settings <small>JSON · optional</small></summary>
                 <label class="sr-only" for="advanced-json">Extra model settings JSON</label>
                 <textarea id="advanced-json" rows="5" maxlength="100000" spellcheck="false" placeholder={'{\n  "guidance_scale": 5\n}'} value={snapshot.draft.settings.advancedJson} oninput={(event) => editDraft((draft) => (draft.settings.advancedJson = event.currentTarget.value))} onblur={() => void flushLatestDraft().catch(() => undefined)}></textarea>
-                <p>Advanced values are sent to the selected model. Review shows the exact saved object before payment.</p>
+                <p>Only use values documented by the model. You will see the exact saved settings again before payment.</p>
               </details>
             </div>
           </section>
@@ -1493,12 +1561,18 @@
           <section class="review-launcher" aria-label="Review readiness">
             <div class="readiness"><span class:ready={canReview} class="readiness__dot" aria-hidden="true"></span><p>{compatibilityMessage()}</p></div>
             {#if snapshot.preparedReview}
-              <button class="button button--secondary button--full" onclick={() => reviewDialog.showModal()}>Open Review</button>
+              <button class="button button--secondary button--full" onclick={() => reviewDialog.showModal()}>Open saved review</button>
             {/if}
-            <button class="button button--primary button--full" disabled={!canReview} onclick={beginReview}>
-              <Icon name="spark" size={17} /> {isPreparing ? 'Preparing Review…' : 'Review this shot'}
-            </button>
-            <p class="billing-note">Review may upload the local files above. It does not start a paid generation.</p>
+            {#if selectedProvider && !selectedProvider.connected}
+              <button class="button button--primary button--full" onclick={() => setView('providers')}>
+                <Icon name="plug" size={17} /> Connect {selectedProvider.name}
+              </button>
+            {:else}
+              <button class="button button--primary button--full" disabled={!canReview} onclick={beginReview}>
+                <Icon name="spark" size={17} /> {isPreparing ? 'Checking settings & price…' : 'Review price & details'}
+              </button>
+            {/if}
+            <p class="billing-note">Reviewing does not start a paid generation. If local files need uploading, Video Harness asks first.</p>
           </section>
         </aside>
       </div>
@@ -1506,19 +1580,25 @@
   {:else if activeView === 'jobs'}
     <main class="workspace jobs-page">
       <section class="page-heading jobs-heading" bind:this={jobsHeadingElement} tabindex="-1">
-        <div><p class="eyebrow">Screening room</p><h1>Your films, taking shape.</h1><p>Watch each render grow, then play the finished cut.</p></div>
-        <div class="job-summary"><strong>{activeJobCount}</strong><span>active {activeJobCount === 1 ? 'render' : 'renders'}</span></div>
+        <div><p class="eyebrow">My videos</p><h1>Track and play your videos.</h1><p>Video Harness keeps accepted provider jobs here so you can resume them after restarting the app.</p></div>
+        <div class="jobs-heading__actions">
+          <div class="job-summary"><strong>{activeJobCount}</strong><span>active {activeJobCount === 1 ? 'job' : 'jobs'}</span></div>
+          <div class="bulk-monitor-actions" role="group" aria-label="All job monitoring controls">
+            <button class="button button--secondary" disabled={pausableJobCount === 0 || Boolean(bulkMonitorBusy) || Object.keys(monitorBusy).length > 0} onclick={() => void changeAllMonitoring('pause')}><Icon name="pause" size={15} /> {bulkMonitorBusy === 'pause' ? 'Pausing all…' : `Pause all (${pausableJobCount})`}</button>
+            <button class="button button--secondary" disabled={resumableJobCount === 0 || Boolean(bulkMonitorBusy) || Object.keys(monitorBusy).length > 0} onclick={() => void changeAllMonitoring('resume')}><Icon name="play" size={15} /> {bulkMonitorBusy === 'resume' ? 'Resuming all…' : `Resume all (${resumableJobCount})`}</button>
+          </div>
+        </div>
       </section>
 
       <div class="jobs-layout">
         <aside class="jobs-sidebar" aria-label="Generation jobs">
           <div class="jobs-tools">
-            <label class="search-field"><span class="sr-only">Search renders</span><Icon name="search" size={17} /><input value={jobSearch} oninput={(event) => updateJobSearch(event.currentTarget.value)} type="search" placeholder="Search renders" /></label>
+            <label class="search-field"><span class="sr-only">Search videos</span><Icon name="search" size={17} /><input value={jobSearch} oninput={(event) => updateJobSearch(event.currentTarget.value)} type="search" placeholder="Search videos" /></label>
             <label class="sr-only" for="job-filter">Filter jobs</label>
             <select id="job-filter" class="filter-select" value={jobFilter} onchange={(event) => updateJobFilter(event.currentTarget.value as typeof jobFilter)}><option value="all">All</option><option value="active">Active</option><option value="attention">Needs attention</option><option value="completed">Completed</option></select>
           </div>
           {#if filteredJobs.length === 0}
-            <div class="sidebar-empty"><Icon name="film" size={25} /><p>{snapshot.jobs.length === 0 ? 'No renders yet. Review a shot to begin.' : 'Nothing matches this reel.'}</p></div>
+            <div class="sidebar-empty"><Icon name="film" size={25} /><p>{snapshot.jobs.length === 0 ? 'No video jobs yet. Create a video to begin.' : 'No videos match this search.'}</p></div>
           {:else}
             <div class="job-list">
               {#each filteredJobs as job (job.id)}
@@ -1543,13 +1623,13 @@
                   <button class="button button--primary" disabled={outputBusy || playbackBusy} onclick={() => void playSelectedOutput()}><Icon name="play" size={16} /> {playbackBusy ? 'Loading…' : 'Play here'}</button>
                   <button class="button button--secondary" disabled={outputBusy || playbackBusy} onclick={() => void openSelectedOutput()}><Icon name="external" size={16} /> {outputBusy ? 'Opening…' : 'Open in player'}</button>
                 {/if}
-                {#if selectedJob.deletable}<button class="icon-button icon-button--danger" disabled={playbackBusy || deleteBusy} aria-label="Delete render" title="Delete render" onclick={askToDeleteRender}><Icon name="trash" size={17} /></button>{/if}
+                {#if selectedJob.deletable}<button class="icon-button icon-button--danger" disabled={playbackBusy || deleteBusy} aria-label="Remove video job" title="Remove video job" onclick={askToDeleteRender}><Icon name="trash" size={17} /></button>{/if}
               </div>
             </div>
 
             {#if selectedJob.status === 'completed' && selectedJob.hasLocalOutput}
               <section class="player-card" aria-labelledby="player-heading">
-                <div class="player-card__heading"><div><p class="micro-label">Finished film</p><h3 id="player-heading">{selectedJob.outputFileName ?? 'Generated video'}</h3></div><button class="text-button" disabled={playbackBusy} onclick={() => void playSelectedOutput()}>{playbackBusy ? 'Loading…' : playbackUrl ? 'Play again' : 'Load & play'}</button></div>
+                <div class="player-card__heading"><div><p class="micro-label">Finished video</p><h3 id="player-heading">{selectedJob.outputFileName ?? 'Generated video'}</h3></div><button class="text-button" disabled={playbackBusy} onclick={() => void playSelectedOutput()}>{playbackBusy ? 'Loading…' : playbackUrl ? 'Play again' : 'Load & play'}</button></div>
                 {#if selectedJob.captionsUrl}
                   <video bind:this={videoElement} controls preload="metadata" poster="/demo-poster.svg" src={playbackUrl || selectedJob.playbackUrl || undefined} aria-label={`Generated video: ${selectedJob.prompt}`}>
                     <track kind="captions" srclang="en" label="English" src={selectedJob.captionsUrl} default />
@@ -1569,19 +1649,19 @@
               <section class="card detail-card provider-id-card">
                 <div class="provider-id-heading"><div><p class="micro-label">{selectedJob.providerJobId ? 'Provider job ID' : 'Local job handle'}</p><span>{selectedJob.providerName}</span></div><button class="text-button copy-id-button" aria-label={selectedJob.providerJobId ? 'Copy provider job ID' : 'Copy local job handle'} onclick={() => void copyJobIdentifier(selectedJobIdentifier, selectedJob.id)}>{copiedJobId === selectedJob.id ? 'Copied ✓' : 'Copy ID'}</button></div>
                 <code bind:this={jobIdentifierElement} class="provider-id-value" tabindex="-1">{selectedJobIdentifier}</code>
-                <p>{selectedJob.providerJobId ? 'Handy if you need to find this render with the provider.' : 'This local handle identifies the render inside Video Harness.'}</p>
+                <p>{selectedJob.providerJobId ? 'Use this ID to find the job on the provider’s website.' : 'This local handle identifies the job inside Video Harness.'}</p>
                 <p>Started {formatDate(selectedJob.createdAt)}</p>
               </section>
             </div>
           {:else}
-            <div class="detail-empty"><div class="empty-illustration"><Icon name="film" size={30} /></div><h2>Pick a render</h2><p>Its progress, Tiny Cloud Cinema, and finished video will appear here.</p></div>
+            <div class="detail-empty"><div class="empty-illustration"><Icon name="film" size={30} /></div><h2>Choose a video job</h2><p>Its progress, provider job ID, and finished video will appear here.</p></div>
           {/if}
         </section>
       </div>
     </main>
   {:else}
     <main class="workspace providers-page">
-      <section class="page-heading"><div><p class="eyebrow">Backstage</p><h1>Providers &amp; keys</h1><p>Connect the services that make the magic. Keys stay out of drafts and history.</p></div><div class="privacy-chip"><Icon name="key" size={16} /> System keyring when available</div></section>
+      <section class="page-heading"><div><p class="eyebrow">Connections</p><h1>Video services &amp; API keys</h1><p>Connect the service you want to use. API keys are never saved in drafts or video history.</p></div><div class="privacy-chip"><Icon name="key" size={16} /> System keyring when available</div></section>
       <div class="provider-grid">
         {#each snapshot.providers as provider (provider.id)}
           <section class:connected={provider.connected} class="card provider-card">
@@ -1605,74 +1685,74 @@
       </div>
       {#if snapshot.safetyHolds.length > 0}
         <section class="safety-holds" aria-labelledby="safety-holds-title">
-          <div class="safety-holds__heading"><Icon name="warning" size={22} /><div><p class="eyebrow">Double-charge guard</p><h2 id="safety-holds-title">These requests need a quick check.</h2><p>Each hold stops the exact request from being submitted—and possibly billed—twice.</p></div></div>
+          <div class="safety-holds__heading"><Icon name="warning" size={22} /><div><p class="eyebrow">Possible duplicate payment</p><h2 id="safety-holds-title">Check these requests before trying again.</h2><p>Video Harness did not receive a clear provider response, so it blocked each exact request from being submitted and possibly billed twice.</p></div></div>
           <div class="safety-holds__list">
             {#each snapshot.safetyHolds as hold (hold.handle)}
               <article class="card safety-hold">
                 <div><p class="micro-label">{hold.providerName} · {formatDate(hold.recordedAt)}</p><h3>We don’t know whether the provider accepted this request.</h3><p>{hold.message}</p></div>
-                <label class="check-row"><input type="checkbox" bind:checked={confirmedSafetyHolds[hold.handle]} /><span><strong>I checked the {hold.providerName} dashboard</strong><small>I understand that clearing this hold permits this exact paid request again.</small></span></label>
-                <button class="button button--danger" type="button" disabled={!confirmedSafetyHolds[hold.handle] || holdBusy[hold.handle]} onclick={() => void acknowledgeSafetyHold(hold.handle)}>{holdBusy[hold.handle] ? 'Clearing hold…' : 'Dashboard checked — clear hold'}</button>
+                <label class="check-row"><input type="checkbox" bind:checked={confirmedSafetyHolds[hold.handle]} /><span><strong>I checked the {hold.providerName} dashboard</strong><small>I understand that another attempt may create a second charge.</small></span></label>
+                <button class="button button--danger" type="button" disabled={!confirmedSafetyHolds[hold.handle] || holdBusy[hold.handle]} onclick={() => void acknowledgeSafetyHold(hold.handle)}>{holdBusy[hold.handle] ? 'Allowing another attempt…' : 'Allow another paid attempt'}</button>
               </article>
             {/each}
           </div>
         </section>
       {/if}
-      <section class="privacy-note"><Icon name="key" size={22} /><div><h2>Your key stays backstage.</h2><p>It goes straight to the Rust credential service, then leaves the form. No browser storage, logs, drafts, or job events.</p></div></section>
+      <section class="privacy-note"><Icon name="key" size={22} /><div><h2>Your API key stays private.</h2><p>It goes directly to the desktop credential service, then leaves this form. It is never put in browser storage, logs, drafts, or job events.</p></div></section>
     </main>
   {/if}
 </div>
 
 <dialog class="sheet-dialog delete-dialog" bind:this={deleteDialog} aria-labelledby="delete-title" oncancel={(event) => deleteBusy && event.preventDefault()}>
   <div class="dialog-accent dialog-accent--danger" aria-hidden="true"></div>
-  <div class="dialog-heading"><div class="dialog-icon dialog-icon--danger"><Icon name="trash" size={21} /></div><div><p class="eyebrow">Clear the reel</p><h2 id="delete-title">Remove this render?</h2></div><button class="icon-button" aria-label="Cancel render deletion" disabled={deleteBusy} onclick={() => deleteDialog.close()}><Icon name="x" size={18} /></button></div>
+  <div class="dialog-heading"><div class="dialog-icon dialog-icon--danger"><Icon name="trash" size={21} /></div><div><p class="eyebrow">Remove video job</p><h2 id="delete-title">Remove this item from Video Harness?</h2></div><button class="icon-button" aria-label="Cancel removal" disabled={deleteBusy} onclick={() => deleteDialog.close()}><Icon name="x" size={18} /></button></div>
   <div class="dialog-body delete-dialog__body">
-    <p>It’ll disappear from Video Harness. {selectedJob?.providerName ?? 'The provider'} keeps its own copy and job record.</p>
+    <p>This removes the local history entry. {selectedJob?.providerName ?? 'The provider'} keeps its remote job and any provider-side copy.</p>
     {#if selectedJob?.hasLocalOutput}<div class="delete-file-note"><Icon name="video" size={18} /><span><strong>{selectedJob.outputFileName ?? 'Saved generated video'}</strong><small>You choose whether this saved file stays in your Videos folder.</small></span></div>{/if}
     {#if deleteError}<div class="dialog-error" role="alert"><Icon name="warning" size={17} /><p>{deleteError}</p></div>{/if}
   </div>
   <div class="dialog-actions delete-dialog__actions">
     <button class="button button--secondary" disabled={deleteBusy} onclick={() => deleteDialog.close()}>Never mind</button>
-    <button class="button button--secondary" disabled={deleteBusy} onclick={() => void deleteSelectedRender(false)}>{deleteBusy ? 'Clearing…' : selectedJob?.hasLocalOutput ? 'Remove, keep video' : 'Remove from reel'}</button>
-    {#if selectedJob?.hasLocalOutput}<button class="button button--danger" disabled={deleteBusy} onclick={() => void deleteSelectedRender(true)}><Icon name="trash" size={16} /> {deleteBusy ? 'Deleting…' : 'Delete video too'}</button>{/if}
+    <button class="button button--secondary" disabled={deleteBusy} onclick={() => void deleteSelectedRender(false)}>{deleteBusy ? 'Removing…' : selectedJob?.hasLocalOutput ? 'Remove job, keep file' : 'Remove job'}</button>
+    {#if selectedJob?.hasLocalOutput}<button class="button button--danger" disabled={deleteBusy} onclick={() => void deleteSelectedRender(true)}><Icon name="trash" size={16} /> {deleteBusy ? 'Deleting…' : 'Remove job & delete file'}</button>{/if}
   </div>
 </dialog>
 
 <dialog class="sheet-dialog" bind:this={uploadDialog} aria-labelledby="upload-title">
   <div class="dialog-accent dialog-accent--warning" aria-hidden="true"></div>
-  <div class="dialog-heading"><div class="dialog-icon dialog-icon--warning"><Icon name="paperclip" size={22} /></div><div><p class="eyebrow">Before Review</p><h2 id="upload-title">One small detour: these files need a public link.</h2></div><button class="icon-button" aria-label="Cancel upload" onclick={() => uploadDialog.close()}><Icon name="x" size={18} /></button></div>
+  <div class="dialog-heading"><div class="dialog-icon dialog-icon--warning"><Icon name="paperclip" size={22} /></div><div><p class="eyebrow">Upload permission</p><h2 id="upload-title">Upload local files to create shareable links?</h2></div><button class="icon-button" aria-label="Cancel upload" onclick={() => uploadDialog.close()}><Icon name="x" size={18} /></button></div>
   <div class="dialog-body">
-    <p>OpenRouter accepts reference media by public HTTPS URL. To prepare this Review, Video Harness will upload <strong>{snapshot.draft.media.filter((item) => item.source === 'local').length} local {snapshot.draft.media.filter((item) => item.source === 'local').length === 1 ? 'file' : 'files'}</strong> to fal.ai's public-by-link CDN.</p>
-    <ul class="disclosure-list"><li>Anyone with the link can download the file.</li><li>Video Harness asks for the link to expire after 24 hours.</li><li>The link is shared with OpenRouter and the selected model provider.</li><li>This only prepares Review; starting the paid generation takes a separate click.</li></ul>
-    <div class="safety-callout"><Icon name="check" size={18} /><span>Choose Keep files local and nothing leaves this device.</span></div>
+    <p>{snapshot.draft.providerId === 'openrouter' ? 'OpenRouter needs reference media at public HTTPS links. To prepare your review, Video Harness will first upload' : 'The selected fal.ai model needs your local references uploaded before it can use them. To prepare your review, Video Harness will upload'} <strong>{snapshot.draft.media.filter((item) => item.source === 'local').length} local {snapshot.draft.media.filter((item) => item.source === 'local').length === 1 ? 'file' : 'files'}</strong> to fal.ai's public-by-link storage.{snapshot.draft.providerId === 'openrouter' ? ' The resulting links are then shared with OpenRouter and the selected model provider.' : ''}</p>
+    <ul class="disclosure-list"><li>Anyone with the link can download the file.</li><li>Video Harness asks for the link to expire after 24 hours.</li><li>{snapshot.draft.providerId === 'openrouter' ? 'The link is shared with OpenRouter and the selected model provider.' : 'The link is used only by the selected fal.ai model.'}</li><li>This only prepares the review; starting the paid generation takes a separate click.</li></ul>
+    <div class="safety-callout"><Icon name="check" size={18} /><span>Choose Cancel and keep files local to send nothing.</span></div>
   </div>
-  <div class="dialog-actions"><button class="button button--secondary" onclick={() => uploadDialog.close()}>Keep files local</button><button class="button button--primary" onclick={() => void prepareReview(true)}>Upload for Review</button></div>
+  <div class="dialog-actions"><button class="button button--secondary" onclick={() => uploadDialog.close()}>Cancel — keep files local</button><button class="button button--primary" onclick={() => void prepareReview(true)}>Upload files for review</button></div>
 </dialog>
 
 <dialog class="sheet-dialog review-dialog" bind:this={reviewDialog} aria-labelledby="review-title" aria-describedby={isSubmitting ? 'submission-state' : undefined} oncancel={(event) => { event.preventDefault(); closeReview(); }}>
   {#if snapshot.preparedReview}
     {@const review = snapshot.preparedReview}
     <div class="dialog-accent" aria-hidden="true"></div>
-    <div class="dialog-heading"><div class="dialog-icon"><Icon name="spark" size={22} /></div><div><p class="eyebrow">Final check</p><h2 id="review-title">One last look before the lights go down.</h2></div><button class="icon-button" aria-label="Close Review" disabled={isSubmitting} onclick={closeReview}><Icon name="x" size={18} /></button></div>
-    <div class="review-price"><div><span>Fresh estimate</span><strong>{review.estimatedCost}</strong></div><p>Estimate only — your provider’s final usage is what counts.</p></div>
+    <div class="dialog-heading"><div class="dialog-icon"><Icon name="spark" size={22} /></div><div><p class="eyebrow">Before payment</p><h2 id="review-title">Review price and details.</h2></div><button class="icon-button" aria-label="Close review" disabled={isSubmitting} onclick={closeReview}><Icon name="x" size={18} /></button></div>
+    <div class="review-price"><div><span>Estimated cost</span><strong>{review.estimatedCost}</strong></div><p>This is an estimate. Your provider decides the final charge.</p></div>
     <div class="dialog-body review-body">
       {#if review.uploadDisclosure}<div class="review-disclosure"><Icon name="warning" size={18} /><p>{review.uploadDisclosure}</p></div>{/if}
       <section><p class="micro-label">Prompt</p><p class="review-prompt">{review.prompt}</p></section>
       <div class="review-facts"><div><span>Provider</span><strong>{review.providerName}</strong></div><div><span>Model</span><strong title={review.modelName}>{review.modelName}</strong></div><div><span>Duration</span><strong>{review.settings.duration || 'Provider default'}</strong></div><div><span>Output</span><strong>{review.settings.resolution || 'Provider default'} · {review.settings.aspectRatio || 'Provider default'}</strong></div>{#if review.settings.size}<div><span>Exact size</span><strong>{review.settings.size}</strong></div>{/if}<div><span>Generated audio</span><strong>{review.settings.generatedAudio === 'on' ? 'On' : review.settings.generatedAudio === 'off' ? 'Off' : 'Provider default'}</strong></div><div><span>Seed</span><strong>{review.settings.seed || 'Random / provider default'}</strong></div></div>
       {#if review.advancedSettingsJson}<section class="review-advanced"><div><p class="micro-label">Extra model settings</p><p>These saved settings are included in this paid request.</p></div><pre>{review.advancedSettingsJson}</pre></section>{/if}
       {#if review.media.length > 0}<section><p class="micro-label">Reference media</p><ul class="review-media">{#each review.media as item (item.handle)}<li><Icon name={item.kind} size={16} /><span>{item.displayName}{#if item.displayUrl}<small title={item.displayUrl}>{item.displayUrl}</small>{/if}</span><small>{mediaRoleLabel(item.role)}</small></li>{/each}</ul></section>{/if}
-      <p class="review-expiry"><Icon name="clock" size={15} /> Review expires at {formatDate(review.expiresAt)}. Any edit makes a fresh Review.</p>
-      {#if isSubmitting}<div id="submission-state" class="submission-state" role="status"><Icon name="clock" size={18} /><p><strong>Submitting exactly once…</strong><span>This paid request is in flight. Review stays locked until the provider outcome is known.</span>{#if closeRequestedAfterSubmission}<span>Video Harness will save and close after that outcome arrives.</span>{/if}</p></div>{/if}
+      <p class="review-expiry"><Icon name="clock" size={15} /> This review expires at {formatDate(review.expiresAt)}. Any edit requires a new review.</p>
+      {#if isSubmitting}<div id="submission-state" class="submission-state" role="status"><Icon name="clock" size={18} /><p><strong>Sending one paid request…</strong><span>Video Harness will not retry it automatically. This window stays locked until the provider responds.</span>{#if closeRequestedAfterSubmission}<span>Video Harness will save and close after that response arrives.</span>{/if}</p></div>{/if}
       {#if reviewError}<div class="dialog-error" role="alert"><Icon name="warning" size={17} /><p>{reviewError}</p></div>{/if}
     </div>
-    <div class="dialog-actions dialog-actions--paid"><button class="button button--secondary" disabled={isSubmitting} onclick={closeReview}>Go back</button><div><span>Exactly one paid provider request</span><button class="button button--paid" disabled={isSubmitting} onclick={() => void submitReview()}>{isSubmitting ? 'Submitting once…' : 'Generate — one paid request'} <Icon name="spark" size={16} /></button></div></div>
+    <div class="dialog-actions dialog-actions--paid"><button class="button button--secondary" disabled={isSubmitting} onclick={closeReview}>Go back</button><div><span>This sends one paid provider request</span><button class="button button--paid" disabled={isSubmitting} onclick={() => void submitReview()}>{isSubmitting ? 'Sending one request…' : 'Generate video — paid'} <Icon name="spark" size={16} /></button></div></div>
   {/if}
 </dialog>
 
 <dialog class="sheet-dialog close-dialog" bind:this={closeDialog} aria-labelledby="close-title" aria-describedby="close-description" oncancel={(event) => { event.preventDefault(); void cancelCloseRequest(); }}>
   <div class="dialog-accent" aria-hidden="true"></div>
-  <div class="dialog-heading"><div class="dialog-icon"><Icon name="check" size={21} /></div><div><p class="eyebrow">Before closing</p><h2 id="close-title">Save this scene safely?</h2></div></div>
+  <div class="dialog-heading"><div class="dialog-icon"><Icon name="check" size={21} /></div><div><p class="eyebrow">Before closing</p><h2 id="close-title">Save before closing?</h2></div></div>
   <div class="dialog-body">
-    <p id="close-description">Video Harness is saving the latest draft on this device before the window closes.</p>
+    <p id="close-description">Video Harness saves your latest draft on this device before the window closes.</p>
     {#if closeBusy}<div class="submission-state" role="status"><Icon name="clock" size={18} /><p><strong>{closeCommitted ? 'Draft saved. Finishing background work…' : 'Saving the latest edit…'}</strong><span>{closeCommitted ? 'The close request is committed. Video Harness will exit as soon as in-flight work reaches a safe stopping point.' : 'Keep this window open until the save is confirmed.'}</span>{#if closeWaitMessage}<span>{closeWaitMessage}</span>{/if}</p></div>{/if}
     {#if closeError}<div class="dialog-error" role="alert"><Icon name="warning" size={17} /><p><strong>{closeErrorTitle || 'Video Harness stayed open.'}</strong><span>{closeError}</span></p></div>{/if}
   </div>

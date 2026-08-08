@@ -1,4 +1,7 @@
-//! Native GTK/libadwaita frontend for Video Harness.
+//! Deprecated GTK/libadwaita frontend for Video Harness.
+//!
+//! The supported desktop frontend is the Tauri/Svelte application. This
+//! module remains available only through the opt-in `legacy-gtk` feature.
 
 pub mod cloud_cinema;
 pub mod composer_state;
@@ -11,6 +14,8 @@ use std::sync::Arc;
 use adw::prelude::*;
 
 pub const APPLICATION_ID: &str = "io.github.EnchiladaBoy.VideoHarness";
+pub const LEGACY_FRONTEND_NOTICE: &str =
+    "Legacy GTK frontend — maintenance-only. Use the supported Tauri/Svelte desktop app.";
 
 #[derive(Debug)]
 pub enum GuiError {
@@ -27,8 +32,13 @@ impl fmt::Display for GuiError {
 
 impl std::error::Error for GuiError {}
 
-/// Run the native application until its final window closes.
+/// Run the deprecated GTK application until its final window closes.
+#[deprecated(
+    since = "0.7.1",
+    note = "use the supported Tauri/Svelte `video-harness` desktop application"
+)]
 pub fn run() -> Result<(), GuiError> {
+    eprintln!("warning: {LEGACY_FRONTEND_NOTICE}");
     let runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()

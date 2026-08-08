@@ -71,7 +71,9 @@ TAURI_CLI="${PROJECT_DIR}/ui/node_modules/.bin/tauri"
 export CARGO_TARGET_DIR="${PROJECT_DIR}/desktop/src-tauri/target"
 BUNDLE_DIR="${CARGO_TARGET_DIR}/release/bundle/appimage"
 PACKAGE_DIR="${CARGO_TARGET_DIR}/release/bundle/appimage_deb"
+TAURI_TOOLS_DIR="${CARGO_TARGET_DIR}/.tauri"
 rm -rf -- "${BUNDLE_DIR}" "${PACKAGE_DIR}"
+"${SCRIPT_DIR}/prepare-tauri-appimage-tools.sh" "${TAURI_TOOLS_DIR}"
 (
     cd -- "${PROJECT_DIR}/desktop"
     CI=true "${TAURI_CLI}" build --ci --bundles appimage --no-sign -- --locked

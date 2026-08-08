@@ -41,7 +41,7 @@ export function demoSnapshot(): AppSnapshot {
         credentialStorage: 'none',
         description: 'Video models, plus a bridge for local references.',
         localMediaNote:
-          'Local files upload only in Review, as public-by-link files with a requested 24-hour expiry.'
+          'Local files upload only after review confirmation, as public-by-link files with a requested 24-hour expiry.'
       }
     ],
     models: [
@@ -158,7 +158,7 @@ export function demoSnapshot(): AppSnapshot {
         prompt: 'A paper airship sailing through peach-colored clouds at sunrise.',
         status: 'processing',
         statusLabel: 'Generating frames',
-        detail: 'Tiny Cloud Cinema is keeping watch while the model works.',
+        detail: 'Video Harness is checking the provider while the model works.',
         createdAt: new Date(Date.now() - 184_000).toISOString(),
         elapsedSeconds: 184,
         nextPollSeconds: 18,
@@ -195,7 +195,7 @@ export function demoSnapshot(): AppSnapshot {
         prompt: 'A glass greenhouse glowing in a snowy field at blue hour.',
         status: 'paused',
         statusLabel: 'Monitoring paused',
-        detail: 'The provider keeps working while local updates take a nap.',
+        detail: 'Local updates are paused, but the provider may still be working.',
         createdAt: new Date(Date.now() - 5_420_000).toISOString(),
         elapsedSeconds: 92,
         remoteContinues: true,
@@ -345,14 +345,11 @@ class BrowserDemoBridge implements VideoHarnessBridge {
     await wait(720);
     const provider = this.snapshot.providers.find((item) => item.id === draft.providerId);
     const model = modelById(this.snapshot, draft.providerId, draft.modelId);
-    if (!provider?.connected) throw new Error(`Connect ${provider?.name ?? 'the provider'} before Review.`);
-    if (!model) throw new Error('Choose an available model before Review.');
-    if (
-      draft.providerId === 'openrouter' &&
-      draft.media.some((item) => item.source === 'local') &&
-      !authorization.localMediaUploadConfirmed
-    ) {
-      throw new Error('Local-media staging was not confirmed. No files were uploaded.');
+    if (!provider?.connected) throw new Error(`Connect ${provider?.name ?? 'the video service'} before review.`);
+    if (!model) throw new Error('Choose an available model before review.');
+    const hasLocalMedia = draft.media.some((item) => item.source === 'local');
+    if (hasLocalMedia && !authorization.localMediaUploadConfirmed) {
+      throw new Error('Local-media upload was not confirmed. No files were uploaded.');
     }
 
     const review: PreparedReview = {
@@ -368,16 +365,18 @@ class BrowserDemoBridge implements VideoHarnessBridge {
       estimatedCost: model.priceHint.replace('From about ', '') || 'Provider estimate unavailable',
       expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
       uploadDisclosure:
-        draft.providerId === 'openrouter' && draft.media.some((item) => item.source === 'local')
-          ? 'Your local references will be uploaded to fal.ai as public-by-link files with a requested 24-hour expiry, then their URLs will be shared with OpenRouter and the selected model provider.'
-          : undefined
+        !hasLocalMedia
+          ? undefined
+          : draft.providerId === 'openrouter'
+            ? 'Your local references will be uploaded to fal.ai as public-by-link files with a requested 24-hour expiry, then their URLs will be shared with OpenRouter and the selected model provider.'
+            : 'Your local references will be uploaded to fal.ai as public-by-link files with a requested 24-hour expiry, then used by the selected fal.ai model.'
     };
     this.emit({ type: 'review_ready', review });
   }
 
   async submitPrepared(preparedId: number): Promise<void> {
     const review = this.snapshot.preparedReview;
-    if (!review || review.preparedId !== preparedId) throw new Error('This Review is no longer current.');
+    if (!review || review.preparedId !== preparedId) throw new Error('This review is no longer current.');
     await wait(420);
     const id = `demo-${Date.now().toString(36)}`;
     const job: JobSummary = {
@@ -388,7 +387,7 @@ class BrowserDemoBridge implements VideoHarnessBridge {
       prompt: review.prompt,
       status: 'queued',
       statusLabel: 'Waiting in line',
-      detail: 'This render is pretend—nothing was sent and no credits were used.',
+      detail: 'This video job is a demo—nothing was sent and no credits were used.',
       createdAt: new Date().toISOString(),
       elapsedSeconds: 0,
       nextPollSeconds: 4,
@@ -408,7 +407,7 @@ class BrowserDemoBridge implements VideoHarnessBridge {
           ...job,
           status: 'processing',
           statusLabel: 'Painting the in-between moments',
-          detail: 'Tiny Cloud Cinema is painting a pretend progress state.',
+          detail: 'Video Harness is showing demo progress.',
           elapsedSeconds: 2,
           nextPollSeconds: 3
         }
@@ -420,7 +419,7 @@ class BrowserDemoBridge implements VideoHarnessBridge {
         job: {
           ...job,
           status: 'completed',
-          statusLabel: 'Pretend render complete',
+          statusLabel: 'Demo video complete',
           detail: 'In the desktop app, your finished file would be ready to play here.',
           elapsedSeconds: 6,
           outputFileName: 'demo-cloud-cinema.mp4',
@@ -464,7 +463,7 @@ class BrowserDemoBridge implements VideoHarnessBridge {
         ...job,
         status: 'paused',
         statusLabel: 'Monitoring paused',
-        detail: 'The pretend provider keeps working while local updates take a nap.',
+        detail: 'Demo updates are paused; the pretend provider may still be working.',
         remoteContinues: true,
         monitorState: 'paused',
         canResume: true,
@@ -482,7 +481,7 @@ class BrowserDemoBridge implements VideoHarnessBridge {
         ...job,
         status: 'processing',
         statusLabel: 'Back on watch',
-        detail: 'Tiny Cloud Cinema is checking again.',
+        detail: 'Video Harness is checking again.',
         remoteContinues: undefined,
         nextPollSeconds: 8,
         monitorState: 'active',
@@ -492,10 +491,22 @@ class BrowserDemoBridge implements VideoHarnessBridge {
     });
   }
 
+  async pauseAllJobs(): Promise<void> {
+    for (const job of [...this.snapshot.jobs]) {
+      if (job.canPause) await this.pauseJob(job.id);
+    }
+  }
+
+  async resumeAllJobs(): Promise<void> {
+    for (const job of [...this.snapshot.jobs]) {
+      if (job.canResume) await this.resumeJob(job.id);
+    }
+  }
+
   async deleteRender(jobId: string, _deleteOutput: boolean): Promise<void> {
     await wait(220);
     const job = this.snapshot.jobs.find((item) => item.id === jobId);
-    if (!job?.deletable) throw new Error('Only finished renders can be removed from the reel.');
+    if (!job?.deletable) throw new Error('Only finished video jobs can be removed.');
     this.emit({ type: 'job_removed', jobId });
   }
 
