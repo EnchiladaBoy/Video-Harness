@@ -63,8 +63,8 @@ RUSTUP_TOOLCHAIN=1.95 packaging/build-appimage.sh
 
 The expected output for the current machine is one of:
 
-- `dist/Video-Harness-0.7.1-linux-x86_64.AppImage`
-- `dist/Video-Harness-0.7.1-linux-aarch64.AppImage`
+- `dist/Video-Harness-0.7.2-linux-x86_64.AppImage`
+- `dist/Video-Harness-0.7.2-linux-aarch64.AppImage`
 
 The builder checks the CPU architecture, exact application version, extraction
 fallback, and the bundled GStreamer playback/libav plugins. It decodes both

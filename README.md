@@ -5,9 +5,9 @@ OpenRouter and fal.ai. It keeps prompts, job history, drafts, and downloaded
 videos on your computer. There is no Video Harness account, telemetry, cloud
 sync, or background updater.
 
-Version 0.7.1 makes the Tauri 2 + Svelte app the only supported frontend and
-prepares native release targets for Linux, Windows, and macOS. The old GTK
-frontend is deprecated, opt-in, and not included in release packages.
+Version 0.7.2 discovers OpenRouter reference-media capabilities from live model
+metadata, so newly released video models can use the image, video, and audio
+inputs they advertise without waiting for a hard-coded model update.
 
 ## Create your first video
 
@@ -36,7 +36,7 @@ fal.ai model.
 
 ## Install
 
-The 0.7.1 packages below can be downloaded from the
+The 0.7.2 packages below can be downloaded from the
 [latest release](https://github.com/EnchiladaBoy/Video-Harness/releases/latest).
 They are intentionally unsigned community builds. Before opening one, verify
 its SHA-256 checksum and GitHub build-provenance attestation as described in
@@ -44,16 +44,16 @@ its SHA-256 checksum and GitHub build-provenance attestation as described in
 
 | Platform | Package | Supported baseline |
 | --- | --- | --- |
-| Linux x86_64 | `Video-Harness-0.7.1-linux-x86_64.AppImage` | glibc-based desktop Linux |
-| Linux ARM64 | `Video-Harness-0.7.1-linux-aarch64.AppImage` | glibc-based desktop Linux |
+| Linux x86_64 | `Video-Harness-0.7.2-linux-x86_64.AppImage` | glibc-based desktop Linux |
+| Linux ARM64 | `Video-Harness-0.7.2-linux-aarch64.AppImage` | glibc-based desktop Linux |
 | Windows x64 | unsigned NSIS setup `.exe` | Windows 10 22H2 or Windows 11 |
 | macOS Apple Silicon | unsigned aarch64 `.dmg` | macOS 12 or newer |
 
 On Linux, make the AppImage executable and run it:
 
 ```bash
-chmod +x Video-Harness-0.7.1-linux-x86_64.AppImage
-./Video-Harness-0.7.1-linux-x86_64.AppImage
+chmod +x Video-Harness-0.7.2-linux-x86_64.AppImage
+./Video-Harness-0.7.2-linux-x86_64.AppImage
 ```
 
 If FUSE is unavailable, add `--appimage-extract-and-run`. Alpine/musl and

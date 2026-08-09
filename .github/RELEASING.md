@@ -53,7 +53,7 @@ move or reuse a published release tag even when repository settings permit it.
 Enable GitHub's Dependency Graph under **Settings → Security and analysis** so
 the pull-request dependency-review job can assess dependency changes.
 
-## Cut v0.7.1
+## Cut v0.7.2
 
 1. Confirm the complete push CI run for the exact `main` commit is green,
    including Windows x64, both Linux AppImage architectures, Apple Silicon
@@ -63,26 +63,26 @@ the pull-request dependency-review job can assess dependency changes.
    Silicon Mac. Record playback, native picker, credential-store, non-ASCII
    path, redirected/cross-volume Videos or Movies folder, and visible-window
    results. Intel Mac testing is not required or supported.
-3. Run `packaging/check-release-version.sh v0.7.1` with `appstreamcli` and
+3. Run `packaging/check-release-version.sh v0.7.2` with `appstreamcli` and
    `desktop-file-validate` installed.
 4. Create an unsigned annotated source tag and push it. Do not use a lightweight
    tag. The explicit configuration override below also works for maintainers
    whose Git configuration normally signs tags:
 
    ```bash
-   git -c tag.gpgSign=false tag -a v0.7.1 -m "Video Harness 0.7.1"
-   git push origin v0.7.1
+   git -c tag.gpgSign=false tag -a v0.7.2 -m "Video Harness 0.7.2"
+   git push origin v0.7.2
    ```
 
 5. The release workflow validates the tag and exact push CI run, rebuilds the
    packages, verifies their structure and launch behavior, generates checksums,
    SBOM, and keyless provenance, then automatically publishes exactly:
 
-   - `Video-Harness-0.7.1-linux-x86_64.AppImage`
-   - `Video-Harness-0.7.1-linux-aarch64.AppImage`
-   - `Video-Harness-0.7.1-windows-x86_64-setup.exe`
-   - `Video-Harness-0.7.1-macos-aarch64.dmg`
-   - `Video-Harness-v0.7.1.spdx.json`
+   - `Video-Harness-0.7.2-linux-x86_64.AppImage`
+   - `Video-Harness-0.7.2-linux-aarch64.AppImage`
+   - `Video-Harness-0.7.2-windows-x86_64-setup.exe`
+   - `Video-Harness-0.7.2-macos-aarch64.dmg`
+   - `Video-Harness-v0.7.2.spdx.json`
    - `SHA256SUMS`
 
 6. Download each published package and `SHA256SUMS`. Compute each package's
@@ -90,7 +90,7 @@ the pull-request dependency-review job can assess dependency changes.
    attestation, substituting each asset name in turn:
 
    ```bash
-   gh attestation verify Video-Harness-0.7.1-linux-x86_64.AppImage \
+   gh attestation verify Video-Harness-0.7.2-linux-x86_64.AppImage \
      --repo EnchiladaBoy/Video-Harness
    ```
 

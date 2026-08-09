@@ -45,20 +45,20 @@ Download the package and `SHA256SUMS` from the same GitHub release. From the
 download directory, compute the package checksum on Linux:
 
 ```bash
-sha256sum Video-Harness-0.7.1-linux-x86_64.AppImage
+sha256sum Video-Harness-0.7.2-linux-x86_64.AppImage
 ```
 
 macOS also includes `shasum` if `sha256sum` is unavailable:
 
 ```bash
-shasum -a 256 Video-Harness-0.7.1-macos-aarch64.dmg
+shasum -a 256 Video-Harness-0.7.2-macos-aarch64.dmg
 ```
 
 Compare that result with the corresponding value in `SHA256SUMS`. On Windows,
 use PowerShell and compare the result the same way:
 
 ```powershell
-Get-FileHash .\Video-Harness-0.7.1-windows-x86_64-setup.exe -Algorithm SHA256
+Get-FileHash .\Video-Harness-0.7.2-windows-x86_64-setup.exe -Algorithm SHA256
 ```
 
 The checksum detects a damaged or substituted asset relative to the release
@@ -67,7 +67,7 @@ repository's release workflow. With GitHub CLI installed, retrieve and verify
 the attestation for each package:
 
 ```bash
-gh attestation verify Video-Harness-0.7.1-linux-x86_64.AppImage \
+gh attestation verify Video-Harness-0.7.2-linux-x86_64.AppImage \
   --repo EnchiladaBoy/Video-Harness
 ```
 

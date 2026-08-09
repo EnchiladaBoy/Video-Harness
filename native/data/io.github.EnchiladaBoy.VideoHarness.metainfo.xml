@@ -25,6 +25,11 @@
   <url type="vcs-browser">https://github.com/EnchiladaBoy/Video-Harness</url>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.7.2" date="2026-08-09">
+      <description>
+        <p>Discovers OpenRouter reference-media capabilities from live model metadata, enabling newly released models such as Seedance 2.5 to accept their advertised video and audio inputs without a hard-coded allowlist.</p>
+      </description>
+    </release>
     <release version="0.7.1" date="2026-08-08">
       <description>
         <p>Makes the Tauri and Svelte desktop app canonical, simplifies creator workflows, strengthens spending and submission safeguards, and adds prebuilt Linux, Windows, and Apple Silicon macOS packages.</p>

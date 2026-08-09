@@ -43,7 +43,7 @@ ad-hoc legacy build from being mistaken for the supported Tauri application.
 
 ## Feature-parity audit
 
-This matrix reflects the repository at 0.7.1. “Shared” means both frontends
+This matrix reflects the repository at 0.7.2. “Shared” means both frontends
 delegate the behavior to the same Rust workflow/domain layer, not that their
 presentation code is identical.
 

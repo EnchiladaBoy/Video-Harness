@@ -2,7 +2,7 @@
 
 This directory contains the provider workflows, safety checks, persistence,
 downloads, and platform-neutral application services used by Video Harness
-v0.7.1. The stable desktop interface lives in [`../ui`](../ui) and is hosted by
+v0.7.2. The stable desktop interface lives in [`../ui`](../ui) and is hosted by
 Tauri from [`../desktop/src-tauri`](../desktop/src-tauri).
 
 The older GTK4/libadwaita frontend is retained behind the `legacy-gtk` feature
