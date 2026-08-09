@@ -4294,7 +4294,7 @@ mod tests {
         let openrouter = VideoModel::from_provider_api(
             ProviderId::openrouter(),
             &serde_json::json!({
-                "id": "bytedance/seedance-2.0",
+                "id": "vendor/future-video-v1",
                 "name": "OpenRouter policy fixture",
                 "input_modalities": ["image", "video", "audio"],
                 "supported_frame_images": ["first_frame"]
@@ -4302,6 +4302,8 @@ mod tests {
         )
         .expect("OpenRouter policy fixture");
         let openrouter_summary = model_summary(&openrouter);
+        assert!(openrouter_summary.capabilities.video);
+        assert!(openrouter_summary.capabilities.audio_references);
         assert_eq!(
             openrouter_summary.max_media_items,
             Some(MAX_MEDIA_INPUTS_TOTAL)

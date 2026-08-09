@@ -139,24 +139,50 @@ fn has_authorization(request: &CapturedRequest) -> bool {
 }
 
 #[tokio::test]
-async fn typed_reference_models_are_enriched_from_the_public_general_catalog() {
+async fn newly_released_models_are_enriched_from_the_public_general_catalog() {
     let executor = ScriptedExecutor::with_replies([
         Reply::Json(
             StatusCode::OK,
-            json!({"data": [{
-                "id": "bytedance/seedance-2.0",
-                "name": "Seedance 2.0"
-            }]}),
+            json!({"data": [
+                {
+                    "id": "bytedance/seedance-2.5",
+                    "name": "Seedance 2.5"
+                },
+                {
+                    "id": "vendor/future-video-v1",
+                    "name": "Future video fixture"
+                },
+                {
+                    "id": "example/unadvertised-video-model",
+                    "name": "Unadvertised fixture"
+                }
+            ]}),
         ),
         Reply::Json(
             StatusCode::OK,
-            json!({"data": [{
-                "id": "bytedance/seedance-2.0",
-                "architecture": {
-                    "input_modalities": ["text", "image", "video", "audio"],
-                    "output_modalities": ["video"]
+            json!({"data": [
+                {
+                    "id": "bytedance/seedance-2.5",
+                    "architecture": {
+                        "input_modalities": ["text", "image", "video", "audio"],
+                        "output_modalities": ["video"]
+                    }
+                },
+                {
+                    "id": "vendor/future-video-v1",
+                    "architecture": {
+                        "input_modalities": ["text", "video"],
+                        "output_modalities": ["video"]
+                    }
+                },
+                {
+                    "id": "example/not-in-dedicated-video-catalog",
+                    "architecture": {
+                        "input_modalities": ["text", "video"],
+                        "output_modalities": ["video"]
+                    }
                 }
-            }]}),
+            ]}),
         ),
     ]);
     let catalog = client(executor.clone(), 0)
@@ -167,6 +193,11 @@ async fn typed_reference_models_are_enriched_from_the_public_general_catalog() {
         catalog.models[0].input_modalities,
         Some(vec![MediaKind::Image, MediaKind::Video, MediaKind::Audio])
     );
+    assert_eq!(
+        catalog.models[1].input_modalities,
+        Some(vec![MediaKind::Video])
+    );
+    assert_eq!(catalog.models[2].input_modalities, None);
     let requests = executor.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].url.path(), "/api/v1/videos/models");
@@ -185,7 +216,7 @@ async fn failed_typed_capability_enrichment_leaves_modalities_unknown() {
     let executor = ScriptedExecutor::with_replies([
         Reply::Json(
             StatusCode::OK,
-            json!({"data": [{"id": "bytedance/seedance-2.0"}]}),
+            json!({"data": [{"id": "bytedance/seedance-2.5"}]}),
         ),
         Reply::Json(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -198,6 +229,26 @@ async fn failed_typed_capability_enrichment_leaves_modalities_unknown() {
         .expect("base catalog remains usable");
     assert_eq!(catalog.models[0].input_modalities, None);
     assert_eq!(executor.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn dedicated_input_modalities_are_authoritative_without_a_second_request() {
+    let executor = ScriptedExecutor::with_replies([Reply::Json(
+        StatusCode::OK,
+        json!({"data": [{
+            "id": "example/explicit-video-model",
+            "input_modalities": ["image", "video"]
+        }]}),
+    )]);
+    let catalog = client(executor.clone(), 0)
+        .list_video_models()
+        .await
+        .expect("directly described video catalog");
+    assert_eq!(
+        catalog.models[0].input_modalities,
+        Some(vec![MediaKind::Image, MediaKind::Video])
+    );
+    assert_eq!(executor.requests().len(), 1);
 }
 
 #[tokio::test]

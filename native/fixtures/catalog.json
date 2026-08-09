@@ -10,6 +10,7 @@
       "supported_sizes": ["1280x720"],
       "supported_durations": [4, 8],
       "supported_frame_images": ["first_frame", "last_frame"],
+      "input_modalities": ["image", "video"],
       "generate_audio": false,
       "seed": true,
       "allowed_passthrough_parameters": ["guidance"],
@@ -24,6 +25,7 @@
       "supported_resolutions": ["720p"],
       "supported_aspect_ratios": ["16:9"],
       "supported_durations": [5],
+      "input_modalities": ["image"],
       "generate_audio": true,
       "pricing_skus": {
         "duration_seconds_with_audio": "0.25",
@@ -32,4 +34,3 @@
     }
   ]
 }
-

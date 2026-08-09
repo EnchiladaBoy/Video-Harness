@@ -1695,17 +1695,16 @@ fn media_kind(value: &Value) -> Option<MediaKind> {
 }
 
 fn input_modalities(object: &Map<String, Value>) -> Option<Vec<MediaKind>> {
-    let value = object.get("input_modalities").or_else(|| {
-        object
-            .get("architecture")
-            .and_then(Value::as_object)
-            .and_then(|architecture| architecture.get("input_modalities"))
-    })?;
-    if value.is_null() {
-        return None;
-    }
-    value
-        .as_array()
+    object
+        .get("input_modalities")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            object
+                .get("architecture")
+                .and_then(Value::as_object)
+                .and_then(|architecture| architecture.get("input_modalities"))
+                .and_then(Value::as_array)
+        })
         .map(|values| values.iter().filter_map(media_kind).collect())
 }
 
@@ -2797,6 +2796,19 @@ mod tests {
 
         request.model = capable.id.clone();
         assert!(capable.supports_request(&request).is_empty());
+
+        let architecture_fallback = VideoModel::from_api(&json!({
+            "id": "example/architecture-fallback",
+            "input_modalities": null,
+            "architecture": {
+                "input_modalities": ["text", "video"]
+            }
+        }))
+        .expect("architecture fallback model");
+        assert_eq!(
+            architecture_fallback.input_modalities,
+            Some(vec![MediaKind::Video])
+        );
 
         let fal_frame_only = VideoModel::from_provider_api(
             ProviderId::fal(),

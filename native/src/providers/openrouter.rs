@@ -20,8 +20,6 @@ use super::{
     audio_input_requires_visual,
 };
 
-const TYPED_REFERENCE_MODELS: &[&str] = &["bytedance/seedance-2.0", "bytedance/seedance-2.0-fast"];
-
 #[derive(Debug)]
 pub struct OpenRouterProvider {
     client: Arc<OpenRouterClient>,
@@ -265,12 +263,6 @@ fn validate_reference_policy(model_id: &str, request: &VideoRequest) -> Result<(
         .iter()
         .filter(|reference| reference.kind == InputReferenceKind::Audio)
         .count();
-    if videos + audio > 0 && !TYPED_REFERENCE_MODELS.contains(&model_id) {
-        return Err(validation(format!(
-            "OpenRouter model {} is not currently verified for video or audio references",
-            model_id
-        )));
-    }
     if images > MAX_IMAGE_INPUTS {
         return Err(validation(format!(
             "OpenRouter accepts at most {MAX_IMAGE_INPUTS} reference images"
@@ -404,21 +396,20 @@ mod tests {
     }
 
     #[test]
-    fn typed_reference_policy_rejects_unverified_models_and_limits() {
-        let unverified = VideoModel::from_api(&json!({
-            "id": "example/future-video-model",
-            "input_modalities": ["video"]
+    fn typed_reference_policy_accepts_future_models_and_enforces_limits() {
+        let future = VideoModel::from_api(&json!({
+            "id": "vendor/future-video-v1",
+            "input_modalities": ["image", "video", "audio"]
         }))
-        .expect("unverified fixture model");
-        let mut request = VideoRequest::new(&unverified.id, "fixture prompt").expect("request");
+        .expect("future fixture model");
+        let mut request = VideoRequest::new(&future.id, "fixture prompt").expect("request");
         request.input_references.push(
             InputReference::with_kind("https://media.example/video.mp4", InputReferenceKind::Video)
                 .expect("video reference"),
         );
-        assert!(validate_reference_policy(&unverified.id, &request).is_err());
+        validate_reference_policy(&future.id, &request)
+            .expect("catalog-advertised future model is not blocked by its ID");
 
-        let verified = seedance_model();
-        request.model = verified.id.clone();
         for index in 1..=MAX_VIDEO_INPUTS {
             request.input_references.push(
                 InputReference::with_kind(
@@ -428,7 +419,7 @@ mod tests {
                 .expect("video reference"),
             );
         }
-        assert!(validate_reference_policy(&verified.id, &request).is_err());
+        assert!(validate_reference_policy(&future.id, &request).is_err());
     }
 
     #[test]

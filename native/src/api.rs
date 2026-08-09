@@ -41,8 +41,6 @@ pub const MAX_VIDEO_DOWNLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DOWNLOAD_SPACE_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 1024 * 1024;
-const OPENROUTER_TYPED_REFERENCE_MODELS: &[&str] =
-    &["bytedance/seedance-2.0", "bytedance/seedance-2.0-fast"];
 
 fn retryable_statuses() -> BTreeSet<u16> {
     [408, 425, 429, 500, 502, 503, 504].into_iter().collect()
@@ -54,16 +52,22 @@ fn catalog_needs_input_modality_enrichment(payload: &Value) -> bool {
         .and_then(Value::as_array)
         .is_some_and(|models| {
             models.iter().any(|model| {
-                model
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(is_typed_reference_model)
+                model.get("id").and_then(Value::as_str).is_some()
+                    && advertised_input_modalities(model).is_none()
             })
         })
 }
 
-fn is_typed_reference_model(model_id: &str) -> bool {
-    OPENROUTER_TYPED_REFERENCE_MODELS.contains(&model_id)
+fn advertised_input_modalities(model: &Value) -> Option<&Vec<Value>> {
+    model
+        .get("input_modalities")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            model
+                .get("architecture")
+                .and_then(|architecture| architecture.get("input_modalities"))
+                .and_then(Value::as_array)
+        })
 }
 
 fn enrich_video_model_input_modalities(video_catalog: &mut Value, model_catalog: &Value) {
@@ -74,14 +78,18 @@ fn enrich_video_model_input_modalities(video_catalog: &mut Value, model_catalog:
         .flatten()
         .filter_map(|model| {
             let id = model.get("id")?.as_str()?;
-            if !is_typed_reference_model(id) {
+            let architecture = model.get("architecture");
+            let outputs = architecture
+                .and_then(|value| value.get("output_modalities"))
+                .or_else(|| model.get("output_modalities"))
+                .and_then(Value::as_array)?;
+            if !outputs
+                .iter()
+                .any(|output| output.as_str() == Some("video"))
+            {
                 return None;
             }
-            let modalities = model
-                .get("architecture")
-                .and_then(|architecture| architecture.get("input_modalities"))
-                .or_else(|| model.get("input_modalities"))
-                .and_then(Value::as_array)?
+            let modalities = advertised_input_modalities(model)?
                 .iter()
                 .filter_map(Value::as_str)
                 .filter(|modality| matches!(*modality, "image" | "video" | "audio"))
@@ -95,6 +103,9 @@ fn enrich_video_model_input_modalities(video_catalog: &mut Value, model_catalog:
         return;
     };
     for model in models {
+        if advertised_input_modalities(model).is_some() {
+            continue;
+        }
         let Some(object) = model.as_object_mut() else {
             continue;
         };
@@ -562,11 +573,13 @@ impl OpenRouterClient {
             )
             .await?;
         // The dedicated generation catalog does not currently expose input
-        // modalities. Enrich only models whose video endpoint is documented
-        // to accept typed media, using the public general model catalog. A
-        // failed enrichment deliberately leaves those capabilities unknown;
-        // callers can still use text/image generation but must fail closed for
-        // video and audio references.
+        // modalities. Enrich every model missing them from OpenRouter's public
+        // general model catalog, which is the structured source of truth for
+        // model input/output architecture. This deliberately avoids a model-ID
+        // allowlist so newly released models gain advertised capabilities on
+        // the first catalog refresh. A failed or incomplete enrichment leaves
+        // capabilities unknown, so video and audio references still fail
+        // closed rather than being guessed from names or descriptions.
         if catalog_needs_input_modality_enrichment(&payload) {
             let mut models_url = self.api_url("models")?;
             models_url

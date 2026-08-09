@@ -35,7 +35,8 @@ impl HttpExecutor for CatalogExecutor {
                 "data": [{
                     "id": "fixture/video",
                     "name": "Fixture video",
-                    "supported_durations": [4, 8]
+                    "supported_durations": [4, 8],
+                    "input_modalities": ["image"]
                 }]
             }),
         )
